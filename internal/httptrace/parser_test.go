@@ -1,0 +1,63 @@
+package httptrace
+
+import "testing"
+
+func TestTryParseRequest(t *testing.T) {
+	raw := []byte("POST /api/v1/items HTTP/1.1\r\nHost: example.com\r\nContent-Length: 11\r\n\r\nhello world")
+
+	msg, complete, err := TryParseMessage(DirectionRequest, raw, ParseOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !complete {
+		t.Fatalf("request should be complete")
+	}
+	if got, want := msg.Method, "POST"; got != want {
+		t.Fatalf("method mismatch: got %q want %q", got, want)
+	}
+	if got, want := msg.URL, "/api/v1/items"; got != want {
+		t.Fatalf("url mismatch: got %q want %q", got, want)
+	}
+	if got, want := msg.Body, "hello world"; got != want {
+		t.Fatalf("body mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestTryParseChunkedResponse(t *testing.T) {
+	raw := []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n")
+
+	msg, complete, err := TryParseMessage(DirectionResponse, raw, ParseOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !complete {
+		t.Fatalf("response should be complete")
+	}
+	if got, want := msg.StatusCode, 200; got != want {
+		t.Fatalf("status mismatch: got %d want %d", got, want)
+	}
+	if got, want := msg.Body, "Wikipedia"; got != want {
+		t.Fatalf("body mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestTryParseResponseHeadWithPartialBody(t *testing.T) {
+	raw := []byte("HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Type: application/json\r\n\r\nabc")
+
+	msg, ok, err := TryParseMessageHead(DirectionResponse, raw, ParseOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("response head should be parseable")
+	}
+	if got, want := msg.StatusCode, 200; got != want {
+		t.Fatalf("status mismatch: got %d want %d", got, want)
+	}
+	if !msg.BodyPartial {
+		t.Fatalf("partial response body should be marked")
+	}
+	if got, want := msg.Body, "abc"; got != want {
+		t.Fatalf("partial body mismatch: got %q want %q", got, want)
+	}
+}
