@@ -73,3 +73,74 @@ func TestAssemblerEmitsPartialResponseOnClose(t *testing.T) {
 		t.Fatalf("response latency should be calculated")
 	}
 }
+
+func TestAssemblerEmitsMultipleMessagesFromSingleChain(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute)
+	now := time.Unix(1711717000, 0)
+
+	reqRaw := []byte(
+		"GET /api/a HTTP/1.1\r\nHost: example.com\r\n\r\n" +
+			"GET /api/b HTTP/1.1\r\nHost: example.com\r\n\r\n",
+	)
+	reqUpdates, err := asm.Process(Event{
+		Timestamp: now,
+		ChainID:   2001,
+		PID:       77,
+		FD:        9,
+		SrcIP:     "192.168.4.1",
+		DstIP:     "192.168.4.161",
+		SrcPort:   51060,
+		DstPort:   12581,
+		FragIdx:   0,
+		Direction: DirectionRequest,
+		Payload:   reqRaw,
+	})
+	if err != nil {
+		t.Fatalf("process requests: %v", err)
+	}
+	if len(reqUpdates) != 2 {
+		t.Fatalf("expected 2 request updates, got %d", len(reqUpdates))
+	}
+	if reqUpdates[0].Trace.ChainID == reqUpdates[1].Trace.ChainID {
+		t.Fatalf("logical chain ids should differ for multiple requests on one base chain")
+	}
+	if got, want := reqUpdates[0].Trace.Request.URL, "/api/a"; got != want {
+		t.Fatalf("first request url mismatch: got %q want %q", got, want)
+	}
+	if got, want := reqUpdates[1].Trace.Request.URL, "/api/b"; got != want {
+		t.Fatalf("second request url mismatch: got %q want %q", got, want)
+	}
+
+	respRaw := []byte(
+		"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na" +
+			"HTTP/1.1 201 Created\r\nContent-Length: 1\r\n\r\nb",
+	)
+	respUpdates, err := asm.Process(Event{
+		Timestamp: now.Add(10 * time.Millisecond),
+		ChainID:   2001,
+		PID:       77,
+		FD:        9,
+		SrcIP:     "192.168.4.161",
+		DstIP:     "192.168.4.1",
+		SrcPort:   12581,
+		DstPort:   51060,
+		FragIdx:   0,
+		Direction: DirectionResponse,
+		Payload:   respRaw,
+	})
+	if err != nil {
+		t.Fatalf("process responses: %v", err)
+	}
+	if len(respUpdates) != 2 {
+		t.Fatalf("expected 2 response updates, got %d", len(respUpdates))
+	}
+	if respUpdates[0].Trace.ChainID != reqUpdates[0].Trace.ChainID {
+		t.Fatalf("first response should match first request chain id")
+	}
+	if respUpdates[1].Trace.ChainID != reqUpdates[1].Trace.ChainID {
+		t.Fatalf("second response should match second request chain id")
+	}
+	if got, want := respUpdates[1].Trace.Response.StatusCode, 201; got != want {
+		t.Fatalf("second response status mismatch: got %d want %d", got, want)
+	}
+}

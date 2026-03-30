@@ -66,13 +66,12 @@ type stateShard struct {
 }
 
 type traceState struct {
-	doc               TraceDocument
-	requestStream     fragmentStream
-	responseStream    fragmentStream
-	requestEmitted    bool
-	responseEmitted   bool
-	lastUpdated       time.Time
-	requestMethodHint string
+	base            TraceDocument
+	requestStream   fragmentStream
+	responseStream  fragmentStream
+	lastUpdated     time.Time
+	logicalSeq      uint64
+	pendingRequests []pendingRequest
 }
 
 type fragmentStream struct {
@@ -80,10 +79,14 @@ type fragmentStream struct {
 	nextFrag   uint16
 	buffer     []byte
 	truncated  bool
-	parseError string
-	complete   bool
-	message    *ParsedMessage
 	firstTS    *time.Time
+}
+
+type pendingRequest struct {
+	chainID          uint64
+	requestTS        *time.Time
+	request          *ParsedMessage
+	requestTruncated bool
 }
 
 // NewAssembler 创建请求/响应聚合器。
@@ -125,7 +128,7 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 
 	if state == nil {
 		state = &traceState{
-			doc: TraceDocument{
+			base: TraceDocument{
 				ChainID: event.ChainID,
 				SockID:  event.SockID,
 				PID:     event.PID,
@@ -149,16 +152,8 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 	switch event.Direction {
 	case DirectionRequest:
 		stream = &state.requestStream
-		if state.doc.RequestTS == nil {
-			ts := event.Timestamp
-			state.doc.RequestTS = &ts
-		}
 	case DirectionResponse:
 		stream = &state.responseStream
-		if state.doc.ResponseTS == nil {
-			ts := event.Timestamp
-			state.doc.ResponseTS = &ts
-		}
 	default:
 		return nil, nil
 	}
@@ -212,120 +207,174 @@ func (a *Assembler) finalizeOnClose(state *traceState, shard *stateShard, chainI
 	if err != nil {
 		return nil, err
 	}
-	if state.requestEmitted && state.responseEmitted {
+	if state.canDelete() {
 		delete(shard.traces, chainID)
 	}
 	return updates, nil
 }
 
 func (a *Assembler) tryEmitUpdates(state *traceState, shard *stateShard, chainID uint64, eof bool) ([]Update, error) {
-	updates := make([]Update, 0, 2)
+	updates := make([]Update, 0, 4)
 
-	if !state.requestStream.complete {
-		msg, complete, err := TryParseMessage(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: eof})
-		if err != nil {
-			state.requestStream.parseError = err.Error()
-		} else if complete {
-			state.requestStream.complete = true
-			state.requestStream.message = msg
-			state.requestMethodHint = msg.Method
-			state.doc.Request = msg
-			state.doc.RequestTruncated = state.requestStream.truncated
-		}
+	requestUpdates, err := a.emitRequests(state, eof)
+	if err != nil {
+		return nil, err
 	}
+	updates = append(updates, requestUpdates...)
 
-	if !state.requestStream.complete && !state.requestEmitted && (state.requestStream.truncated || eof) {
-		msg, ok, err := TryParseMessageHead(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: eof})
-		if err != nil {
-			state.requestStream.parseError = err.Error()
-		} else if ok {
-			state.requestMethodHint = msg.Method
-			state.doc.Request = msg
-			state.doc.RequestTruncated = state.requestStream.truncated || msg.BodyPartial
-			state.requestStream.complete = eof || state.requestStream.truncated
-		}
+	responseUpdates, err := a.emitResponses(state, eof)
+	if err != nil {
+		return nil, err
 	}
+	updates = append(updates, responseUpdates...)
 
-	if state.requestStream.complete && !state.requestEmitted {
-		state.requestEmitted = true
-		updates = append(updates, Update{Kind: "request", Trace: state.snapshotRequest()})
-	}
-
-	if !state.responseStream.complete {
-		msg, complete, err := TryParseMessage(DirectionResponse, state.responseStream.buffer, ParseOptions{
-			RequestMethod: state.requestMethodHint,
-			EOF:           eof,
-		})
-		if err != nil {
-			state.responseStream.parseError = err.Error()
-		} else if complete {
-			state.responseStream.complete = true
-			state.responseStream.message = msg
-			state.doc.Response = msg
-			state.doc.ResponseTruncated = state.responseStream.truncated
-			if state.doc.RequestTS != nil && state.doc.ResponseTS != nil {
-				latency := state.doc.ResponseTS.Sub(*state.doc.RequestTS).Seconds() * 1000
-				state.doc.ResponseLatency = &latency
-			}
-		}
-	}
-
-	// 响应优先等完整 body。
-	// 只有连接关闭或抓包被截断时，才降级成“头完整 + 部分 body”的 response，
-	// 这样既不会把 request 卡到 response 一起输出，也尽量保留完整响应体。
-	if !state.responseStream.complete && !state.responseEmitted && (state.responseStream.truncated || eof) {
-		msg, ok, err := TryParseMessageHead(DirectionResponse, state.responseStream.buffer, ParseOptions{
-			RequestMethod: state.requestMethodHint,
-			EOF:           eof,
-		})
-		if err != nil {
-			state.responseStream.parseError = err.Error()
-		} else if ok {
-			state.doc.Response = msg
-			state.doc.ResponseTruncated = state.responseStream.truncated || msg.BodyPartial
-			if state.doc.RequestTS != nil && state.doc.ResponseTS != nil {
-				latency := state.doc.ResponseTS.Sub(*state.doc.RequestTS).Seconds() * 1000
-				state.doc.ResponseLatency = &latency
-			}
-			state.responseStream.complete = eof || state.responseStream.truncated
-		}
-	}
-
-	if state.doc.Response != nil && !state.responseEmitted {
-		state.responseEmitted = true
-		updates = append(updates, Update{Kind: "response", Trace: state.snapshotResponse()})
-	}
-
-	if state.requestEmitted && state.responseEmitted && (state.responseStream.complete || eof) {
+	if eof && state.canDelete() {
 		delete(shard.traces, chainID)
 	}
 	return updates, nil
 }
 
-func (t *traceState) snapshot() TraceDocument {
-	doc := t.doc
-	return doc
+func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) {
+	updates := make([]Update, 0, 2)
+
+	for len(state.requestStream.buffer) > 0 {
+		msg, complete, err := TryParseMessage(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: eof})
+		if err != nil {
+			return updates, nil
+		}
+		if complete {
+			updates = append(updates, state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, false))
+			state.requestStream.consume(msg.ConsumedBytes)
+			continue
+		}
+
+		if !(state.requestStream.truncated || eof) {
+			return updates, nil
+		}
+
+		msg, ok, err := TryParseMessageHead(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: eof})
+		if err != nil {
+			return updates, nil
+		}
+		if !ok {
+			return updates, nil
+		}
+		updates = append(updates, state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, state.requestStream.truncated || msg.BodyPartial))
+		state.requestStream.consumeAll()
+		return updates, nil
+	}
+
+	return updates, nil
 }
 
-// snapshotRequest 返回“纯请求”视图，专门给控制台打印和 Redis 入库。
-func (t *traceState) snapshotRequest() TraceDocument {
-	doc := t.snapshot()
+func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error) {
+	updates := make([]Update, 0, 2)
+
+	for len(state.responseStream.buffer) > 0 {
+		opts := ParseOptions{EOF: eof}
+		if len(state.pendingRequests) > 0 && state.pendingRequests[0].request != nil {
+			opts.RequestMethod = state.pendingRequests[0].request.Method
+		}
+
+		msg, complete, err := TryParseMessage(DirectionResponse, state.responseStream.buffer, opts)
+		if err != nil {
+			return updates, nil
+		}
+		if complete {
+			updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, false))
+			state.responseStream.consume(msg.ConsumedBytes)
+			continue
+		}
+
+		if !(state.responseStream.truncated || eof) {
+			return updates, nil
+		}
+
+		msg, ok, err := TryParseMessageHead(DirectionResponse, state.responseStream.buffer, opts)
+		if err != nil {
+			return updates, nil
+		}
+		if !ok {
+			return updates, nil
+		}
+		updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, state.responseStream.truncated || msg.BodyPartial))
+		state.responseStream.consumeAll()
+		return updates, nil
+	}
+
+	return updates, nil
+}
+
+func (a *Assembler) nextLogicalChainID(state *traceState) uint64 {
+	seq := state.logicalSeq
+	state.logicalSeq++
+	if seq == 0 {
+		return state.base.ChainID
+	}
+	return state.base.ChainID ^ (0x9e3779b97f4a7c15 * seq)
+}
+
+func (t *traceState) buildRequestUpdate(chainID uint64, msg *ParsedMessage, ts *time.Time, truncated bool) Update {
+	doc := t.base
 	doc.Kind = "request"
+	doc.ChainID = chainID
+	doc.RequestTS = cloneTimePtr(ts)
 	doc.ResponseTS = nil
 	doc.ResponseLatency = nil
+	doc.Request = msg
 	doc.Response = nil
+	doc.RequestTruncated = truncated
 	doc.ResponseTruncated = false
-	return doc
+
+	t.pendingRequests = append(t.pendingRequests, pendingRequest{
+		chainID:          chainID,
+		requestTS:        cloneTimePtr(ts),
+		request:          msg,
+		requestTruncated: truncated,
+	})
+
+	return Update{Kind: "request", Trace: doc}
 }
 
-// snapshotResponse 返回“纯响应”视图，避免把 request/response 混在同一条 JSON 里。
-func (t *traceState) snapshotResponse() TraceDocument {
-	doc := t.snapshot()
+func (t *traceState) buildResponseUpdate(msg *ParsedMessage, ts *time.Time, truncated bool) Update {
+	doc := t.base
 	doc.Kind = "response"
+	doc.ResponseTS = cloneTimePtr(ts)
 	doc.RequestTS = nil
 	doc.Request = nil
+	doc.Response = msg
 	doc.RequestTruncated = false
-	return doc
+	doc.ResponseTruncated = truncated
+
+	if len(t.pendingRequests) > 0 {
+		pending := t.pendingRequests[0]
+		t.pendingRequests = t.pendingRequests[1:]
+		doc.ChainID = pending.chainID
+		if pending.requestTS != nil && ts != nil {
+			latency := ts.Sub(*pending.requestTS).Seconds() * 1000
+			doc.ResponseLatency = &latency
+		}
+	} else {
+		doc.ChainID = t.base.ChainID
+	}
+
+	return Update{Kind: "response", Trace: doc}
+}
+
+func (t *traceState) canDelete() bool {
+	return len(t.pendingRequests) == 0 &&
+		len(t.requestStream.buffer) == 0 &&
+		len(t.responseStream.buffer) == 0 &&
+		len(t.requestStream.received) == 0 &&
+		len(t.responseStream.received) == 0
+}
+
+func cloneTimePtr(ts *time.Time) *time.Time {
+	if ts == nil {
+		return nil
+	}
+	v := *ts
+	return &v
 }
 
 func (s *fragmentStream) drain(maxMessageBytes int) {
@@ -346,6 +395,23 @@ func (s *fragmentStream) drain(maxMessageBytes int) {
 		}
 		s.buffer = append(s.buffer, part...)
 	}
+}
+
+func (s *fragmentStream) consume(n int) {
+	if n <= 0 {
+		return
+	}
+	if n >= len(s.buffer) {
+		s.consumeAll()
+		return
+	}
+	s.buffer = append([]byte(nil), s.buffer[n:]...)
+}
+
+func (s *fragmentStream) consumeAll() {
+	s.buffer = nil
+	s.firstTS = nil
+	s.truncated = false
 }
 
 func (d TraceDocument) SummaryLine() string {

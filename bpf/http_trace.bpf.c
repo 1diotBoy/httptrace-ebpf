@@ -198,7 +198,7 @@ static __always_inline __u64 next_chain_id(struct flow_state *state)
 
 	if (!state)
 		return 0;
-
+	// 请求序列号递增,生成唯一chain id,防止短连接复用同一个 sock 地址时 chain_id 重复 qqq
 	state->req_seq += 1;
 	seq_component = (__u64)state->req_seq << 32;
 	return state->conn_id ^ seq_component ^ state->rx_cursor;
@@ -654,6 +654,14 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 		start_request_capture(state, chain_id);
 	} else if (state->req_active && state->last_req_chain_id && !state->req_capture_stopped) {
 		chain_id = state->last_req_chain_id;
+		flags = 0;
+	} else if (state->last_req_chain_id && !state->response_pending) {
+		/* 长连接顺序调用时，下一条请求未必总是从当前 recv 缓冲的第一个字节开始，
+		 * 这时仅靠方法行前缀判断会漏掉第二、第三个接口。
+		 * 这里在“上一轮已经进入响应阶段”的前提下，允许把新的 recv 直接视作下一条 request。
+		 */
+		chain_id = next_chain_id(state);
+		start_request_capture(state, chain_id);
 		flags = 0;
 	} else {
 		goto cleanup;

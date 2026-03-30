@@ -454,6 +454,7 @@ func attachAll(objs *bpfgen.HttpTraceObjects) ([]link.Link, error) {
 		{group: "syscalls", name: "sys_enter_read", prog: objs.TracepointSysEnterRead},
 		{group: "syscalls", name: "sys_enter_readv", prog: objs.TracepointSysEnterReadv},
 	}
+	// 多个挂载点挂载
 	for _, tp := range tracepoints {
 		l, err := link.Tracepoint(tp.group, tp.name, tp.prog, nil)
 		if err != nil {
