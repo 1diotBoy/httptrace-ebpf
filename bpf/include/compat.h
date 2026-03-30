@@ -122,9 +122,21 @@ struct filter_config {
 };
 
 struct flow_state {
+	__u64 conn_id;
 	__u64 tx_cursor;
 	__u64 rx_cursor;
 	__u64 last_req_chain_id;
+	__u32 req_seq;
+	__u32 req_capture_bytes;
+	__u32 resp_capture_bytes;
+	__u32 req_frag_idx;
+	__u32 resp_frag_idx;
+	__u8 req_active;
+	__u8 resp_active;
+	__u8 req_capture_stopped;
+	__u8 resp_capture_stopped;
+	__u8 response_pending;
+	__u8 pad0[3];
 };
 
 struct recv_args {

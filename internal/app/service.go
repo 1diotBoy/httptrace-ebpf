@@ -427,6 +427,10 @@ func attachAll(objs *bpfgen.HttpTraceObjects) ([]link.Link, error) {
 		ret     bool
 		prog    *ebpf.Program
 	}{
+		// 4.19 上部分收包路径更容易命中 tcp_recvmsg；
+		// 它与 sock_recvmsg 共用同一个暂存 map，哪个更靠近真正执行路径就由哪个产出事件。
+		{symbols: []string{"tcp_recvmsg"}, prog: objs.KprobeTcpRecvmsg},
+		{symbols: []string{"tcp_recvmsg"}, ret: true, prog: objs.KretprobeTcpRecvmsg},
 		{symbols: []string{"tcp_close"}, prog: objs.KprobeTcpClose},
 	}
 	for _, item := range optionalKprobes {

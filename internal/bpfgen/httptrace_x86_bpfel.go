@@ -57,7 +57,9 @@ type HttpTraceProgramSpecs struct {
 	KprobeSockRecvmsg          *ebpf.ProgramSpec `ebpf:"kprobe_sock_recvmsg"`
 	KprobeSockSendmsg          *ebpf.ProgramSpec `ebpf:"kprobe_sock_sendmsg"`
 	KprobeTcpClose             *ebpf.ProgramSpec `ebpf:"kprobe_tcp_close"`
+	KprobeTcpRecvmsg           *ebpf.ProgramSpec `ebpf:"kprobe_tcp_recvmsg"`
 	KretprobeSockRecvmsg       *ebpf.ProgramSpec `ebpf:"kretprobe_sock_recvmsg"`
+	KretprobeTcpRecvmsg        *ebpf.ProgramSpec `ebpf:"kretprobe_tcp_recvmsg"`
 	TracepointSysEnterRead     *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_read"`
 	TracepointSysEnterReadv    *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_readv"`
 	TracepointSysEnterRecvfrom *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_recvfrom"`
@@ -144,7 +146,9 @@ type HttpTracePrograms struct {
 	KprobeSockRecvmsg          *ebpf.Program `ebpf:"kprobe_sock_recvmsg"`
 	KprobeSockSendmsg          *ebpf.Program `ebpf:"kprobe_sock_sendmsg"`
 	KprobeTcpClose             *ebpf.Program `ebpf:"kprobe_tcp_close"`
+	KprobeTcpRecvmsg           *ebpf.Program `ebpf:"kprobe_tcp_recvmsg"`
 	KretprobeSockRecvmsg       *ebpf.Program `ebpf:"kretprobe_sock_recvmsg"`
+	KretprobeTcpRecvmsg        *ebpf.Program `ebpf:"kretprobe_tcp_recvmsg"`
 	TracepointSysEnterRead     *ebpf.Program `ebpf:"tracepoint_sys_enter_read"`
 	TracepointSysEnterReadv    *ebpf.Program `ebpf:"tracepoint_sys_enter_readv"`
 	TracepointSysEnterRecvfrom *ebpf.Program `ebpf:"tracepoint_sys_enter_recvfrom"`
@@ -160,7 +164,9 @@ func (p *HttpTracePrograms) Close() error {
 		p.KprobeSockRecvmsg,
 		p.KprobeSockSendmsg,
 		p.KprobeTcpClose,
+		p.KprobeTcpRecvmsg,
 		p.KretprobeSockRecvmsg,
+		p.KretprobeTcpRecvmsg,
 		p.TracepointSysEnterRead,
 		p.TracepointSysEnterReadv,
 		p.TracepointSysEnterRecvfrom,

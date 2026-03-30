@@ -180,11 +180,60 @@ static __always_inline int lookup_or_init_flow(__u64 sock_id, struct flow_state 
 	if (*state)
 		return 0;
 
+	zero.conn_id = ((__u64)bpf_get_prandom_u32() << 32) ^ bpf_ktime_get_ns() ^ sock_id;
 	if (bpf_map_update_elem(&flow_map, &sock_id, &zero, BPF_NOEXIST) < 0)
 		return -1;
 
 	*state = bpf_map_lookup_elem(&flow_map, &sock_id);
 	return *state ? 0 : -1;
+}
+
+/* next_chain_id 为每条连接生成稳定但不重复的请求编号：
+ * - conn_id 在 flow_state 初次创建时生成，避免短连接复用同一个 sock 地址时 chain_id 重复。
+ * - req_seq 在 keep-alive 连接上递增，保证同一连接上的多次请求/响应各自唯一。
+ */
+static __always_inline __u64 next_chain_id(struct flow_state *state)
+{
+	__u64 seq_component = 0;
+
+	if (!state)
+		return 0;
+
+	state->req_seq += 1;
+	seq_component = (__u64)state->req_seq << 32;
+	return state->conn_id ^ seq_component ^ state->rx_cursor;
+}
+
+static __always_inline void start_request_capture(struct flow_state *state, __u64 chain_id)
+{
+	if (!state)
+		return;
+
+	state->last_req_chain_id = chain_id;
+	state->req_frag_idx = 0;
+	state->req_capture_bytes = 0;
+	state->req_capture_stopped = 0;
+	state->req_active = 1;
+	state->response_pending = 1;
+
+	/* 新请求开始后，旧响应状态已经结束或失效，直接清掉，避免 keep-alive 上串流。 */
+	state->resp_active = 0;
+	state->resp_frag_idx = 0;
+	state->resp_capture_bytes = 0;
+	state->resp_capture_stopped = 0;
+}
+
+static __always_inline void start_response_capture(struct flow_state *state)
+{
+	if (!state)
+		return;
+
+	state->resp_frag_idx = 0;
+	state->resp_capture_bytes = 0;
+	state->resp_capture_stopped = 0;
+	state->resp_active = 1;
+	state->response_pending = 0;
+	state->req_active = 0;
 }
 
 static __always_inline int read_msg_iter(struct msghdr_compat *msg, struct iov_iter_compat *iter)
@@ -218,15 +267,6 @@ static __always_inline int read_prefix_from_iter(const struct iov_iter_compat *i
 	if (bpf_probe_read(buf, available, (const char *)iov.iov_base + skip) < 0)
 		return 0;
 	return available;
-}
-
-static __always_inline int read_prefix(struct msghdr_compat *msg, char *buf, __u32 buf_len)
-{
-	struct iov_iter_compat iter = {};
-
-	if (read_msg_iter(msg, &iter) < 0)
-		return 0;
-	return read_prefix_from_iter(&iter, buf, buf_len);
 }
 
 static __always_inline int looks_like_http_request(const char *buf, __u32 len)
@@ -555,6 +595,92 @@ static __always_inline __s32 consume_fd(__u64 pid_tgid, void *map)
 	return value;
 }
 
+static __always_inline int store_recv_args(struct sock_compat *sk, struct msghdr_compat *msg, __s32 fd)
+{
+	struct recv_args meta = {};
+	struct iov_iter_compat iter = {};
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+
+	if (fill_common_meta(&meta, sk, fd) < 0)
+		return 0;
+	if (!matches_filter(&meta))
+		return 0;
+
+	meta.msg_ptr = (__u64)msg;
+	if (read_msg_iter(msg, &iter) < 0 || !iter.count)
+		return 0;
+	meta.saved_iter = iter;
+	bpf_map_update_elem(&recv_args_map, &pid_tgid, &meta, BPF_ANY);
+	return 0;
+}
+
+/* handle_recv_return 统一处理 sock_recvmsg/tcp_recvmsg 的返回路径：
+ * - 新请求命中请求行时，分配新的 chain_id。
+ * - 同一请求的后续 recvmsg 调用沿用同一个 chain_id，并继续累计 fragment 索引。
+ */
+static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgid, __s64 ret)
+{
+	struct recv_args *meta = NULL;
+	struct recv_args emit_meta = {};
+	struct flow_state *state = NULL;
+	struct kernel_stats *stats = stats_lookup();
+	char prefix[16] = {};
+	int prefix_len = 0;
+	__u8 direction = DIR_UNKNOWN;
+	__u64 chain_id = 0;
+	__u64 seq_hint = 0;
+	__u16 flags = EVT_FLAG_HTTP_HINT;
+
+	meta = bpf_map_lookup_elem(&recv_args_map, &pid_tgid);
+	if (!meta)
+		return 0;
+	if (stats)
+		stats->recv_calls += 1;
+	if (ret <= 0)
+		goto cleanup;
+	if (lookup_or_init_flow(meta->sock_id, &state) < 0)
+		goto cleanup;
+
+	emit_meta = *meta;
+	swap_meta_endpoints(&emit_meta);
+
+	state->rx_cursor += ret;
+	seq_hint = state->rx_cursor;
+
+	prefix_len = read_prefix_from_iter(&meta->saved_iter, prefix, sizeof(prefix));
+	direction = detect_http_direction(prefix, prefix_len);
+	if (direction == DIR_REQUEST) {
+		chain_id = next_chain_id(state);
+		start_request_capture(state, chain_id);
+	} else if (state->req_active && state->last_req_chain_id && !state->req_capture_stopped) {
+		chain_id = state->last_req_chain_id;
+		flags = 0;
+	} else {
+		goto cleanup;
+	}
+
+	emit_meta.seq_hint = seq_hint;
+	{
+		struct capture_call call = {};
+
+		call.iter = &meta->saved_iter;
+		call.meta = &emit_meta;
+		call.chain_id = chain_id;
+		call.seq_hint = seq_hint;
+		call.frag_cursor = &state->req_frag_idx;
+		call.message_captured = &state->req_capture_bytes;
+		call.capture_stopped = &state->req_capture_stopped;
+		call.total_len = (__u32)ret;
+		call.base_flags = flags;
+		call.direction = DIR_REQUEST;
+		capture_message_from_iter(ctx, &call);
+	}
+
+cleanup:
+	bpf_map_delete_elem(&recv_args_map, &pid_tgid);
+	return 0;
+}
+
 SEC("tracepoint/syscalls/sys_enter_sendto")
 int tracepoint_sys_enter_sendto(struct trace_event_raw_sys_enter_compat *ctx)
 {
@@ -648,13 +774,7 @@ int BPF_KPROBE(kprobe_sock_sendmsg, void *sock_ptr, struct msghdr_compat *msg)
 	__u64 seq_hint = 0;
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = consume_fd(pid_tgid, &send_fd_map);
-	char prefix[16] = {};
-	int prefix_len = 0;
-	__u8 direction = DIR_UNKNOWN;
-	__u16 flags = EVT_FLAG_HTTP_HINT;
-	__u32 frag_cursor = 0;
-	__u32 message_captured = 0;
-	__u8 capture_stopped = 0;
+	__u16 flags = 0;
 
 	if (stats)
 		stats->send_calls += 1;
@@ -671,22 +791,30 @@ int BPF_KPROBE(kprobe_sock_sendmsg, void *sock_ptr, struct msghdr_compat *msg)
 	if (lookup_or_init_flow(sock_id, &state) < 0)
 		return 0;
 
-	prefix_len = read_prefix(msg, prefix, sizeof(prefix));
-	direction = detect_http_direction(prefix, prefix_len);
-	if (direction != DIR_RESPONSE)
-		return 0;
-
 	state->tx_cursor += iter.count;
 	seq_hint = state->tx_cursor;
-
-	chain_id = state->last_req_chain_id;
-	if (!chain_id)
-		chain_id = sock_id ^ seq_hint;
-
 	meta.seq_hint = seq_hint;
+
+	/* 发送侧不再依赖每次 sendmsg 都以 "HTTP/" 开头：
+	 * - 看到 request 后，把 response_pending 置 1。
+	 * - 第一次 sendmsg 到来时把它当作该请求的响应开始。
+	 * - 后续 body-only sendmsg 继续沿用同一个 chain_id 和 frag_idx。
+	 */
+	if (!state->last_req_chain_id)
+		return 0;
+
+	if (state->resp_active && !state->resp_capture_stopped) {
+		chain_id = state->last_req_chain_id;
+	} else if (state->response_pending) {
+		start_response_capture(state);
+		chain_id = state->last_req_chain_id;
+	} else {
+		return 0;
+	}
+
 	if (capture_message(ctx, msg, &meta, chain_id, seq_hint, DIR_RESPONSE,
-			    &frag_cursor, &message_captured,
-			    &capture_stopped, (__u32)iter.count, flags) < 0)
+			    &state->resp_frag_idx, &state->resp_capture_bytes,
+			    &state->resp_capture_stopped, (__u32)iter.count, flags) < 0)
 		return 0;
 
 	return 0;
@@ -699,94 +827,45 @@ SEC("kprobe/sock_recvmsg")
 int BPF_KPROBE(kprobe_sock_recvmsg, void *sock_ptr, struct msghdr_compat *msg)
 {
 	struct sock_compat *sk = NULL;
-	struct recv_args meta = {};
-	struct iov_iter_compat iter = {};
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = consume_fd(pid_tgid, &recv_fd_map);
 
 	if (extract_sk(sock_ptr, &sk) < 0)
 		return 0;
-	if (fill_common_meta(&meta, sk, fd) < 0)
-		return 0;
-	if (!matches_filter(&meta))
-		return 0;
+	return store_recv_args(sk, msg, fd);
+}
 
-	meta.msg_ptr = (__u64)msg;
-	if (read_msg_iter(msg, &iter) < 0)
-		return 0;
-	meta.saved_iter = iter;
-	if (bpf_map_update_elem(&recv_args_map, &pid_tgid, &meta, BPF_ANY) < 0)
-		return 0;
+SEC("kprobe/tcp_recvmsg")
+int BPF_KPROBE(kprobe_tcp_recvmsg, struct sock_compat *sk, struct msghdr_compat *msg)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__s32 fd = consume_fd(pid_tgid, &recv_fd_map);
 
-	return 0;
+	if (!sk)
+		return 0;
+	return store_recv_args(sk, msg, fd);
 }
 
 /* kretprobe/sock_recvmsg 负责读取响应明文，并把请求/响应通过同一个 chain_id 关联起来。 */
 SEC("kretprobe/sock_recvmsg")
 int BPF_KRETPROBE(kretprobe_sock_recvmsg)
 {
-	struct recv_args *meta = NULL;
-	struct recv_args emit_meta = {};
-	struct flow_state *state = NULL;
-	struct kernel_stats *stats = stats_lookup();
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s64 ret = PT_REGS_RC(ctx);
-	char prefix[16] = {};
-	int prefix_len = 0;
-	__u8 direction = DIR_UNKNOWN;
-	__u64 chain_id = 0;
-	__u64 seq_hint = 0;
-	__u16 flags = EVT_FLAG_HTTP_HINT;
-	__u32 frag_cursor = 0;
-	__u32 message_captured = 0;
-	__u8 capture_stopped = 0;
 
-	meta = bpf_map_lookup_elem(&recv_args_map, &pid_tgid);
-	if (!meta)
-		return 0;
-	if (stats)
-		stats->recv_calls += 1;
-	if (ret <= 0)
-		goto cleanup;
-	if (lookup_or_init_flow(meta->sock_id, &state) < 0)
-		goto cleanup;
-	emit_meta = *meta;
-	swap_meta_endpoints(&emit_meta);
-
-	prefix_len = read_prefix_from_iter(&meta->saved_iter, prefix, sizeof(prefix));
-	direction = detect_http_direction(prefix, prefix_len);
-	if (direction != DIR_REQUEST)
-		goto cleanup;
-
-	state->rx_cursor += ret;
-	seq_hint = state->rx_cursor;
-
-	chain_id = meta->sock_id ^ seq_hint;
-	state->last_req_chain_id = chain_id;
-
-	emit_meta.seq_hint = seq_hint;
-	{
-		struct capture_call call = {};
-
-		call.iter = &meta->saved_iter;
-		call.meta = &emit_meta;
-		call.chain_id = chain_id;
-		call.seq_hint = seq_hint;
-		call.frag_cursor = &frag_cursor;
-		call.message_captured = &message_captured;
-		call.capture_stopped = &capture_stopped;
-		call.total_len = (__u32)ret;
-		call.base_flags = flags;
-		call.direction = DIR_REQUEST;
-		if (capture_message_from_iter(ctx, &call) < 0)
-			goto cleanup;
-	}
-
-cleanup:
-	bpf_map_delete_elem(&recv_args_map, &pid_tgid);
-	return 0;
+	return handle_recv_return(ctx, pid_tgid, ret);
 }
 
+SEC("kretprobe/tcp_recvmsg")
+int BPF_KRETPROBE(kretprobe_tcp_recvmsg)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__s64 ret = PT_REGS_RC(ctx);
+
+	return handle_recv_return(ctx, pid_tgid, ret);
+}
+
+/* tcp_close 上报 close 控制事件，帮助用户态在 keep-alive/connection: close 场景下做最终收尾。 */
 SEC("kprobe/tcp_close")
 int BPF_KPROBE(kprobe_tcp_close, struct sock_compat *sk)
 {
