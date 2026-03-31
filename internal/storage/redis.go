@@ -60,7 +60,7 @@ func (s *RedisStore) Save(ctx context.Context, trace httptrace.TraceDocument) er
 			kind = "trace"
 		}
 	}
-	// 请求和响应分开存，使用同一个 chain_id 做关联，避免 response 覆盖 request。
+	// 请求和响应分开存，使用同一个 chain_id 去关联，避免 response 覆盖 request。
 	key := fmt.Sprintf("%s:%s:%d", s.keyPrefix, kind, trace.ChainID)
 	if err := s.client.Set(ctx, key, body, s.ttl).Err(); err != nil {
 		return fmt.Errorf("set redis key %s: %w", key, err)

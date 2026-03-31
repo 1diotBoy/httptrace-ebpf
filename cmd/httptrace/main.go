@@ -28,9 +28,13 @@ func main() {
 	flag.IntVar(&cfg.PerfPages, "perf-pages", cfg.PerfPages, "perf buffer pages per CPU")
 	flag.IntVar(&cfg.BatchSize, "batch-size", cfg.BatchSize, "events parsed per worker batch")
 	flag.IntVar(&cfg.WorkerCount, "workers", cfg.WorkerCount, "number of parser workers")
+	flag.IntVar(&cfg.RedisWorkers, "redis-workers", cfg.RedisWorkers, "number of async redis writer workers")
+	flag.IntVar(&cfg.RedisQueueSize, "redis-queue-size", cfg.RedisQueueSize, "buffered redis write queue size")
 	flag.DurationVar(&cfg.FlushInterval, "flush-interval", cfg.FlushInterval, "batch flush interval")
 	flag.DurationVar(&cfg.LogInterval, "log-interval", cfg.LogInterval, "stats log interval")
 	flag.BoolVar(&cfg.PrintHTTP, "print-http", cfg.PrintHTTP, "print parsed HTTP request/response to console")
+	flag.BoolVar(&cfg.PrintSummary, "print-summary", cfg.PrintSummary, "print one-line request/response summary to console")
+	flag.BoolVar(&cfg.DebugKernel, "debug-kernel", cfg.DebugKernel, "print extended kernel hook/branch diagnostics")
 	flag.DurationVar(&cfg.TransactionTTL, "txn-ttl", cfg.TransactionTTL, "idle transaction eviction TTL")
 	flag.IntVar(&cfg.MaxMessageBytes, "max-message-bytes", cfg.MaxMessageBytes, "maximum reassembled bytes kept per request/response before truncation")
 	flag.StringVar(&cfg.RedisAddr, "redis-addr", cfg.RedisAddr, "redis address, empty disables redis write")
@@ -51,6 +55,7 @@ func main() {
 	defer svc.Close()
 
 	runErrCh := make(chan error, 1)
+	// 启动goroutine执行svc.Run
 	go func() {
 		runErrCh <- svc.Run(ctx)
 	}()

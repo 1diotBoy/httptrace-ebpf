@@ -19,7 +19,9 @@
  * 为了兼容 4.19 上更严格的 verifier，这里把单次展开的分支数控制在可加载范围内。
  * 当前策略优先保证“单 iov 场景下最多采到 10KB”，这是大多数普通 HTTP 请求/响应的常见路径。
  */
-#define MAX_PAYLOAD_SIZE 1024
+#define EVENT_PAYLOAD_SIZE 1024
+#define MAX_PAYLOAD_SIZE 1023
+#define MAX_PAYLOAD_MASK 1023
 #define MAX_IOVECS 2
 #define MAX_CHUNKS_PER_IOV 5
 #define MAX_FRAGMENTS (MAX_IOVECS * MAX_CHUNKS_PER_IOV)
@@ -202,7 +204,7 @@ struct http_event {
 	__u8 flags;
 	__u16 family;
 	char comm[16];
-	unsigned char payload[MAX_PAYLOAD_SIZE];
+	unsigned char payload[EVENT_PAYLOAD_SIZE];
 };
 
 struct kernel_stats {
@@ -214,6 +216,23 @@ struct kernel_stats {
 	__u64 perf_errors;
 	__u64 truncations;
 	__u64 close_events;
+	__u64 sock_send_hits;
+	__u64 tcp_send_hits;
+	__u64 sock_recv_hits;
+	__u64 tcp_recv_hits;
+	__u64 recv_store_ok;
+	__u64 recv_store_no_iter;
+	__u64 recv_store_meta_fail;
+	__u64 recv_ret_no_meta;
+	__u64 recv_dir_request;
+	__u64 recv_dir_response;
+	__u64 recv_dir_unknown;
+	__u64 recv_fallback_local;
+	__u64 recv_fallback_keepalive;
+	__u64 send_no_req_chain;
+	__u64 send_resp_start;
+	__u64 send_resp_continue;
+	__u64 send_iter_empty;
 };
 
 struct trace_event_raw_sys_enter_compat {

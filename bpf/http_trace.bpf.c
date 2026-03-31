@@ -90,7 +90,43 @@ static __always_inline int extract_sk(void *sock_ptr, struct sock_compat **sk)
 	return 0;
 }
 
-static __always_inline int extract_tuple(struct sock_compat *sk, struct recv_args *meta)
+static __always_inline __attribute__((unused)) int has_any_endpoint_filter(void)
+{
+	struct filter_config cfg = {};
+
+	if (read_filter(&cfg) < 0)
+		return 0;
+	if (cfg.src_ip || cfg.dst_ip || cfg.src_port || cfg.dst_port)
+		return 1;
+	return 0;
+}
+
+/* 只看 socket 的本端/local endpoint。
+ * recv 路径里：
+ * - 服务端收到请求时，本端就是服务 IP/PORT。
+ * - 客户端收到响应时，本端则是客户端临时 IP/PORT。
+ * 因此 4.19 上 request fallback 只能按本端匹配，不能按“任意一端命中”对称匹配。
+ */
+static __always_inline __attribute__((unused)) int matches_local_endpoint_filter(const struct recv_args *meta)
+{
+	struct filter_config cfg = {};
+
+	if (!meta)
+		return 0;
+	if (read_filter(&cfg) < 0)
+		return 0;
+	if (cfg.src_ip && meta->src_ip == cfg.src_ip)
+		return 1;
+	if (cfg.dst_ip && meta->src_ip == cfg.dst_ip)
+		return 1;
+	if (cfg.src_port && meta->src_port == cfg.src_port)
+		return 1;
+	if (cfg.dst_port && meta->src_port == cfg.dst_port)
+		return 1;
+	return 0;
+}
+
+static __always_inline __attribute__((unused)) int extract_tuple(struct sock_compat *sk, struct recv_args *meta)
 {
 	struct sock_common_compat common = {};
 
@@ -114,7 +150,7 @@ static __always_inline int extract_tuple(struct sock_compat *sk, struct recv_arg
  * - 如果两边配置成同一个值，表示“任意一端命中这个值即可”。
  * - 如果两边是不同值，允许请求/响应方向翻转。
  */
-static __always_inline int match_u32_pair(__u32 cfg_src, __u32 cfg_dst, __u32 meta_src, __u32 meta_dst)
+static __always_inline __attribute__((unused)) int match_u32_pair(__u32 cfg_src, __u32 cfg_dst, __u32 meta_src, __u32 meta_dst)
 {
 	if (cfg_src && cfg_dst) {
 		if (cfg_src == cfg_dst)
@@ -129,7 +165,7 @@ static __always_inline int match_u32_pair(__u32 cfg_src, __u32 cfg_dst, __u32 me
 	return 1;
 }
 
-static __always_inline int match_u16_pair(__u16 cfg_src, __u16 cfg_dst, __u16 meta_src, __u16 meta_dst)
+static __always_inline __attribute__((unused)) int match_u16_pair(__u16 cfg_src, __u16 cfg_dst, __u16 meta_src, __u16 meta_dst)
 {
 	if (cfg_src && cfg_dst) {
 		if (cfg_src == cfg_dst)
@@ -150,7 +186,7 @@ static __always_inline int match_u16_pair(__u16 cfg_src, __u16 cfg_dst, __u16 me
  *   本机打本机或者未显式 bind 设备的连接经常是 0。
  * 真正的 ifname 精确过滤会在用户态按接口 IPv4 再补一层。
  */
-static __always_inline int matches_filter(const struct recv_args *meta)
+static __always_inline __attribute__((unused)) int matches_filter(const struct recv_args *meta)
 {
 	struct filter_config cfg = {};
 	struct kernel_stats *stats = stats_lookup();
@@ -302,6 +338,75 @@ static __always_inline int looks_like_http_request(const char *buf, __u32 len)
 	return 0;
 }
 
+/* 高并发下第一段 recv 有时只有 "G" / "PO" / "HEA" 这类半截方法名。
+ * 旧逻辑只认完整方法，偶发会漏掉这一条 request，最后表现成：
+ * - request 比压测样本少 1
+ * - response 反而多 1（孤儿响应）
+ * 这里补一层“方法名前缀”识别，尽量把第一包很短的请求也纳入同一个 chain。
+ */
+static __always_inline int looks_like_http_request_prefix(const char *buf, __u32 len)
+{
+	if (!buf || len == 0)
+		return 0;
+
+	if (len <= 3 &&
+	    buf[0] == 'G' &&
+	    (len < 2 || buf[1] == 'E') &&
+	    (len < 3 || buf[2] == 'T'))
+		return 1;
+	if (len <= 4 &&
+	    buf[0] == 'P' && buf[1] == 'O' &&
+	    (len < 3 || buf[2] == 'S') &&
+	    (len < 4 || buf[3] == 'T'))
+		return 1;
+	if (len <= 3 &&
+	    buf[0] == 'P' && buf[1] == 'U' &&
+	    (len < 3 || buf[2] == 'T'))
+		return 1;
+	if (len <= 5 &&
+	    buf[0] == 'P' && buf[1] == 'A' &&
+	    (len < 3 || buf[2] == 'T') &&
+	    (len < 4 || buf[3] == 'C') &&
+	    (len < 5 || buf[4] == 'H'))
+		return 1;
+	if (len <= 6 &&
+	    buf[0] == 'D' && buf[1] == 'E' &&
+	    (len < 3 || buf[2] == 'L') &&
+	    (len < 4 || buf[3] == 'E') &&
+	    (len < 5 || buf[4] == 'T') &&
+	    (len < 6 || buf[5] == 'E'))
+		return 1;
+	if (len <= 4 &&
+	    buf[0] == 'H' && buf[1] == 'E' &&
+	    (len < 3 || buf[2] == 'A') &&
+	    (len < 4 || buf[3] == 'D'))
+		return 1;
+	if (len <= 7 &&
+	    buf[0] == 'O' && buf[1] == 'P' &&
+	    (len < 3 || buf[2] == 'T') &&
+	    (len < 4 || buf[3] == 'I') &&
+	    (len < 5 || buf[4] == 'O') &&
+	    (len < 6 || buf[5] == 'N') &&
+	    (len < 7 || buf[6] == 'S'))
+		return 1;
+	if (len <= 5 &&
+	    buf[0] == 'T' && buf[1] == 'R' &&
+	    (len < 3 || buf[2] == 'A') &&
+	    (len < 4 || buf[3] == 'C') &&
+	    (len < 5 || buf[4] == 'E'))
+		return 1;
+	if (len <= 7 &&
+	    buf[0] == 'C' && buf[1] == 'O' &&
+	    (len < 3 || buf[2] == 'N') &&
+	    (len < 4 || buf[3] == 'N') &&
+	    (len < 5 || buf[4] == 'E') &&
+	    (len < 6 || buf[5] == 'C') &&
+	    (len < 7 || buf[6] == 'T'))
+		return 1;
+
+	return 0;
+}
+
 static __always_inline int looks_like_http_response(const char *buf, __u32 len)
 {
 	if (len < 5)
@@ -374,21 +479,24 @@ static __attribute__((noinline)) int emit_control_event(void *ctx, const struct 
 }
 
 /* emit_data_event 把内核态采到的一段 HTTP 明文连同元数据一起推到 perf buffer。
- * 为了兼容更严格的 verifier，这里固定从用户缓冲拷贝一个 MAX_PAYLOAD_SIZE 的窗口，
- * 但真正的有效长度仍然通过 payload_len 告诉用户态。
+ * 这里必须只按 safe_len 读取真实有效字节。
+ * 如果像旧版本那样固定读 MAX_PAYLOAD_SIZE，在 4.19 上很容易因为越过用户缓冲区边界而失败，
+ * 最终表现成：send/recv hook 都命中了，但 request/response fragment 始终是 0。
  */
 static __attribute__((noinline)) int emit_data_event(void *ctx, const struct emit_call *call)
 {
 	struct http_event *event = NULL;
 	struct kernel_stats *stats = stats_lookup();
 	__u32 key = 0;
-	__u32 safe_len = call->payload_len;
+	__u32 safe_len = call->payload_len & MAX_PAYLOAD_MASK;
 
 	event = bpf_map_lookup_elem(&scratch_heap, &key);
 	if (!event)
 		return -1;
-	if (safe_len > MAX_PAYLOAD_SIZE)
-		safe_len = MAX_PAYLOAD_SIZE;
+	/* 4.19 verifier 对 helper 的变长 size 参数非常敏感。
+	 * 这里直接用 “var &= const” 把长度硬限制到 0..1023，
+	 * 避免 verifier 报 "R2 unbounded memory access"。
+	 */
 
 	event->ts_ns = bpf_ktime_get_ns();
 	event->chain_id = call->chain_id;
@@ -409,8 +517,11 @@ static __attribute__((noinline)) int emit_data_event(void *ctx, const struct emi
 	event->flags = call->flags;
 	event->family = call->meta->family;
 	__builtin_memcpy(event->comm, call->meta->comm, sizeof(event->comm));
-	if (safe_len > 0 && bpf_probe_read(event->payload, MAX_PAYLOAD_SIZE, call->src) < 0)
+	if (safe_len > 0 && bpf_probe_read(event->payload, safe_len, call->src) < 0) {
+		if (stats)
+			stats->perf_errors += 1;
 		return -1;
+	}
 
 	if (bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, event, sizeof(*event)) < 0) {
 		if (stats)
@@ -518,33 +629,12 @@ static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct
 	return 0;
 }
 
-static __always_inline int capture_message(void *ctx, struct msghdr_compat *msg,
-					   const struct recv_args *meta, __u64 chain_id,
-					   __u64 seq_hint, __u8 direction, __u32 *frag_cursor,
-					   __u32 *message_captured, __u8 *capture_stopped,
-					   __u32 total_len, __u16 base_flags)
-{
-	struct iov_iter_compat iter = {};
-	struct capture_call call = {};
-
-	if (read_msg_iter(msg, &iter) < 0)
-		return -1;
-	call.iter = &iter;
-	call.meta = meta;
-	call.chain_id = chain_id;
-	call.seq_hint = seq_hint;
-	call.frag_cursor = frag_cursor;
-	call.message_captured = message_captured;
-	call.capture_stopped = capture_stopped;
-	call.total_len = total_len;
-	call.base_flags = base_flags;
-	call.direction = direction;
-	return capture_message_from_iter(ctx, &call);
-}
-
-/* fill_common_meta 统一补齐 PID/TID/FD/五元组/comm 等基础元数据。 */
-static __always_inline int fill_common_meta(struct recv_args *meta, struct sock_compat *sk,
-					    __s32 fd)
+/* fill_common_meta 统一补齐 PID/TID/FD/comm 等基础元数据。
+ * 五元组和接口信息统一留给用户态基于 pid+fd+/proc 反查，避免不同内核版本上的 sock
+ * 布局差异把整个采集链路卡死，也顺手把 BPF 主程序体积压下来。
+ */
+static __always_inline void fill_common_meta(struct recv_args *meta, struct sock_compat *sk,
+					     __s32 fd)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 
@@ -555,14 +645,14 @@ static __always_inline int fill_common_meta(struct recv_args *meta, struct sock_
 	meta->fd = fd;
 	meta->seq_hint = 0;
 	bpf_get_current_comm(meta->comm, sizeof(meta->comm));
-	return extract_tuple(sk, meta);
+	meta->family = 0;
 }
 
 /* recvmsg 看到的是“对端 -> 本端”的消息方向。
  * sock_common 里的地址默认按“本端/local -> 对端/peer”摆放，
  * 所以在 recv 路径真正上报事件前需要交换一次，保证用户态看到的 src/dst
  * 就是这条 HTTP 消息本身的源/目的。 */
-static __always_inline void swap_meta_endpoints(struct recv_args *meta)
+static __always_inline __attribute__((unused)) void swap_meta_endpoints(struct recv_args *meta)
 {
 	__u32 ip = 0;
 	__u16 port = 0;
@@ -600,17 +690,25 @@ static __always_inline int store_recv_args(struct sock_compat *sk, struct msghdr
 	struct recv_args meta = {};
 	struct iov_iter_compat iter = {};
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct kernel_stats *stats = stats_lookup();
+	struct recv_args *existing = NULL;
 
-	if (fill_common_meta(&meta, sk, fd) < 0)
+	existing = bpf_map_lookup_elem(&recv_args_map, &pid_tgid);
+	if (existing && fd < 0)
 		return 0;
-	if (!matches_filter(&meta))
-		return 0;
+
+	fill_common_meta(&meta, sk, fd);
 
 	meta.msg_ptr = (__u64)msg;
-	if (read_msg_iter(msg, &iter) < 0 || !iter.count)
+	if (read_msg_iter(msg, &iter) < 0 || !iter.count) {
+		if (stats)
+			stats->recv_store_no_iter += 1;
 		return 0;
+	}
 	meta.saved_iter = iter;
 	bpf_map_update_elem(&recv_args_map, &pid_tgid, &meta, BPF_ANY);
+	if (stats)
+		stats->recv_store_ok += 1;
 	return 0;
 }
 
@@ -632,8 +730,11 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 	__u16 flags = EVT_FLAG_HTTP_HINT;
 
 	meta = bpf_map_lookup_elem(&recv_args_map, &pid_tgid);
-	if (!meta)
+	if (!meta) {
+		if (stats)
+			stats->recv_ret_no_meta += 1;
 		return 0;
+	}
 	if (stats)
 		stats->recv_calls += 1;
 	if (ret <= 0)
@@ -642,20 +743,33 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 		goto cleanup;
 
 	emit_meta = *meta;
-	swap_meta_endpoints(&emit_meta);
 
 	state->rx_cursor += ret;
 	seq_hint = state->rx_cursor;
 
 	prefix_len = read_prefix_from_iter(&meta->saved_iter, prefix, sizeof(prefix));
 	direction = detect_http_direction(prefix, prefix_len);
+	if (direction == DIR_UNKNOWN && looks_like_http_request_prefix(prefix, prefix_len))
+		direction = DIR_REQUEST;
 	if (direction == DIR_REQUEST) {
+		if (stats)
+			stats->recv_dir_request += 1;
 		chain_id = next_chain_id(state);
 		start_request_capture(state, chain_id);
+	} else if (direction == DIR_RESPONSE) {
+		if (stats)
+			stats->recv_dir_response += 1;
+		goto cleanup;
 	} else if (state->req_active && state->last_req_chain_id && !state->req_capture_stopped) {
+		if (stats)
+			stats->recv_dir_unknown += 1;
 		chain_id = state->last_req_chain_id;
 		flags = 0;
 	} else if (state->last_req_chain_id && !state->response_pending) {
+		if (stats) {
+			stats->recv_dir_unknown += 1;
+			stats->recv_fallback_keepalive += 1;
+		}
 		/* 长连接顺序调用时，下一条请求未必总是从当前 recv 缓冲的第一个字节开始，
 		 * 这时仅靠方法行前缀判断会漏掉第二、第三个接口。
 		 * 这里在“上一轮已经进入响应阶段”的前提下，允许把新的 recv 直接视作下一条 request。
@@ -664,6 +778,8 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 		start_request_capture(state, chain_id);
 		flags = 0;
 	} else {
+		if (stats)
+			stats->recv_dir_unknown += 1;
 		goto cleanup;
 	}
 
@@ -686,6 +802,81 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 
 cleanup:
 	bpf_map_delete_elem(&recv_args_map, &pid_tgid);
+	return 0;
+}
+
+static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_compat *sk,
+						       struct msghdr_compat *msg, __s32 fd)
+{
+	struct recv_args meta = {};
+	struct flow_state *state = NULL;
+	struct iov_iter_compat iter = {};
+	struct kernel_stats *stats = stats_lookup();
+	__u64 sock_id = 0;
+	__u64 chain_id = 0;
+	__u64 seq_hint = 0;
+	__u16 flags = 0;
+
+	if (stats)
+		stats->send_calls += 1;
+	if (!sk)
+		return 0;
+	fill_common_meta(&meta, sk, fd);
+	if (read_msg_iter(msg, &iter) < 0 || !iter.count) {
+		if (stats)
+			stats->send_iter_empty += 1;
+		return 0;
+	}
+
+	sock_id = meta.sock_id;
+	if (lookup_or_init_flow(sock_id, &state) < 0)
+		return 0;
+
+	state->tx_cursor += iter.count;
+	seq_hint = state->tx_cursor;
+	meta.seq_hint = seq_hint;
+
+	/* 对 TCP 响应来说，tcp_sendmsg 的第一段不一定都以 "HTTP/" 开头。
+	 * 只要同一连接上已经有活跃 request，就直接把 send 路径视作 response。
+	 */
+	if (!state->last_req_chain_id) {
+		if (stats)
+			stats->send_no_req_chain += 1;
+		return 0;
+	}
+
+	if (state->resp_active && !state->resp_capture_stopped) {
+		if (stats)
+			stats->send_resp_continue += 1;
+		chain_id = state->last_req_chain_id;
+	} else if (state->response_pending) {
+		start_response_capture(state);
+		if (stats)
+			stats->send_resp_start += 1;
+		chain_id = state->last_req_chain_id;
+	} else {
+		if (stats)
+			stats->send_no_req_chain += 1;
+		return 0;
+	}
+
+	{
+		struct capture_call call = {};
+
+		call.iter = &iter;
+		call.meta = &meta;
+		call.chain_id = chain_id;
+		call.seq_hint = seq_hint;
+		call.frag_cursor = &state->resp_frag_idx;
+		call.message_captured = &state->resp_capture_bytes;
+		call.capture_stopped = &state->resp_capture_stopped;
+		call.total_len = (__u32)iter.count;
+		call.base_flags = flags;
+		call.direction = DIR_RESPONSE;
+		if (capture_message_from_iter(ctx, &call) < 0)
+			return 0;
+	}
+
 	return 0;
 }
 
@@ -773,59 +964,26 @@ SEC("kprobe/sock_sendmsg")
 int BPF_KPROBE(kprobe_sock_sendmsg, void *sock_ptr, struct msghdr_compat *msg)
 {
 	struct sock_compat *sk = NULL;
-	struct recv_args meta = {};
-	struct flow_state *state = NULL;
-	struct iov_iter_compat iter = {};
-	struct kernel_stats *stats = stats_lookup();
-	__u64 sock_id = 0;
-	__u64 chain_id = 0;
-	__u64 seq_hint = 0;
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = consume_fd(pid_tgid, &send_fd_map);
-	__u16 flags = 0;
-
+	struct kernel_stats *stats = stats_lookup();
 	if (stats)
-		stats->send_calls += 1;
+		stats->sock_send_hits += 1;
 	if (extract_sk(sock_ptr, &sk) < 0)
 		return 0;
-	if (fill_common_meta(&meta, sk, fd) < 0)
-		return 0;
-	if (!matches_filter(&meta))
-		return 0;
-	if (read_msg_iter(msg, &iter) < 0 || !iter.count)
-		return 0;
+	return handle_send_entry(ctx, sk, msg, fd);
+}
 
-	sock_id = meta.sock_id;
-	if (lookup_or_init_flow(sock_id, &state) < 0)
-		return 0;
+SEC("kprobe/tcp_sendmsg")
+int BPF_KPROBE(kprobe_tcp_sendmsg, struct sock_compat *sk, struct msghdr_compat *msg)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__s32 fd = consume_fd(pid_tgid, &send_fd_map);
+	struct kernel_stats *stats = stats_lookup();
+	if (stats)
+		stats->tcp_send_hits += 1;
 
-	state->tx_cursor += iter.count;
-	seq_hint = state->tx_cursor;
-	meta.seq_hint = seq_hint;
-
-	/* 发送侧不再依赖每次 sendmsg 都以 "HTTP/" 开头：
-	 * - 看到 request 后，把 response_pending 置 1。
-	 * - 第一次 sendmsg 到来时把它当作该请求的响应开始。
-	 * - 后续 body-only sendmsg 继续沿用同一个 chain_id 和 frag_idx。
-	 */
-	if (!state->last_req_chain_id)
-		return 0;
-
-	if (state->resp_active && !state->resp_capture_stopped) {
-		chain_id = state->last_req_chain_id;
-	} else if (state->response_pending) {
-		start_response_capture(state);
-		chain_id = state->last_req_chain_id;
-	} else {
-		return 0;
-	}
-
-	if (capture_message(ctx, msg, &meta, chain_id, seq_hint, DIR_RESPONSE,
-			    &state->resp_frag_idx, &state->resp_capture_bytes,
-			    &state->resp_capture_stopped, (__u32)iter.count, flags) < 0)
-		return 0;
-
-	return 0;
+	return handle_send_entry(ctx, sk, msg, fd);
 }
 
 SEC("kprobe/sock_recvmsg")
@@ -837,6 +995,9 @@ int BPF_KPROBE(kprobe_sock_recvmsg, void *sock_ptr, struct msghdr_compat *msg)
 	struct sock_compat *sk = NULL;
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = consume_fd(pid_tgid, &recv_fd_map);
+	struct kernel_stats *stats = stats_lookup();
+	if (stats)
+		stats->sock_recv_hits += 1;
 
 	if (extract_sk(sock_ptr, &sk) < 0)
 		return 0;
@@ -848,6 +1009,9 @@ int BPF_KPROBE(kprobe_tcp_recvmsg, struct sock_compat *sk, struct msghdr_compat 
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = consume_fd(pid_tgid, &recv_fd_map);
+	struct kernel_stats *stats = stats_lookup();
+	if (stats)
+		stats->tcp_recv_hits += 1;
 
 	if (!sk)
 		return 0;
@@ -885,13 +1049,11 @@ int BPF_KPROBE(kprobe_tcp_close, struct sock_compat *sk)
 
 	if (lookup_or_init_flow(sock_id, &state) < 0)
 		return 0;
-	if (fill_common_meta(&meta, sk, -1) < 0)
-		goto cleanup;
+	fill_common_meta(&meta, sk, -1);
 
 	chain_id = state->last_req_chain_id;
 	emit_control_event(ctx, &meta, chain_id, sock_id, EVT_FLAG_CLOSE);
 
-cleanup:
 	if (stats)
 		stats->close_events += 1;
 	bpf_map_delete_elem(&flow_map, &sock_id);

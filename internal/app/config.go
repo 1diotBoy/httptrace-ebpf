@@ -24,9 +24,13 @@ type Config struct {
 	PerfPages       int
 	BatchSize       int
 	WorkerCount     int
+	RedisWorkers    int
+	RedisQueueSize  int
 	FlushInterval   time.Duration
 	LogInterval     time.Duration
 	PrintHTTP       bool
+	PrintSummary    bool
+	DebugKernel     bool
 	TransactionTTL  time.Duration
 	MaxMessageBytes int
 	RedisAddr       string
@@ -49,21 +53,32 @@ type ResolvedFilter struct {
 	DstPort      uint16
 }
 
-// DefaultConfig 返回 tracer 的默认运行参数。
+// 默认运行参数。
 func DefaultConfig() Config {
 	return Config{
 		CaptureBytes:    10 * 1024,
-		PerfPages:       64,
+		PerfPages:       256,
 		BatchSize:       100,
 		WorkerCount:     runtime.NumCPU(),
+		RedisWorkers:    max(1, runtime.NumCPU()/2),
+		RedisQueueSize:  8192,
 		FlushInterval:   200 * time.Millisecond,
 		LogInterval:     5 * time.Second,
 		PrintHTTP:       true,
+		PrintSummary:    true,
+		DebugKernel:     false,
 		TransactionTTL:  2 * time.Minute,
 		MaxMessageBytes: 10 * 1024,
 		RedisKeyPrefix:  "http-trace",
 		RedisTTL:        24 * time.Hour,
 	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // PerfBufferBytes 把 perf buffer 页数转换成字节数。
@@ -74,7 +89,7 @@ func (c Config) PerfBufferBytes() int {
 	return c.PerfPages * os.Getpagesize()
 }
 
-// BuildFilter 只负责构造内核态使用的过滤配置。
+// 配置内核态过滤
 func (c Config) BuildFilter() (bpfgen.HttpTraceFilterConfig, error) {
 	var filter bpfgen.HttpTraceFilterConfig
 

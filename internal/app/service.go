@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -37,6 +38,7 @@ type Service struct {
 	filter    ResolvedFilter
 	assembler *httptrace.Assembler
 	store     *storage.RedisStore
+	resolver  *socketResolver
 	stats     *stats
 }
 
@@ -46,9 +48,12 @@ type stats struct {
 	requests      atomic.Uint64
 	responses     atomic.Uint64
 	redisWrites   atomic.Uint64
+	redisFailures atomic.Uint64
 	parseFailures atomic.Uint64
 	evicted       atomic.Uint64
 	userFiltered  atomic.Uint64
+	tupleResolved atomic.Uint64
+	tupleMiss     atomic.Uint64
 }
 
 func NewService(cfg Config) (*Service, error) {
@@ -65,6 +70,7 @@ func NewService(cfg Config) (*Service, error) {
 		filter:    filter,
 		assembler: httptrace.NewAssembler(cfg.MaxMessageBytes, cfg.TransactionTTL),
 		store:     store,
+		resolver:  newSocketResolver(15 * time.Second),
 		stats:     &stats{},
 	}, nil
 }
@@ -78,7 +84,7 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("remove memlock: %w", err)
 	}
 
-	log.Printf("loading bpf objects...")
+	log.Printf("加载ebpf 对象...")
 	stopLoadWatch := startPhaseWatch(ctx, "bpf object load", 2*time.Second)
 	objs, err := bpfgen.LoadObjects(nil)
 	stopLoadWatch()
@@ -108,7 +114,15 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	defer reader.Close()
 
-	workers := s.startWorkers(ctx)
+	writeCh, writersDone := s.startRedisWriters(ctx)
+	defer func() {
+		if writeCh != nil {
+			close(writeCh)
+		}
+		writersDone.Wait()
+	}()
+
+	workers := s.startWorkers(ctx, writeCh)
 	defer func() {
 		for _, ch := range workers {
 			close(ch)
@@ -150,14 +164,66 @@ func (s *Service) Run(ctx context.Context) error {
 // 真正运行时还会叠加一层用户态补偿过滤，用来修正 socket 层 ifindex/方向翻转问题。
 func (s *Service) installFilter(objs *bpfgen.HttpTraceObjects) error {
 	key := uint32(0)
-	if err := objs.FilterMap.Update(&key, &s.filter.Kernel, ebpf.UpdateAny); err != nil {
+	kernelFilter := s.filter.Kernel
+	if usesLegacySockABI() {
+		// 4.x 上 sock 结构布局在不同发行版/回移内核间差异更大，
+		// 内核态五元组提取并不总是可靠。这里关闭 endpoint 过滤，
+		// 先保证 payload 能上送，再由用户态用 pid+fd 反查 socket tuple 后精确过滤。
+		kernelFilter.Ifindex = 0
+		kernelFilter.SrcIp = 0
+		kernelFilter.DstIp = 0
+		kernelFilter.SrcPort = 0
+		kernelFilter.DstPort = 0
+		log.Printf("legacy 4.x detected: kernel endpoint filters disabled; tuple filter will be enforced in user space")
+	}
+	if err := objs.FilterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update filter map: %w", err)
 	}
 	return nil
 }
 
+func (s *Service) startRedisWriters(ctx context.Context) (chan httptrace.Update, *sync.WaitGroup) {
+	var wg sync.WaitGroup
+
+	if s.store == nil {
+		return nil, &wg
+	}
+	workerCount := s.cfg.RedisWorkers
+	if workerCount <= 0 {
+		workerCount = max(1, runtime.NumCPU()/2)
+	}
+	queueSize := s.cfg.RedisQueueSize
+	if queueSize <= 0 {
+		queueSize = 8192
+	}
+	ch := make(chan httptrace.Update, queueSize)
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case update, ok := <-ch:
+					if !ok {
+						return
+					}
+					if err := s.store.Save(ctx, update.Trace); err != nil {
+						s.stats.redisFailures.Add(1)
+						log.Printf("[redis-worker=%d] save error: %v", workerID, err)
+						continue
+					}
+					s.stats.redisWrites.Add(1)
+				}
+			}
+		}(i)
+	}
+	return ch, &wg
+}
+
 // startWorkers 启动批量解析 worker。每个 worker 固定一个 OS 线程，减少高并发下的调度抖动。
-func (s *Service) startWorkers(ctx context.Context) []chan httptrace.Event {
+func (s *Service) startWorkers(ctx context.Context, writeCh chan<- httptrace.Update) []chan httptrace.Event {
 	workerCount := s.cfg.WorkerCount
 	if workerCount <= 0 {
 		workerCount = runtime.NumCPU()
@@ -165,14 +231,14 @@ func (s *Service) startWorkers(ctx context.Context) []chan httptrace.Event {
 
 	workers := make([]chan httptrace.Event, workerCount)
 	for i := 0; i < workerCount; i++ {
-		workers[i] = make(chan httptrace.Event, s.cfg.BatchSize*4)
-		go s.workerLoop(ctx, i, workers[i])
+		workers[i] = make(chan httptrace.Event, s.cfg.BatchSize*16)
+		go s.workerLoop(ctx, i, workers[i], writeCh)
 	}
 	return workers
 }
 
 // workerLoop 负责批量调用 assembler、打印解析结果、落 Redis。
-func (s *Service) workerLoop(ctx context.Context, workerID int, ch <-chan httptrace.Event) {
+func (s *Service) workerLoop(ctx context.Context, workerID int, ch <-chan httptrace.Event, writeCh chan<- httptrace.Update) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -189,20 +255,24 @@ func (s *Service) workerLoop(ctx context.Context, workerID int, ch <-chan httptr
 				continue
 			}
 			for _, update := range updates {
-				log.Printf("[worker=%d] %s", workerID, update.Trace.SummaryLine())
-				if s.cfg.PrintHTTP {
-					s.printHTTPTrace(workerID, update)
-				}
-				if err := s.store.Save(ctx, update.Trace); err != nil {
-					log.Printf("[worker=%d] redis save error: %v", workerID, err)
-					continue
-				}
-				s.stats.redisWrites.Add(1)
 				if update.Kind == "request" {
 					s.stats.requests.Add(1)
 				}
 				if update.Kind == "response" {
 					s.stats.responses.Add(1)
+				}
+				if s.cfg.PrintSummary {
+					log.Printf("[worker=%d] %s", workerID, update.Trace.SummaryLine())
+				}
+				if s.cfg.PrintHTTP {
+					s.printHTTPTrace(workerID, update)
+				}
+				if writeCh != nil {
+					select {
+					case <-ctx.Done():
+						return
+					case writeCh <- update:
+					}
 				}
 			}
 		}
@@ -329,13 +399,20 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 		}
 
 		event := normalizeEvent(raw)
+		if resolved, ok := s.resolver.Resolve(event); ok {
+			event = resolved
+			s.stats.tupleResolved.Add(1)
+		} else if event.FD >= 0 && missingTuple(event) {
+			s.stats.tupleMiss.Add(1)
+		}
 		if !s.filter.Match(event) {
 			count := s.stats.userFiltered.Add(1)
 			if count <= 5 {
 				log.Printf(
-					"user filtered event chain=%d dir=%d ifindex=%d %s:%d -> %s:%d comm=%s",
+					"user filtered event chain=%d dir=%d fd=%d ifindex=%d %s:%d -> %s:%d comm=%s",
 					event.ChainID,
 					event.Direction,
+					event.FD,
 					event.IfIndex,
 					event.SrcIP,
 					event.SrcPort,
@@ -380,7 +457,7 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.HttpTraceObjects) er
 				continue
 			}
 			log.Printf(
-				"stats kernel(send_calls=%d recv_calls=%d request_fragments=%d response_fragments=%d filtered=%d perf_errors=%d truncations=%d) user(perf_received=%d lost=%d requests=%d responses=%d redis=%d evicted=%d user_filtered=%d)",
+				"stats kernel(send_calls=%d recv_calls=%d request_fragments=%d response_fragments=%d filtered=%d perf_errors=%d truncations=%d) user(perf_received=%d lost=%d requests=%d responses=%d redis=%d redis_failures=%d parse_failures=%d evicted=%d user_filtered=%d tuple_resolved=%d tuple_miss=%d)",
 				kstats.SendCalls,
 				kstats.RecvCalls,
 				kstats.SendEvents,
@@ -393,26 +470,93 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.HttpTraceObjects) er
 				s.stats.requests.Load(),
 				s.stats.responses.Load(),
 				s.stats.redisWrites.Load(),
+				s.stats.redisFailures.Load(),
+				s.stats.parseFailures.Load(),
 				s.stats.evicted.Load(),
 				s.stats.userFiltered.Load(),
+				s.stats.tupleResolved.Load(),
+				s.stats.tupleMiss.Load(),
 			)
+			if s.cfg.DebugKernel {
+				log.Printf(
+					"kernel debug(sock_send_hits=%d tcp_send_hits=%d sock_recv_hits=%d tcp_recv_hits=%d recv_store_ok=%d recv_store_no_iter=%d recv_store_meta_fail=%d recv_ret_no_meta=%d recv_dir_request=%d recv_dir_response=%d recv_dir_unknown=%d recv_fallback_local=%d recv_fallback_keepalive=%d send_no_req_chain=%d send_resp_start=%d send_resp_continue=%d send_iter_empty=%d)",
+					kstats.SockSendHits,
+					kstats.TcpSendHits,
+					kstats.SockRecvHits,
+					kstats.TcpRecvHits,
+					kstats.RecvStoreOk,
+					kstats.RecvStoreNoIter,
+					kstats.RecvStoreMetaFail,
+					kstats.RecvRetNoMeta,
+					kstats.RecvDirRequest,
+					kstats.RecvDirResponse,
+					kstats.RecvDirUnknown,
+					kstats.RecvFallbackLocal,
+					kstats.RecvFallbackKeepalive,
+					kstats.SendNoReqChain,
+					kstats.SendRespStart,
+					kstats.SendRespContinue,
+					kstats.SendIterEmpty,
+				)
+			}
 		}
 	}
 }
 
 // attachAll 统一挂载 kprobe/kretprobe/tracepoint，并打印挂载成功信息。
+// 这里优先坚持 socket 层的 sock_sendmsg/sock_recvmsg：
+// - 这一层看到的就是应用层 send/recv 的明文边界，不需要 TCP 重组。
+// - 4.x 真正不稳定的是 __sock_sendmsg/__sock_recvmsg 的 ABI，不是 sock_sendmsg/sock_recvmsg。
+// - 所以 4.x 的兼容策略应该是“避开 __sock_*，但继续保留 sock_*”，而不是直接收敛到 tcp_*。
 func attachAll(objs *bpfgen.HttpTraceObjects) ([]link.Link, error) {
 	var attached []link.Link
+	legacySockABI := usesLegacySockABI()
 
-	required := []struct {
+	required := make([]struct {
 		symbols []string
 		ret     bool
 		prog    *ebpf.Program
-	}{
-		{symbols: []string{"__sock_sendmsg", "sock_sendmsg"}, prog: objs.KprobeSockSendmsg},
-		{symbols: []string{"sock_recvmsg", "__sock_recvmsg"}, prog: objs.KprobeSockRecvmsg},
-		{symbols: []string{"sock_recvmsg", "__sock_recvmsg"}, ret: true, prog: objs.KretprobeSockRecvmsg},
+	}, 0, 3)
+
+	if legacySockABI {
+		log.Printf("using legacy socket hook strategy: prefer sock_sendmsg/sock_recvmsg on 4.x and avoid __sock_* ABI drift")
+		required = append(required,
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"sock_sendmsg"}, prog: objs.KprobeSockSendmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"sock_recvmsg"}, prog: objs.KprobeSockRecvmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"sock_recvmsg"}, ret: true, prog: objs.KretprobeSockRecvmsg},
+		)
+	} else {
+		required = append(required,
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"__sock_sendmsg", "sock_sendmsg"}, prog: objs.KprobeSockSendmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"sock_recvmsg", "__sock_recvmsg"}, prog: objs.KprobeSockRecvmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"sock_recvmsg", "__sock_recvmsg"}, ret: true, prog: objs.KretprobeSockRecvmsg},
+		)
 	}
+
 	for _, item := range required {
 		l, err := attachOne(item.symbols, item.ret, item.prog)
 		if err != nil {
@@ -427,11 +571,21 @@ func attachAll(objs *bpfgen.HttpTraceObjects) ([]link.Link, error) {
 		ret     bool
 		prog    *ebpf.Program
 	}{
-		// 4.19 上部分收包路径更容易命中 tcp_recvmsg；
-		// 它与 sock_recvmsg 共用同一个暂存 map，哪个更靠近真正执行路径就由哪个产出事件。
-		{symbols: []string{"tcp_recvmsg"}, prog: objs.KprobeTcpRecvmsg},
-		{symbols: []string{"tcp_recvmsg"}, ret: true, prog: objs.KretprobeTcpRecvmsg},
 		{symbols: []string{"tcp_close"}, prog: objs.KprobeTcpClose},
+	}
+	if !legacySockABI {
+		optionalKprobes = append(optionalKprobes,
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_recvmsg"}, prog: objs.KprobeTcpRecvmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_recvmsg"}, ret: true, prog: objs.KretprobeTcpRecvmsg},
+		)
 	}
 	for _, item := range optionalKprobes {
 		l, err := attachOne(item.symbols, item.ret, item.prog)
@@ -496,6 +650,30 @@ func closeAll(items []link.Link) {
 	for _, item := range items {
 		item.Close()
 	}
+}
+
+// usesLegacySockABI 检测 4.x 风格的 socket API。
+// 这类内核上真正容易漂移的是 __sock_sendmsg/__sock_recvmsg 的 ABI，
+// 但 sock_sendmsg/sock_recvmsg 这一层依然更接近应用层 send/recv 语义。
+// 因此 4.x 只需要避开 __sock_*，不需要退化成把 tcp_* 当主采集路径。
+func usesLegacySockABI() bool {
+	var uts syscall.Utsname
+	if err := syscall.Uname(&uts); err != nil {
+		return false
+	}
+	release := strings.TrimSpace(cStringInt8(uts.Release[:]))
+	return strings.HasPrefix(release, "4.")
+}
+
+func cStringInt8(raw []int8) string {
+	var b strings.Builder
+	for _, c := range raw {
+		if c == 0 {
+			break
+		}
+		b.WriteByte(byte(c))
+	}
+	return b.String()
 }
 
 // startPhaseWatch 在启动的关键阶段周期性打印心跳，避免旧内核上长时间 verifier
@@ -607,6 +785,23 @@ func readKernelStats(m *ebpf.Map) (bpfgen.HttpTraceKernelStats, error) {
 		total.PerfErrors += v.PerfErrors
 		total.Truncations += v.Truncations
 		total.CloseEvents += v.CloseEvents
+		total.SockSendHits += v.SockSendHits
+		total.TcpSendHits += v.TcpSendHits
+		total.SockRecvHits += v.SockRecvHits
+		total.TcpRecvHits += v.TcpRecvHits
+		total.RecvStoreOk += v.RecvStoreOk
+		total.RecvStoreNoIter += v.RecvStoreNoIter
+		total.RecvStoreMetaFail += v.RecvStoreMetaFail
+		total.RecvRetNoMeta += v.RecvRetNoMeta
+		total.RecvDirRequest += v.RecvDirRequest
+		total.RecvDirResponse += v.RecvDirResponse
+		total.RecvDirUnknown += v.RecvDirUnknown
+		total.RecvFallbackLocal += v.RecvFallbackLocal
+		total.RecvFallbackKeepalive += v.RecvFallbackKeepalive
+		total.SendNoReqChain += v.SendNoReqChain
+		total.SendRespStart += v.SendRespStart
+		total.SendRespContinue += v.SendRespContinue
+		total.SendIterEmpty += v.SendIterEmpty
 	}
 	return total, nil
 }

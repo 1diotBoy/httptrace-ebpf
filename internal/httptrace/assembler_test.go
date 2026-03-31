@@ -144,3 +144,31 @@ func TestAssemblerEmitsMultipleMessagesFromSingleChain(t *testing.T) {
 		t.Fatalf("second response status mismatch: got %d want %d", got, want)
 	}
 }
+
+func TestAssemblerResyncsRequestAfterLeadingJunk(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute)
+	now := time.Unix(1711717000, 0)
+
+	updates, err := asm.Process(Event{
+		Timestamp: now,
+		ChainID:   3001,
+		PID:       88,
+		FD:        11,
+		SrcIP:     "192.168.4.1",
+		DstIP:     "192.168.4.161",
+		SrcPort:   52000,
+		DstPort:   12581,
+		FragIdx:   0,
+		Direction: DirectionRequest,
+		Payload:   []byte("xxGET /api/resync HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+	})
+	if err != nil {
+		t.Fatalf("process request: %v", err)
+	}
+	if len(updates) != 1 {
+		t.Fatalf("expected one resynced request update, got %d", len(updates))
+	}
+	if got, want := updates[0].Trace.Request.URL, "/api/resync"; got != want {
+		t.Fatalf("resynced url mismatch: got %q want %q", got, want)
+	}
+}

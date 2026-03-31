@@ -240,6 +240,10 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 	for len(state.requestStream.buffer) > 0 {
 		msg, complete, err := TryParseMessage(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: eof})
 		if err != nil {
+			if idx := FindMessageStart(DirectionRequest, state.requestStream.buffer); idx > 0 {
+				state.requestStream.consume(idx)
+				continue
+			}
 			return updates, nil
 		}
 		if complete {
@@ -254,6 +258,10 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 
 		msg, ok, err := TryParseMessageHead(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: eof})
 		if err != nil {
+			if idx := FindMessageStart(DirectionRequest, state.requestStream.buffer); idx > 0 {
+				state.requestStream.consume(idx)
+				continue
+			}
 			return updates, nil
 		}
 		if !ok {
@@ -278,6 +286,10 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 
 		msg, complete, err := TryParseMessage(DirectionResponse, state.responseStream.buffer, opts)
 		if err != nil {
+			if idx := FindMessageStart(DirectionResponse, state.responseStream.buffer); idx > 0 {
+				state.responseStream.consume(idx)
+				continue
+			}
 			return updates, nil
 		}
 		if complete {
@@ -292,6 +304,10 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 
 		msg, ok, err := TryParseMessageHead(DirectionResponse, state.responseStream.buffer, opts)
 		if err != nil {
+			if idx := FindMessageStart(DirectionResponse, state.responseStream.buffer); idx > 0 {
+				state.responseStream.consume(idx)
+				continue
+			}
 			return updates, nil
 		}
 		if !ok {

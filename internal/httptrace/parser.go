@@ -16,6 +16,18 @@ const (
 
 var headerSeparator = []byte("\r\n\r\n")
 
+var requestStartTokens = [][]byte{
+	[]byte("GET "),
+	[]byte("POST "),
+	[]byte("PUT "),
+	[]byte("PATCH "),
+	[]byte("DELETE "),
+	[]byte("HEAD "),
+	[]byte("OPTIONS "),
+	[]byte("TRACE "),
+	[]byte("CONNECT "),
+}
+
 type ParseOptions struct {
 	RequestMethod string
 	EOF           bool
@@ -114,6 +126,28 @@ func TryParseMessageHead(direction uint8, data []byte, opts ParseOptions) (*Pars
 		msg.BodyPartial = true
 		return msg, true, nil
 	}
+}
+
+// FindMessageStart 在 buffer 里寻找下一个可信的 HTTP 消息起点。
+// 这用于 keep-alive 高并发场景下少量前导脏字节把解析器"卡死"时做重同步。
+func FindMessageStart(direction uint8, data []byte) int {
+	switch direction {
+	case DirectionRequest:
+		for i := 0; i < len(data); i++ {
+			for _, token := range requestStartTokens {
+				if len(data[i:]) >= len(token) && bytes.HasPrefix(data[i:], token) {
+					return i
+				}
+			}
+		}
+	case DirectionResponse:
+		for i := 0; i < len(data); i++ {
+			if len(data[i:]) >= 5 && bytes.HasPrefix(data[i:], []byte("HTTP/")) {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func parseMessageHead(direction uint8, data []byte) (*ParsedMessage, textproto.MIMEHeader, int, bool, error) {

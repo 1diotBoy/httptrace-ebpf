@@ -61,3 +61,19 @@ func TestTryParseResponseHeadWithPartialBody(t *testing.T) {
 		t.Fatalf("partial body mismatch: got %q want %q", got, want)
 	}
 }
+
+func TestFindMessageStartRequest(t *testing.T) {
+	raw := []byte("xxPOST /api HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	got := FindMessageStart(DirectionRequest, raw)
+	if got != 2 {
+		t.Fatalf("request start mismatch: got %d want %d", got, 2)
+	}
+}
+
+func TestFindMessageStartResponse(t *testing.T) {
+	raw := []byte("junkHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+	got := FindMessageStart(DirectionResponse, raw)
+	if got != 4 {
+		t.Fatalf("response start mismatch: got %d want %d", got, 4)
+	}
+}
