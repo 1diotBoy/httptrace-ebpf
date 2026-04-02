@@ -35,6 +35,13 @@ struct bpf_map_def SEC("maps") send_fd_map = {
 	.max_entries = 65535,
 };
 
+struct bpf_map_def SEC("maps") send_guard_map = {
+	.type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(__u64),
+	.value_size = sizeof(struct send_guard),
+	.max_entries = 65535,
+};
+
 struct bpf_map_def SEC("maps") recv_fd_map = {
 	.type = BPF_MAP_TYPE_HASH,
 	.key_size = sizeof(__u64),
@@ -463,6 +470,7 @@ static __attribute__((noinline)) int emit_control_event(void *ctx, const struct 
 	event->dst_port = meta ? meta->dst_port : 0;
 	event->direction = DIR_UNKNOWN;
 	event->flags = EVT_FLAG_CONTROL | flags;
+	event->source = meta ? meta->source : SRC_UNKNOWN;
 	event->family = meta ? meta->family : 0;
 	if (meta)
 		__builtin_memcpy(event->comm, meta->comm, sizeof(event->comm));
@@ -515,6 +523,7 @@ static __attribute__((noinline)) int emit_data_event(void *ctx, const struct emi
 	event->frag_idx = call->frag_idx;
 	event->direction = call->direction;
 	event->flags = call->flags;
+	event->source = call->source;
 	event->family = call->meta->family;
 	__builtin_memcpy(event->comm, call->meta->comm, sizeof(event->comm));
 	if (safe_len > 0 && bpf_probe_read(event->payload, safe_len, call->src) < 0) {
@@ -608,6 +617,7 @@ static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct
 			emit.flags = flags;
 			emit.total_len = (__u16)call->total_len;
 			emit.direction = call->direction;
+			emit.source = call->source;
 			emit.src = base;
 			emit.payload_len = chunk;
 			if (emit_data_event(ctx, &emit) < 0)
@@ -634,7 +644,7 @@ static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct
  * 布局差异把整个采集链路卡死，也顺手把 BPF 主程序体积压下来。
  */
 static __always_inline void fill_common_meta(struct recv_args *meta, struct sock_compat *sk,
-					     __s32 fd)
+					     __s32 fd, __u8 source)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 
@@ -644,6 +654,7 @@ static __always_inline void fill_common_meta(struct recv_args *meta, struct sock
 	meta->tid = pid_tgid;
 	meta->fd = fd;
 	meta->seq_hint = 0;
+	meta->source = source;
 	bpf_get_current_comm(meta->comm, sizeof(meta->comm));
 	meta->family = 0;
 }
@@ -674,6 +685,34 @@ static __always_inline int stash_fd(__u64 pid_tgid, __s32 fd, void *map)
 	return bpf_map_update_elem(map, &pid_tgid, &fd, BPF_ANY);
 }
 
+static __always_inline void clear_send_guard(__u64 pid_tgid)
+{
+	bpf_map_delete_elem(&send_guard_map, &pid_tgid);
+}
+
+/* 当同时挂了 sock_sendmsg 和 tcp_sendmsg 时，同一条 send 调用可能先后命中两个 hook。
+ * 这里按 pid_tgid + msg 指针做一次轻量去重
+ * - msg 指针更接近“这一次具体发送调用”，适合在 sock_sendmsg 与 tcp_sendmsg 之间去重。
+ * - 第一个真正进入 response 采集的 hook 获得本次发送的“所有权”。
+ * - 后续同一 msg 的第二个 hook 直接跳过，避免重复上报和 tx_cursor/frag_idx 双重推进。
+ * 常见路径下通常还是 sock_sendmsg 先命中，因此它天然是主路径，tcp_sendmsg 作为补充兜底。
+ */
+static __always_inline int claim_send_guard(__u64 pid_tgid, struct msghdr_compat *msg, __u8 source)
+{
+	struct send_guard guard = {};
+	struct send_guard *existing = NULL;
+	__u64 msg_ptr = (__u64)msg;
+
+	existing = bpf_map_lookup_elem(&send_guard_map, &pid_tgid);
+	if (existing && existing->msg_ptr == msg_ptr)
+		return 0;
+
+	guard.msg_ptr = msg_ptr;
+	guard.source = source;
+	bpf_map_update_elem(&send_guard_map, &pid_tgid, &guard, BPF_ANY);
+	return 1;
+}
+
 static __always_inline __s32 consume_fd(__u64 pid_tgid, void *map)
 {
 	__s32 *fd = bpf_map_lookup_elem(map, &pid_tgid);
@@ -685,7 +724,8 @@ static __always_inline __s32 consume_fd(__u64 pid_tgid, void *map)
 	return value;
 }
 
-static __always_inline int store_recv_args(struct sock_compat *sk, struct msghdr_compat *msg, __s32 fd)
+static __always_inline int store_recv_args(struct sock_compat *sk, struct msghdr_compat *msg, __s32 fd,
+					   __u8 source)
 {
 	struct recv_args meta = {};
 	struct iov_iter_compat iter = {};
@@ -697,7 +737,9 @@ static __always_inline int store_recv_args(struct sock_compat *sk, struct msghdr
 	if (existing && fd < 0)
 		return 0;
 
-	fill_common_meta(&meta, sk, fd);
+	fill_common_meta(&meta, sk, fd, source);
+	if (extract_tuple(sk, &meta) == 0 && !matches_filter(&meta))
+		return 0;
 
 	meta.msg_ptr = (__u64)msg;
 	if (read_msg_iter(msg, &iter) < 0 || !iter.count) {
@@ -797,6 +839,7 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 		call.total_len = (__u32)ret;
 		call.base_flags = flags;
 		call.direction = DIR_REQUEST;
+		call.source = emit_meta.source;
 		capture_message_from_iter(ctx, &call);
 	}
 
@@ -806,7 +849,8 @@ cleanup:
 }
 
 static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_compat *sk,
-						       struct msghdr_compat *msg, __s32 fd)
+						       struct msghdr_compat *msg, __s32 fd,
+						       __u8 source)
 {
 	struct recv_args meta = {};
 	struct flow_state *state = NULL;
@@ -821,7 +865,9 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 		stats->send_calls += 1;
 	if (!sk)
 		return 0;
-	fill_common_meta(&meta, sk, fd);
+	fill_common_meta(&meta, sk, fd, source);
+	if (extract_tuple(sk, &meta) == 0 && !matches_filter(&meta))
+		return 0;
 	if (read_msg_iter(msg, &iter) < 0 || !iter.count) {
 		if (stats)
 			stats->send_iter_empty += 1;
@@ -859,6 +905,8 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 			stats->send_no_req_chain += 1;
 		return 0;
 	}
+	if (!claim_send_guard(bpf_get_current_pid_tgid(), msg, source))
+		return 0;
 
 	{
 		struct capture_call call = {};
@@ -873,6 +921,7 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 		call.total_len = (__u32)iter.count;
 		call.base_flags = flags;
 		call.direction = DIR_RESPONSE;
+		call.source = source;
 		if (capture_message_from_iter(ctx, &call) < 0)
 			return 0;
 	}
@@ -886,6 +935,7 @@ int tracepoint_sys_enter_sendto(struct trace_event_raw_sys_enter_compat *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = (__s32)ctx->args[0];
 
+	clear_send_guard(pid_tgid);
 	stash_fd(pid_tgid, fd, &send_fd_map);
 	return 0;
 }
@@ -896,6 +946,7 @@ int tracepoint_sys_enter_sendmsg(struct trace_event_raw_sys_enter_compat *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = (__s32)ctx->args[0];
 
+	clear_send_guard(pid_tgid);
 	stash_fd(pid_tgid, fd, &send_fd_map);
 	return 0;
 }
@@ -906,6 +957,7 @@ int tracepoint_sys_enter_write(struct trace_event_raw_sys_enter_compat *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = (__s32)ctx->args[0];
 
+	clear_send_guard(pid_tgid);
 	stash_fd(pid_tgid, fd, &send_fd_map);
 	return 0;
 }
@@ -916,6 +968,7 @@ int tracepoint_sys_enter_writev(struct trace_event_raw_sys_enter_compat *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = (__s32)ctx->args[0];
 
+	clear_send_guard(pid_tgid);
 	stash_fd(pid_tgid, fd, &send_fd_map);
 	return 0;
 }
@@ -971,10 +1024,14 @@ int BPF_KPROBE(kprobe_sock_sendmsg, void *sock_ptr, struct msghdr_compat *msg)
 		stats->sock_send_hits += 1;
 	if (extract_sk(sock_ptr, &sk) < 0)
 		return 0;
-	return handle_send_entry(ctx, sk, msg, fd);
+	return handle_send_entry(ctx, sk, msg, fd, SRC_SOCK_SENDMSG);
 }
 
 SEC("kprobe/tcp_sendmsg")
+/* tcp_sendmsg 只作为响应发送的补充路径：
+ * - 主路径仍然是 sock_sendmsg，语义更接近应用层明文发送。
+ * - 对 Nginx 等场景，如果响应没有完整经过 sock_sendmsg，tcp_sendmsg 可以补到一部分 TCP 发送数据。
+ */
 int BPF_KPROBE(kprobe_tcp_sendmsg, struct sock_compat *sk, struct msghdr_compat *msg)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
@@ -983,7 +1040,7 @@ int BPF_KPROBE(kprobe_tcp_sendmsg, struct sock_compat *sk, struct msghdr_compat 
 	if (stats)
 		stats->tcp_send_hits += 1;
 
-	return handle_send_entry(ctx, sk, msg, fd);
+	return handle_send_entry(ctx, sk, msg, fd, SRC_TCP_SENDMSG);
 }
 
 SEC("kprobe/sock_recvmsg")
@@ -1001,7 +1058,7 @@ int BPF_KPROBE(kprobe_sock_recvmsg, void *sock_ptr, struct msghdr_compat *msg)
 
 	if (extract_sk(sock_ptr, &sk) < 0)
 		return 0;
-	return store_recv_args(sk, msg, fd);
+	return store_recv_args(sk, msg, fd, SRC_SOCK_RECVMSG);
 }
 
 SEC("kprobe/tcp_recvmsg")
@@ -1015,7 +1072,7 @@ int BPF_KPROBE(kprobe_tcp_recvmsg, struct sock_compat *sk, struct msghdr_compat 
 
 	if (!sk)
 		return 0;
-	return store_recv_args(sk, msg, fd);
+	return store_recv_args(sk, msg, fd, SRC_TCP_RECVMSG);
 }
 
 /* kretprobe/sock_recvmsg 负责读取响应明文，并把请求/响应通过同一个 chain_id 关联起来。 */
@@ -1049,7 +1106,7 @@ int BPF_KPROBE(kprobe_tcp_close, struct sock_compat *sk)
 
 	if (lookup_or_init_flow(sock_id, &state) < 0)
 		return 0;
-	fill_common_meta(&meta, sk, -1);
+	fill_common_meta(&meta, sk, -1, SRC_TCP_CLOSE);
 
 	chain_id = state->last_req_chain_id;
 	emit_control_event(ctx, &meta, chain_id, sock_id, EVT_FLAG_CLOSE);

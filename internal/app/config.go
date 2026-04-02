@@ -15,29 +15,30 @@ import (
 )
 
 type Config struct {
-	IfName          string
-	SrcIP           string
-	DstIP           string
-	SrcPort         uint
-	DstPort         uint
-	CaptureBytes    int
-	PerfPages       int
-	BatchSize       int
-	WorkerCount     int
-	RedisWorkers    int
-	RedisQueueSize  int
-	FlushInterval   time.Duration
-	LogInterval     time.Duration
-	PrintHTTP       bool
-	PrintSummary    bool
-	DebugKernel     bool
-	TransactionTTL  time.Duration
-	MaxMessageBytes int
-	RedisAddr       string
-	RedisPassword   string
-	RedisDB         int
-	RedisKeyPrefix  string
-	RedisTTL        time.Duration
+	IfName               string
+	SrcIP                string
+	DstIP                string
+	SrcPort              uint
+	DstPort              uint
+	CaptureBytes         int
+	PerfPages            int
+	BatchSize            int
+	WorkerCount          int
+	RedisWorkers         int
+	RedisQueueSize       int
+	FlushInterval        time.Duration
+	LogInterval          time.Duration
+	PrintHTTP            bool
+	PrintSummary         bool
+	DebugKernel          bool
+	ResponseStallTimeout time.Duration
+	TransactionTTL       time.Duration
+	MaxMessageBytes      int
+	RedisAddr            string
+	RedisPassword        string
+	RedisDB              int
+	RedisKeyPrefix       string
+	RedisTTL             time.Duration
 }
 
 // ResolvedFilter 同时保存：
@@ -56,21 +57,22 @@ type ResolvedFilter struct {
 // 默认运行参数。
 func DefaultConfig() Config {
 	return Config{
-		CaptureBytes:    10 * 1024,
-		PerfPages:       256,
-		BatchSize:       100,
-		WorkerCount:     runtime.NumCPU(),
-		RedisWorkers:    max(1, runtime.NumCPU()/2),
-		RedisQueueSize:  8192,
-		FlushInterval:   200 * time.Millisecond,
-		LogInterval:     5 * time.Second,
-		PrintHTTP:       true,
-		PrintSummary:    true,
-		DebugKernel:     false,
-		TransactionTTL:  2 * time.Minute,
-		MaxMessageBytes: 10 * 1024,
-		RedisKeyPrefix:  "http-trace",
-		RedisTTL:        24 * time.Hour,
+		CaptureBytes:         10 * 1024,
+		PerfPages:            256,
+		BatchSize:            100,
+		WorkerCount:          runtime.NumCPU(),
+		RedisWorkers:         max(1, runtime.NumCPU()/2),
+		RedisQueueSize:       8192,
+		FlushInterval:        200 * time.Millisecond,
+		LogInterval:          5 * time.Second,
+		PrintHTTP:            true,
+		PrintSummary:         true,
+		DebugKernel:          false,
+		ResponseStallTimeout: 500 * time.Millisecond,
+		TransactionTTL:       2 * time.Minute,
+		MaxMessageBytes:      10 * 1024,
+		RedisKeyPrefix:       "http-trace",
+		RedisTTL:             24 * time.Hour,
 	}
 }
 

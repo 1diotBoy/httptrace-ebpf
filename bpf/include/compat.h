@@ -34,6 +34,15 @@ enum http_direction {
 	DIR_RESPONSE = 2,
 };
 
+enum capture_source {
+	SRC_UNKNOWN = 0,
+	SRC_SOCK_SENDMSG = 1,
+	SRC_TCP_SENDMSG = 2,
+	SRC_SOCK_RECVMSG = 3,
+	SRC_TCP_RECVMSG = 4,
+	SRC_TCP_CLOSE = 5,
+};
+
 enum http_event_flags {
 	EVT_FLAG_START = 1 << 0,
 	EVT_FLAG_END = 1 << 1,
@@ -155,7 +164,8 @@ struct recv_args {
 	__u16 src_port;
 	__u16 dst_port;
 	__u16 family;
-	__u16 pad0;
+	__u8 source;
+	__u8 pad0;
 	char comm[16];
 };
 
@@ -167,6 +177,7 @@ struct emit_call {
 	__u16 flags;
 	__u16 total_len;
 	__u8 direction;
+	__u8 source;
 	const char *src;
 	__u32 payload_len;
 };
@@ -182,6 +193,13 @@ struct capture_call {
 	__u32 total_len;
 	__u16 base_flags;
 	__u8 direction;
+	__u8 source;
+};
+
+struct send_guard {
+	__u64 msg_ptr;
+	__u8 source;
+	__u8 pad0[7];
 };
 
 struct http_event {
@@ -202,6 +220,8 @@ struct http_event {
 	__u16 frag_idx;
 	__u8 direction;
 	__u8 flags;
+	__u8 source;
+	__u8 pad0;
 	__u16 family;
 	char comm[16];
 	unsigned char payload[EVENT_PAYLOAD_SIZE];

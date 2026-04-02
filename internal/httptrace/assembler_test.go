@@ -6,7 +6,7 @@ import (
 )
 
 func TestAssemblerEmitsPartialResponseOnClose(t *testing.T) {
-	asm := NewAssembler(1<<20, time.Minute)
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
 	now := time.Unix(1711717000, 0)
 
 	reqUpdates, err := asm.Process(Event{
@@ -75,7 +75,7 @@ func TestAssemblerEmitsPartialResponseOnClose(t *testing.T) {
 }
 
 func TestAssemblerEmitsMultipleMessagesFromSingleChain(t *testing.T) {
-	asm := NewAssembler(1<<20, time.Minute)
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
 	now := time.Unix(1711717000, 0)
 
 	reqRaw := []byte(
@@ -146,7 +146,7 @@ func TestAssemblerEmitsMultipleMessagesFromSingleChain(t *testing.T) {
 }
 
 func TestAssemblerResyncsRequestAfterLeadingJunk(t *testing.T) {
-	asm := NewAssembler(1<<20, time.Minute)
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
 	now := time.Unix(1711717000, 0)
 
 	updates, err := asm.Process(Event{
@@ -170,5 +170,188 @@ func TestAssemblerResyncsRequestAfterLeadingJunk(t *testing.T) {
 	}
 	if got, want := updates[0].Trace.Request.URL, "/api/resync"; got != want {
 		t.Fatalf("resynced url mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestAssemblerFlushesPartialResponseWhenNextRequestArrives(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
+	now := time.Unix(1711717000, 0)
+
+	req1, err := asm.Process(Event{
+		Timestamp: now,
+		ChainID:   4001,
+		PID:       99,
+		FD:        12,
+		SrcIP:     "192.168.4.1",
+		DstIP:     "192.168.4.161",
+		SrcPort:   53000,
+		DstPort:   12581,
+		FragIdx:   0,
+		Direction: DirectionRequest,
+		Payload:   []byte("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+	})
+	if err != nil || len(req1) != 1 {
+		t.Fatalf("first request emit failed: updates=%d err=%v", len(req1), err)
+	}
+
+	if updates, err := asm.Process(Event{
+		Timestamp: now.Add(10 * time.Millisecond),
+		ChainID:   4001,
+		PID:       99,
+		FD:        12,
+		Direction: DirectionResponse,
+		FragIdx:   0,
+		Payload:   []byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"),
+	}); err != nil || len(updates) != 0 {
+		t.Fatalf("partial first response should wait: updates=%d err=%v", len(updates), err)
+	}
+
+	updates, err := asm.Process(Event{
+		Timestamp: now.Add(20 * time.Millisecond),
+		ChainID:   4001,
+		PID:       99,
+		FD:        12,
+		SrcIP:     "192.168.4.1",
+		DstIP:     "192.168.4.161",
+		SrcPort:   53000,
+		DstPort:   12581,
+		FragIdx:   1,
+		Direction: DirectionRequest,
+		Payload:   []byte("GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+	})
+	if err != nil {
+		t.Fatalf("second request process failed: %v", err)
+	}
+	if len(updates) != 2 {
+		t.Fatalf("expected flushed response + second request, got %d updates", len(updates))
+	}
+	if updates[0].Kind != "request" && updates[1].Kind != "response" && updates[0].Kind != "response" {
+		t.Fatalf("unexpected update kinds: %#v", updates)
+	}
+
+	var sawResponse bool
+	var sawRequest bool
+	for _, update := range updates {
+		if update.Kind == "response" {
+			sawResponse = true
+			if !update.Trace.ResponseTruncated {
+				t.Fatalf("partial response should be marked truncated")
+			}
+		}
+		if update.Kind == "request" && update.Trace.Request != nil && update.Trace.Request.URL == "/b" {
+			sawRequest = true
+		}
+	}
+	if !sawResponse || !sawRequest {
+		t.Fatalf("expected both partial response and second request, got %#v", updates)
+	}
+}
+
+func TestAssemblerFlushesStalledPartialResponse(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 100*time.Millisecond)
+	now := time.Unix(1711717000, 0)
+
+	reqUpdates, err := asm.Process(Event{
+		Timestamp: now,
+		ChainID:   5001,
+		PID:       100,
+		FD:        13,
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+		SrcPort:   54000,
+		DstPort:   80,
+		FragIdx:   0,
+		Direction: DirectionRequest,
+		Payload:   []byte("GET /nginx HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+	})
+	if err != nil || len(reqUpdates) != 1 {
+		t.Fatalf("request emit failed: updates=%d err=%v", len(reqUpdates), err)
+	}
+
+	respUpdates, err := asm.Process(Event{
+		Timestamp: now.Add(10 * time.Millisecond),
+		ChainID:   5001,
+		PID:       100,
+		FD:        13,
+		SrcIP:     "10.0.0.2",
+		DstIP:     "10.0.0.1",
+		SrcPort:   80,
+		DstPort:   54000,
+		FragIdx:   0,
+		Direction: DirectionResponse,
+		Payload:   []byte("HTTP/1.1 200 OK\r\nContent-Length: 20\r\nContent-Type: text/plain\r\n\r\nhello"),
+	})
+	if err != nil {
+		t.Fatalf("response process failed: %v", err)
+	}
+	if len(respUpdates) != 0 {
+		t.Fatalf("partial response should wait before stall flush, got %#v", respUpdates)
+	}
+
+	flushed := asm.FlushStalled(time.Now().Add(200 * time.Millisecond))
+	if len(flushed) != 1 {
+		t.Fatalf("expected one stalled response flush, got %d", len(flushed))
+	}
+	if flushed[0].Kind != "response" || flushed[0].Trace.Response == nil {
+		t.Fatalf("expected one response update, got %#v", flushed)
+	}
+	if !flushed[0].Trace.ResponseTruncated || !flushed[0].Trace.Response.BodyPartial {
+		t.Fatalf("stalled flush should mark response partial/truncated")
+	}
+}
+
+func TestAssemblerEvictExpiredFlushesPartialResponse(t *testing.T) {
+	asm := NewAssembler(1<<20, 100*time.Millisecond, 500*time.Millisecond)
+	now := time.Now()
+
+	reqUpdates, err := asm.Process(Event{
+		Timestamp: now,
+		ChainID:   6001,
+		PID:       101,
+		FD:        14,
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+		SrcPort:   54001,
+		DstPort:   80,
+		FragIdx:   0,
+		Direction: DirectionRequest,
+		Payload:   []byte("GET /expire HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+	})
+	if err != nil || len(reqUpdates) != 1 {
+		t.Fatalf("request emit failed: updates=%d err=%v", len(reqUpdates), err)
+	}
+
+	respUpdates, err := asm.Process(Event{
+		Timestamp: now.Add(10 * time.Millisecond),
+		ChainID:   6001,
+		PID:       101,
+		FD:        14,
+		SrcIP:     "10.0.0.2",
+		DstIP:     "10.0.0.1",
+		SrcPort:   80,
+		DstPort:   54001,
+		FragIdx:   0,
+		Direction: DirectionResponse,
+		Payload:   []byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 20\r\n\r\nbad"),
+	})
+	if err != nil {
+		t.Fatalf("response process failed: %v", err)
+	}
+	if len(respUpdates) != 0 {
+		t.Fatalf("partial response should wait before eviction flush, got %#v", respUpdates)
+	}
+
+	evictedUpdates, evicted := asm.EvictExpired(now.Add(200 * time.Millisecond))
+	if evicted != 1 {
+		t.Fatalf("expected one evicted state, got %d", evicted)
+	}
+	if len(evictedUpdates) != 1 {
+		t.Fatalf("expected one eviction-flushed response, got %d", len(evictedUpdates))
+	}
+	if evictedUpdates[0].Kind != "response" || evictedUpdates[0].Trace.Response == nil {
+		t.Fatalf("expected response update on eviction, got %#v", evictedUpdates)
+	}
+	if !evictedUpdates[0].Trace.ResponseTruncated || !evictedUpdates[0].Trace.Response.BodyPartial {
+		t.Fatalf("eviction flush should mark response partial/truncated")
 	}
 }

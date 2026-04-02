@@ -3,6 +3,7 @@ package httptrace
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,6 +25,7 @@ type Event struct {
 	Direction uint8
 	Flags     uint8
 	Comm      string
+	Source    string
 	Payload   []byte
 }
 
@@ -36,6 +38,7 @@ type TraceDocument struct {
 	FD                int32          `json:"fd"`
 	IfIndex           uint32         `json:"ifindex"`
 	Comm              string         `json:"comm"`
+	CaptureSource     string         `json:"capture_source,omitempty"`
 	SrcIP             string         `json:"src_ip"`
 	DstIP             string         `json:"dst_ip"`
 	SrcPort           uint16         `json:"src_port"`
@@ -58,6 +61,9 @@ type Assembler struct {
 	shards          []stateShard
 	maxMessageBytes int
 	maxIdle         time.Duration
+	responseStall   time.Duration
+	stalledFlushes  atomic.Uint64
+	evictedFlushes  atomic.Uint64
 }
 
 type stateShard struct {
@@ -70,16 +76,19 @@ type traceState struct {
 	requestStream   fragmentStream
 	responseStream  fragmentStream
 	lastUpdated     time.Time
+	responseUpdated time.Time
 	logicalSeq      uint64
 	pendingRequests []pendingRequest
+	requestSource   string
+	responseSource  string
 }
 
 type fragmentStream struct {
-	received   map[uint16][]byte
-	nextFrag   uint16
-	buffer     []byte
-	truncated  bool
-	firstTS    *time.Time
+	received  map[uint16][]byte
+	nextFrag  uint16
+	buffer    []byte
+	truncated bool
+	firstTS   *time.Time
 }
 
 type pendingRequest struct {
@@ -89,17 +98,28 @@ type pendingRequest struct {
 	requestTruncated bool
 }
 
+type Snapshot struct {
+	PendingRequests        int
+	PendingResponses       int
+	StalledResponseFlushes uint64
+	EvictedFlushes         uint64
+}
+
 // NewAssembler 创建请求/响应聚合器。
 // 它按 chain_id 把多次 perf 事件重组成一条 HTTP 请求/响应，再交给 parser。
-func NewAssembler(maxMessageBytes int, maxIdle time.Duration) *Assembler {
+func NewAssembler(maxMessageBytes int, maxIdle, responseStall time.Duration) *Assembler {
 	shards := make([]stateShard, 64)
 	for i := range shards {
 		shards[i].traces = make(map[uint64]*traceState)
+	}
+	if responseStall <= 0 {
+		responseStall = 500 * time.Millisecond
 	}
 	return &Assembler{
 		shards:          shards,
 		maxMessageBytes: maxMessageBytes,
 		maxIdle:         maxIdle,
+		responseStall:   responseStall,
 	}
 }
 
@@ -129,24 +149,38 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 	if state == nil {
 		state = &traceState{
 			base: TraceDocument{
-				ChainID: event.ChainID,
-				SockID:  event.SockID,
-				PID:     event.PID,
-				TID:     event.TID,
-				FD:      event.FD,
-				IfIndex: event.IfIndex,
-				Comm:    event.Comm,
-				SrcIP:   event.SrcIP,
-				DstIP:   event.DstIP,
-				SrcPort: event.SrcPort,
-				DstPort: event.DstPort,
+				ChainID:       event.ChainID,
+				SockID:        event.SockID,
+				PID:           event.PID,
+				TID:           event.TID,
+				FD:            event.FD,
+				IfIndex:       event.IfIndex,
+				Comm:          event.Comm,
+				CaptureSource: event.Source,
+				SrcIP:         event.SrcIP,
+				DstIP:         event.DstIP,
+				SrcPort:       event.SrcPort,
+				DstPort:       event.DstPort,
 			},
 			requestStream:  fragmentStream{received: make(map[uint16][]byte)},
 			responseStream: fragmentStream{received: make(map[uint16][]byte)},
+			requestSource:  event.Source,
+			responseSource: event.Source,
 		}
 		shard.traces[event.ChainID] = state
 	}
 	state.lastUpdated = time.Now()
+	switch event.Direction {
+	case DirectionRequest:
+		if event.Source != "" {
+			state.requestSource = event.Source
+		}
+	case DirectionResponse:
+		if event.Source != "" {
+			state.responseSource = event.Source
+		}
+		state.responseUpdated = state.lastUpdated
+	}
 
 	var stream *fragmentStream
 	switch event.Direction {
@@ -185,8 +219,36 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 	return a.tryEmitUpdates(state, shard, event.ChainID, false)
 }
 
-func (a *Assembler) EvictExpired(now time.Time) int {
+func (a *Assembler) FlushStalled(now time.Time) []Update {
+	if a.responseStall <= 0 {
+		return nil
+	}
+
+	updates := make([]Update, 0, 16)
+	for i := range a.shards {
+		shard := &a.shards[i]
+		shard.mu.Lock()
+		for chainID, state := range shard.traces {
+			if !state.shouldFlushStalledResponse(now, a.responseStall) {
+				continue
+			}
+			flushed := a.flushPartialResponse(state)
+			if len(flushed) > 0 {
+				updates = append(updates, flushed...)
+				a.stalledFlushes.Add(uint64(len(flushed)))
+			}
+			if state.canDelete() {
+				delete(shard.traces, chainID)
+			}
+		}
+		shard.mu.Unlock()
+	}
+	return updates
+}
+
+func (a *Assembler) EvictExpired(now time.Time) ([]Update, int) {
 	evicted := 0
+	updates := make([]Update, 0, 16)
 	for i := range a.shards {
 		shard := &a.shards[i]
 		shard.mu.Lock()
@@ -194,12 +256,36 @@ func (a *Assembler) EvictExpired(now time.Time) int {
 			if now.Sub(state.lastUpdated) <= a.maxIdle {
 				continue
 			}
+			flushed, _ := a.tryEmitUpdates(state, shard, chainID, true)
+			if len(flushed) > 0 {
+				updates = append(updates, flushed...)
+				a.evictedFlushes.Add(uint64(len(flushed)))
+			}
 			delete(shard.traces, chainID)
 			evicted++
 		}
 		shard.mu.Unlock()
 	}
-	return evicted
+	return updates, evicted
+}
+
+func (a *Assembler) Snapshot() Snapshot {
+	var snap Snapshot
+
+	for i := range a.shards {
+		shard := &a.shards[i]
+		shard.mu.Lock()
+		for _, state := range shard.traces {
+			snap.PendingRequests += len(state.pendingRequests)
+			if len(state.pendingRequests) > 0 && len(state.responseStream.buffer) > 0 {
+				snap.PendingResponses++
+			}
+		}
+		shard.mu.Unlock()
+	}
+	snap.StalledResponseFlushes = a.stalledFlushes.Load()
+	snap.EvictedFlushes = a.evictedFlushes.Load()
+	return snap
 }
 
 func (a *Assembler) finalizeOnClose(state *traceState, shard *stateShard, chainID uint64) ([]Update, error) {
@@ -228,7 +314,7 @@ func (a *Assembler) tryEmitUpdates(state *traceState, shard *stateShard, chainID
 	}
 	updates = append(updates, responseUpdates...)
 
-	if eof && state.canDelete() {
+	if state.canDelete() {
 		delete(shard.traces, chainID)
 	}
 	return updates, nil
@@ -298,6 +384,22 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 			continue
 		}
 
+		// 同一条 keep-alive 连接上如果下一条 request 都已经进来了，
+		// 说明当前这条 response 在 HTTP 语义上已经结束。
+		// Nginx/sendfile 场景下 body 可能走了 sendpage 等旁路，当前 sendmsg 缓冲里只有响应头；
+		// 这时不能一直等待“完整 body”，否则就会出现 request 数对上、response 持续偏少。
+		if len(state.pendingRequests) > 1 {
+			msg, consumed, ok, err := splitAndParsePartialResponse(state.responseStream.buffer, opts)
+			if err != nil {
+				return updates, nil
+			}
+			if ok {
+				updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, true))
+				state.responseStream.consume(consumed)
+				continue
+			}
+		}
+
 		if !(state.responseStream.truncated || eof) {
 			return updates, nil
 		}
@@ -321,6 +423,57 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 	return updates, nil
 }
 
+func splitAndParsePartialResponse(data []byte, opts ParseOptions) (*ParsedMessage, int, bool, error) {
+	_, _, bodyStart, ok, err := parseMessageHead(DirectionResponse, data)
+	if err != nil || !ok {
+		return nil, 0, false, err
+	}
+
+	if next := FindMessageStart(DirectionResponse, data[bodyStart:]); next >= 0 {
+		limit := bodyStart + next
+		msg, ok, err := TryParseMessageHead(DirectionResponse, data[:limit], opts)
+		if err != nil || !ok {
+			return nil, 0, false, err
+		}
+		msg.Body = ""
+		msg.BodyPartial = true
+		msg.ConsumedBytes = limit
+		msg.RawPayload = string(data[:limit])
+		return msg, limit, true, nil
+	}
+
+	msg, ok, err := TryParseMessageHead(DirectionResponse, data, opts)
+	if err != nil || !ok {
+		return nil, 0, false, err
+	}
+	return msg, len(data), true, nil
+}
+
+func (a *Assembler) flushPartialResponse(state *traceState) []Update {
+	if len(state.pendingRequests) == 0 || len(state.responseStream.buffer) == 0 {
+		return nil
+	}
+
+	opts := ParseOptions{}
+	if state.pendingRequests[0].request != nil {
+		opts.RequestMethod = state.pendingRequests[0].request.Method
+	}
+
+	if msg, complete, err := TryParseMessage(DirectionResponse, state.responseStream.buffer, opts); err == nil && complete {
+		update := state.buildResponseUpdate(msg, state.responseStream.firstTS, false)
+		state.responseStream.consume(msg.ConsumedBytes)
+		return []Update{update}
+	}
+
+	msg, ok, err := TryParseMessageHead(DirectionResponse, state.responseStream.buffer, opts)
+	if err != nil || !ok {
+		return nil
+	}
+	update := state.buildResponseUpdate(msg, state.responseStream.firstTS, true)
+	state.responseStream.consumeAll()
+	return []Update{update}
+}
+
 func (a *Assembler) nextLogicalChainID(state *traceState) uint64 {
 	seq := state.logicalSeq
 	state.logicalSeq++
@@ -339,6 +492,7 @@ func (t *traceState) buildRequestUpdate(chainID uint64, msg *ParsedMessage, ts *
 	doc.ResponseLatency = nil
 	doc.Request = msg
 	doc.Response = nil
+	doc.CaptureSource = t.requestSource
 	doc.RequestTruncated = truncated
 	doc.ResponseTruncated = false
 
@@ -359,6 +513,7 @@ func (t *traceState) buildResponseUpdate(msg *ParsedMessage, ts *time.Time, trun
 	doc.RequestTS = nil
 	doc.Request = nil
 	doc.Response = msg
+	doc.CaptureSource = t.responseSource
 	doc.RequestTruncated = false
 	doc.ResponseTruncated = truncated
 
@@ -383,6 +538,19 @@ func (t *traceState) canDelete() bool {
 		len(t.responseStream.buffer) == 0 &&
 		len(t.requestStream.received) == 0 &&
 		len(t.responseStream.received) == 0
+}
+
+func (t *traceState) shouldFlushStalledResponse(now time.Time, stall time.Duration) bool {
+	if stall <= 0 {
+		return false
+	}
+	if len(t.pendingRequests) == 0 || len(t.responseStream.buffer) == 0 {
+		return false
+	}
+	if t.responseUpdated.IsZero() {
+		return false
+	}
+	return now.Sub(t.responseUpdated) >= stall
 }
 
 func cloneTimePtr(ts *time.Time) *time.Time {
@@ -433,16 +601,16 @@ func (s *fragmentStream) consumeAll() {
 func (d TraceDocument) SummaryLine() string {
 	switch {
 	case d.Request != nil && d.Response == nil:
-		return fmt.Sprintf("request chain=%d pid=%d fd=%d %s %s", d.ChainID, d.PID, d.FD, d.Request.Method, d.Request.URL)
+		return fmt.Sprintf("request chain=%d pid=%d fd=%d source=%s %s %s", d.ChainID, d.PID, d.FD, d.CaptureSource, d.Request.Method, d.Request.URL)
 	case d.Request != nil && d.Response != nil:
 		latency := 0.0
 		if d.ResponseLatency != nil {
 			latency = *d.ResponseLatency
 		}
-		return fmt.Sprintf("response chain=%d pid=%d fd=%d %d %.2fms", d.ChainID, d.PID, d.FD, d.Response.StatusCode, latency)
+		return fmt.Sprintf("response chain=%d pid=%d fd=%d source=%s %d %.2fms", d.ChainID, d.PID, d.FD, d.CaptureSource, d.Response.StatusCode, latency)
 	case d.Request == nil && d.Response != nil:
-		return fmt.Sprintf("response chain=%d pid=%d fd=%d %d", d.ChainID, d.PID, d.FD, d.Response.StatusCode)
+		return fmt.Sprintf("response chain=%d pid=%d fd=%d source=%s %d", d.ChainID, d.PID, d.FD, d.CaptureSource, d.Response.StatusCode)
 	default:
-		return fmt.Sprintf("trace chain=%d pid=%d fd=%d", d.ChainID, d.PID, d.FD)
+		return fmt.Sprintf("trace chain=%d pid=%d fd=%d source=%s", d.ChainID, d.PID, d.FD, d.CaptureSource)
 	}
 }

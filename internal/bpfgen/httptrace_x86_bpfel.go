@@ -83,6 +83,7 @@ type HttpTraceMapSpecs struct {
 	RecvFdMap      *ebpf.MapSpec `ebpf:"recv_fd_map"`
 	ScratchHeap    *ebpf.MapSpec `ebpf:"scratch_heap"`
 	SendFdMap      *ebpf.MapSpec `ebpf:"send_fd_map"`
+	SendGuardMap   *ebpf.MapSpec `ebpf:"send_guard_map"`
 }
 
 // HttpTraceVariableSpecs contains global variables before they are loaded into the kernel.
@@ -119,6 +120,7 @@ type HttpTraceMaps struct {
 	RecvFdMap      *ebpf.Map `ebpf:"recv_fd_map"`
 	ScratchHeap    *ebpf.Map `ebpf:"scratch_heap"`
 	SendFdMap      *ebpf.Map `ebpf:"send_fd_map"`
+	SendGuardMap   *ebpf.Map `ebpf:"send_guard_map"`
 }
 
 func (m *HttpTraceMaps) Close() error {
@@ -131,6 +133,7 @@ func (m *HttpTraceMaps) Close() error {
 		m.RecvFdMap,
 		m.ScratchHeap,
 		m.SendFdMap,
+		m.SendGuardMap,
 	)
 }
 

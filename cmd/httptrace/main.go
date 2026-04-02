@@ -35,6 +35,7 @@ func main() {
 	flag.BoolVar(&cfg.PrintHTTP, "print-http", cfg.PrintHTTP, "print parsed HTTP request/response to console")
 	flag.BoolVar(&cfg.PrintSummary, "print-summary", cfg.PrintSummary, "print one-line request/response summary to console")
 	flag.BoolVar(&cfg.DebugKernel, "debug-kernel", cfg.DebugKernel, "print extended kernel hook/branch diagnostics")
+	flag.DurationVar(&cfg.ResponseStallTimeout, "response-stall-timeout", cfg.ResponseStallTimeout, "flush incomplete responses after this idle timeout, useful for nginx/sendfile-style response paths")
 	flag.DurationVar(&cfg.TransactionTTL, "txn-ttl", cfg.TransactionTTL, "idle transaction eviction TTL")
 	flag.IntVar(&cfg.MaxMessageBytes, "max-message-bytes", cfg.MaxMessageBytes, "maximum reassembled bytes kept per request/response before truncation")
 	flag.StringVar(&cfg.RedisAddr, "redis-addr", cfg.RedisAddr, "redis address, empty disables redis write")

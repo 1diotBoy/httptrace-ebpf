@@ -54,6 +54,7 @@ type stats struct {
 	userFiltered  atomic.Uint64
 	tupleResolved atomic.Uint64
 	tupleMiss     atomic.Uint64
+	stallFlushes  atomic.Uint64
 }
 
 func NewService(cfg Config) (*Service, error) {
@@ -68,7 +69,7 @@ func NewService(cfg Config) (*Service, error) {
 	return &Service{
 		cfg:       cfg,
 		filter:    filter,
-		assembler: httptrace.NewAssembler(cfg.MaxMessageBytes, cfg.TransactionTTL),
+		assembler: httptrace.NewAssembler(cfg.MaxMessageBytes, cfg.TransactionTTL, cfg.ResponseStallTimeout),
 		store:     store,
 		resolver:  newSocketResolver(15 * time.Second),
 		stats:     &stats{},
@@ -143,7 +144,7 @@ func (s *Service) Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := s.logLoop(ctx, objs); err != nil && !errors.Is(err, context.Canceled) {
+		if err := s.logLoop(ctx, objs, writeCh); err != nil && !errors.Is(err, context.Canceled) {
 			errCh <- err
 		}
 	}()
@@ -255,25 +256,7 @@ func (s *Service) workerLoop(ctx context.Context, workerID int, ch <-chan httptr
 				continue
 			}
 			for _, update := range updates {
-				if update.Kind == "request" {
-					s.stats.requests.Add(1)
-				}
-				if update.Kind == "response" {
-					s.stats.responses.Add(1)
-				}
-				if s.cfg.PrintSummary {
-					log.Printf("[worker=%d] %s", workerID, update.Trace.SummaryLine())
-				}
-				if s.cfg.PrintHTTP {
-					s.printHTTPTrace(workerID, update)
-				}
-				if writeCh != nil {
-					select {
-					case <-ctx.Done():
-						return
-					case writeCh <- update:
-					}
-				}
+				s.handleUpdate(ctx, fmt.Sprintf("worker=%d", workerID), update, writeCh)
 			}
 		}
 		batch = batch[:0]
@@ -308,6 +291,7 @@ func (s *Service) printHTTPTrace(workerID int, update httptrace.Update) {
 		PID             uint32                `json:"pid"`
 		FD              int32                 `json:"fd"`
 		Comm            string                `json:"comm"`
+		CaptureSource   string                `json:"capture_source,omitempty"`
 		SrcIP           string                `json:"src_ip"`
 		DstIP           string                `json:"dst_ip"`
 		SrcPort         uint16                `json:"src_port"`
@@ -323,6 +307,7 @@ func (s *Service) printHTTPTrace(workerID int, update httptrace.Update) {
 		PID:             update.Trace.PID,
 		FD:              update.Trace.FD,
 		Comm:            update.Trace.Comm,
+		CaptureSource:   update.Trace.CaptureSource,
 		SrcIP:           update.Trace.SrcIP,
 		DstIP:           update.Trace.DstIP,
 		SrcPort:         update.Trace.SrcPort,
@@ -339,6 +324,73 @@ func (s *Service) printHTTPTrace(workerID int, update httptrace.Update) {
 		return
 	}
 	log.Printf("[worker=%d] http=%s", workerID, string(body))
+}
+
+func (s *Service) printHTTPTraceTag(tag string, update httptrace.Update) {
+	view := struct {
+		Kind            string                `json:"kind"`
+		ChainID         uint64                `json:"chain_id"`
+		PID             uint32                `json:"pid"`
+		FD              int32                 `json:"fd"`
+		Comm            string                `json:"comm"`
+		CaptureSource   string                `json:"capture_source,omitempty"`
+		SrcIP           string                `json:"src_ip"`
+		DstIP           string                `json:"dst_ip"`
+		SrcPort         uint16                `json:"src_port"`
+		DstPort         uint16                `json:"dst_port"`
+		RequestTrunc    bool                  `json:"request_truncated,omitempty"`
+		ResponseTrunc   bool                  `json:"response_truncated,omitempty"`
+		ResponseLatency *float64              `json:"response_latency_ms,omitempty"`
+		Request         *consoleParsedMessage `json:"request,omitempty"`
+		Response        *consoleParsedMessage `json:"response,omitempty"`
+	}{
+		Kind:            update.Kind,
+		ChainID:         update.Trace.ChainID,
+		PID:             update.Trace.PID,
+		FD:              update.Trace.FD,
+		Comm:            update.Trace.Comm,
+		CaptureSource:   update.Trace.CaptureSource,
+		SrcIP:           update.Trace.SrcIP,
+		DstIP:           update.Trace.DstIP,
+		SrcPort:         update.Trace.SrcPort,
+		DstPort:         update.Trace.DstPort,
+		RequestTrunc:    update.Trace.RequestTruncated,
+		ResponseTrunc:   update.Trace.ResponseTruncated,
+		ResponseLatency: update.Trace.ResponseLatency,
+		Request:         newConsoleParsedMessage(update.Trace.Request),
+		Response:        newConsoleParsedMessage(update.Trace.Response),
+	}
+	body, err := json.Marshal(view)
+	if err != nil {
+		log.Printf("[%s] marshal console trace error: %v", tag, err)
+		return
+	}
+	log.Printf("[%s] http=%s", tag, string(body))
+}
+
+func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace.Update, writeCh chan<- httptrace.Update) {
+	if update.Kind == "request" {
+		s.stats.requests.Add(1)
+	}
+	if update.Kind == "response" {
+		s.stats.responses.Add(1)
+	}
+	if tag == "stalled" && update.Kind == "response" {
+		s.stats.stallFlushes.Add(1)
+	}
+	if s.cfg.PrintSummary {
+		log.Printf("[%s] %s", tag, update.Trace.SummaryLine())
+	}
+	if s.cfg.PrintHTTP {
+		s.printHTTPTraceTag(tag, update)
+	}
+	if writeCh != nil {
+		select {
+		case <-ctx.Done():
+			return
+		case writeCh <- update:
+		}
+	}
 }
 
 type consoleParsedMessage struct {
@@ -409,9 +461,10 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 			count := s.stats.userFiltered.Add(1)
 			if count <= 5 {
 				log.Printf(
-					"user filtered event chain=%d dir=%d fd=%d ifindex=%d %s:%d -> %s:%d comm=%s",
+					"user filtered event chain=%d dir=%d source=%s fd=%d ifindex=%d %s:%d -> %s:%d comm=%s",
 					event.ChainID,
 					event.Direction,
+					event.Source,
 					event.FD,
 					event.IfIndex,
 					event.SrcIP,
@@ -438,16 +491,30 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 // 这里的 request_fragments/response_fragments 是按 HTTP 语义分类后的 fragment 数，
 // 不是完整请求/响应条数；真正成功解析出来的条数看 user(requests/responses)。
 // send_calls/recv_calls 仍然是 kprobe/kretprobe 被触发的 syscall 次数。
-func (s *Service) logLoop(ctx context.Context, objs *bpfgen.HttpTraceObjects) error {
-	ticker := time.NewTicker(s.cfg.LogInterval)
-	defer ticker.Stop()
+func (s *Service) logLoop(ctx context.Context, objs *bpfgen.HttpTraceObjects, writeCh chan<- httptrace.Update) error {
+	statsTicker := time.NewTicker(s.cfg.LogInterval)
+	defer statsTicker.Stop()
+	stallInterval := s.cfg.ResponseStallTimeout / 2
+	if stallInterval <= 0 || stallInterval > 250*time.Millisecond {
+		stallInterval = 250 * time.Millisecond
+	}
+	flushTicker := time.NewTicker(stallInterval)
+	defer flushTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
-			evicted := s.assembler.EvictExpired(time.Now())
+		case <-flushTicker.C:
+			updates := s.assembler.FlushStalled(time.Now())
+			for _, update := range updates {
+				s.handleUpdate(ctx, "stalled", update, writeCh)
+			}
+		case <-statsTicker.C:
+			evictUpdates, evicted := s.assembler.EvictExpired(time.Now())
+			for _, update := range evictUpdates {
+				s.handleUpdate(ctx, "evicted", update, writeCh)
+			}
 			if evicted > 0 {
 				s.stats.evicted.Add(uint64(evicted))
 			}
@@ -456,8 +523,9 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.HttpTraceObjects) er
 				log.Printf("read kernel stats error: %v", err)
 				continue
 			}
+			asmStats := s.assembler.Snapshot()
 			log.Printf(
-				"stats kernel(send_calls=%d recv_calls=%d request_fragments=%d response_fragments=%d filtered=%d perf_errors=%d truncations=%d) user(perf_received=%d lost=%d requests=%d responses=%d redis=%d redis_failures=%d parse_failures=%d evicted=%d user_filtered=%d tuple_resolved=%d tuple_miss=%d)",
+				"stats kernel(send_calls=%d recv_calls=%d request_fragments=%d response_fragments=%d filtered=%d perf_errors=%d truncations=%d) user(perf_received=%d lost=%d requests=%d responses=%d redis=%d redis_failures=%d parse_failures=%d evicted=%d user_filtered=%d tuple_resolved=%d tuple_miss=%d pending_req=%d pending_resp=%d stalled_flush=%d evict_flush=%d)",
 				kstats.SendCalls,
 				kstats.RecvCalls,
 				kstats.SendEvents,
@@ -476,6 +544,10 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.HttpTraceObjects) er
 				s.stats.userFiltered.Load(),
 				s.stats.tupleResolved.Load(),
 				s.stats.tupleMiss.Load(),
+				asmStats.PendingRequests,
+				asmStats.PendingResponses,
+				asmStats.StalledResponseFlushes,
+				asmStats.EvictedFlushes,
 			)
 			if s.cfg.DebugKernel {
 				log.Printf(
@@ -504,10 +576,10 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.HttpTraceObjects) er
 }
 
 // attachAll 统一挂载 kprobe/kretprobe/tracepoint，并打印挂载成功信息。
-// 这里优先坚持 socket 层的 sock_sendmsg/sock_recvmsg：
-// - 这一层看到的就是应用层 send/recv 的明文边界，不需要 TCP 重组。
-// - 4.x 真正不稳定的是 __sock_sendmsg/__sock_recvmsg 的 ABI，不是 sock_sendmsg/sock_recvmsg。
-// - 所以 4.x 的兼容策略应该是“避开 __sock_*，但继续保留 sock_*”，而不是直接收敛到 tcp_*。
+// 这里的策略是：
+// - request 固定走 sock_recvmsg/kretprobe(sock_recvmsg)，保持应用层 recv 明文语义。
+// - response 以 sock_sendmsg 为主，tcp_sendmsg 作为补充，专门覆盖 Nginx 等 TCP 发送路径。
+// - 4.x 继续避开 ABI 更容易漂移的 __sock_*，但不退化到只剩 tcp_*。
 func attachAll(objs *bpfgen.HttpTraceObjects) ([]link.Link, error) {
 	var attached []link.Link
 	legacySockABI := usesLegacySockABI()
@@ -572,8 +644,12 @@ func attachAll(objs *bpfgen.HttpTraceObjects) ([]link.Link, error) {
 		prog    *ebpf.Program
 	}{
 		{symbols: []string{"tcp_close"}, prog: objs.KprobeTcpClose},
+		// response 默认仍以 sock_sendmsg 为主，这里把 tcp_sendmsg 当补充路径，
+		// 用来覆盖 Nginx/部分 TCP 发送栈里 sock_sendmsg 看不全的响应场景。
+		{symbols: []string{"tcp_sendmsg"}, prog: objs.KprobeTcpSendmsg},
 	}
 	if !legacySockABI {
+		log.Printf("tcp_sendmsg supplement enabled by default: sock_sendmsg stays primary, tcp_sendmsg supplements nginx/TCP send path, and per-send dedupe guard is active")
 		optionalKprobes = append(optionalKprobes,
 			struct {
 				symbols []string
@@ -591,7 +667,9 @@ func attachAll(objs *bpfgen.HttpTraceObjects) ([]link.Link, error) {
 		l, err := attachOne(item.symbols, item.ret, item.prog)
 		if err == nil {
 			attached = append(attached, l)
+			continue
 		}
+		log.Printf("skip optional kprobe %v: %v", item.symbols, err)
 	}
 
 	tracepoints := []struct {
@@ -745,8 +823,26 @@ func normalizeEvent(raw bpfgen.HttpTraceHttpEvent) httptrace.Event {
 		FragIdx:   raw.FragIdx,
 		Direction: raw.Direction,
 		Flags:     raw.Flags,
+		Source:    captureSourceName(raw.Source),
 		Comm:      cString(raw.Comm[:]),
 		Payload:   append([]byte(nil), raw.Payload[:payloadLen]...),
+	}
+}
+
+func captureSourceName(raw uint8) string {
+	switch raw {
+	case 1:
+		return "sock_sendmsg"
+	case 2:
+		return "tcp_sendmsg"
+	case 3:
+		return "sock_recvmsg"
+	case 4:
+		return "tcp_recvmsg"
+	case 5:
+		return "tcp_close"
+	default:
+		return "unknown"
 	}
 }
 
