@@ -20,6 +20,14 @@ type socketResolver struct {
 	cache map[socketKey]cachedSocketTuple
 }
 
+type resolveSource uint8
+
+const (
+	resolveMiss resolveSource = iota
+	resolveFromCache
+	resolveFromProc
+)
+
 type socketKey struct {
 	pid    uint32
 	fd     int32
@@ -50,22 +58,22 @@ func missingTuple(event httptrace.Event) bool {
 	return srcMissing || dstMissing
 }
 
-func (r *socketResolver) Resolve(event httptrace.Event) (httptrace.Event, bool) {
+func (r *socketResolver) Resolve(event httptrace.Event) (httptrace.Event, resolveSource) {
 	if event.PID == 0 || event.FD < 0 || !missingTuple(event) {
-		return event, false
+		return event, resolveMiss
 	}
 
 	key := socketKey{pid: event.PID, fd: event.FD, sockID: event.SockID}
 	if tuple, ok := r.lookupCache(key); ok {
-		return applyResolvedTuple(event, tuple), true
+		return applyResolvedTuple(event, tuple), resolveFromCache
 	}
 
 	tuple, ok := resolveSocketTuple(event.PID, event.FD)
 	if !ok {
-		return event, false
+		return event, resolveMiss
 	}
 	r.storeCache(key, tuple)
-	return applyResolvedTuple(event, tuple), true
+	return applyResolvedTuple(event, tuple), resolveFromProc
 }
 
 func (r *socketResolver) lookupCache(key socketKey) (cachedSocketTuple, bool) {

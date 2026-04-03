@@ -97,42 +97,6 @@ static __always_inline int extract_sk(void *sock_ptr, struct sock_compat **sk)
 	return 0;
 }
 
-static __always_inline __attribute__((unused)) int has_any_endpoint_filter(void)
-{
-	struct filter_config cfg = {};
-
-	if (read_filter(&cfg) < 0)
-		return 0;
-	if (cfg.src_ip || cfg.dst_ip || cfg.src_port || cfg.dst_port)
-		return 1;
-	return 0;
-}
-
-/* 只看 socket 的本端/local endpoint。
- * recv 路径里：
- * - 服务端收到请求时，本端就是服务 IP/PORT。
- * - 客户端收到响应时，本端则是客户端临时 IP/PORT。
- * 因此 4.19 上 request fallback 只能按本端匹配，不能按“任意一端命中”对称匹配。
- */
-static __always_inline __attribute__((unused)) int matches_local_endpoint_filter(const struct recv_args *meta)
-{
-	struct filter_config cfg = {};
-
-	if (!meta)
-		return 0;
-	if (read_filter(&cfg) < 0)
-		return 0;
-	if (cfg.src_ip && meta->src_ip == cfg.src_ip)
-		return 1;
-	if (cfg.dst_ip && meta->src_ip == cfg.dst_ip)
-		return 1;
-	if (cfg.src_port && meta->src_port == cfg.src_port)
-		return 1;
-	if (cfg.dst_port && meta->src_port == cfg.dst_port)
-		return 1;
-	return 0;
-}
-
 static __always_inline __attribute__((unused)) int extract_tuple(struct sock_compat *sk, struct recv_args *meta)
 {
 	struct sock_common_compat common = {};
@@ -241,7 +205,7 @@ static __always_inline __u64 next_chain_id(struct flow_state *state)
 
 	if (!state)
 		return 0;
-	// 请求序列号递增,生成唯一chain id,防止短连接复用同一个 sock 地址时 chain_id 重复 qqq
+	// 请求序列号递增后参与 chain_id 计算，避免短连接复用同一个 sock 地址时重复。
 	state->req_seq += 1;
 	seq_component = (__u64)state->req_seq << 32;
 	return state->conn_id ^ seq_component ^ state->rx_cursor;
@@ -640,8 +604,9 @@ static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct
 }
 
 /* fill_common_meta 统一补齐 PID/TID/FD/comm 等基础元数据。
- * 五元组和接口信息统一留给用户态基于 pid+fd+/proc 反查，避免不同内核版本上的 sock
- * 布局差异把整个采集链路卡死，也顺手把 BPF 主程序体积压下来。
+ * 五元组仍然会在后面尝试从 sock 中 best-effort 提取，用于现代内核上的第一层粗过滤；
+ * 如果提取失败，事件仍然会继续上送，由用户态基于 pid+fd+/proc 再做一次精确补全。
+ * 这样既保留了现代内核上的过滤收益，也避免因为不同内核布局差异把采集链路彻底卡死。
  */
 static __always_inline void fill_common_meta(struct recv_args *meta, struct sock_compat *sk,
 					     __s32 fd, __u8 source)
@@ -657,27 +622,6 @@ static __always_inline void fill_common_meta(struct recv_args *meta, struct sock
 	meta->source = source;
 	bpf_get_current_comm(meta->comm, sizeof(meta->comm));
 	meta->family = 0;
-}
-
-/* recvmsg 看到的是“对端 -> 本端”的消息方向。
- * sock_common 里的地址默认按“本端/local -> 对端/peer”摆放，
- * 所以在 recv 路径真正上报事件前需要交换一次，保证用户态看到的 src/dst
- * 就是这条 HTTP 消息本身的源/目的。 */
-static __always_inline __attribute__((unused)) void swap_meta_endpoints(struct recv_args *meta)
-{
-	__u32 ip = 0;
-	__u16 port = 0;
-
-	if (!meta)
-		return;
-
-	ip = meta->src_ip;
-	meta->src_ip = meta->dst_ip;
-	meta->dst_ip = ip;
-
-	port = meta->src_port;
-	meta->src_port = meta->dst_port;
-	meta->dst_port = port;
 }
 
 static __always_inline int stash_fd(__u64 pid_tgid, __s32 fd, void *map)
@@ -1104,9 +1048,18 @@ int BPF_KPROBE(kprobe_tcp_close, struct sock_compat *sk)
 	__u64 chain_id = 0;
 	__u64 sock_id = (__u64)sk;
 
-	if (lookup_or_init_flow(sock_id, &state) < 0)
+	state = bpf_map_lookup_elem(&flow_map, &sock_id);
+	if (!state)
 		return 0;
+	if (!state->last_req_chain_id && !state->req_active && !state->resp_active) {
+		bpf_map_delete_elem(&flow_map, &sock_id);
+		return 0;
+	}
 	fill_common_meta(&meta, sk, -1, SRC_TCP_CLOSE);
+	if (extract_tuple(sk, &meta) == 0 && !matches_filter(&meta)) {
+		bpf_map_delete_elem(&flow_map, &sock_id);
+		return 0;
+	}
 
 	chain_id = state->last_req_chain_id;
 	emit_control_event(ctx, &meta, chain_id, sock_id, EVT_FLAG_CLOSE);

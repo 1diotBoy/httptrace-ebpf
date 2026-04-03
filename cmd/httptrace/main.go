@@ -18,26 +18,33 @@ func main() {
 	ensureStableBPFLoad()
 
 	cfg := app.DefaultConfig()
-
+	// 过滤规则配置
 	flag.StringVar(&cfg.IfName, "ifname", cfg.IfName, "filter by interface name")
 	flag.StringVar(&cfg.SrcIP, "src-ip", cfg.SrcIP, "filter by IPv4 endpoint; if dst-ip is empty, matches either endpoint")
 	flag.StringVar(&cfg.DstIP, "dst-ip", cfg.DstIP, "filter by IPv4 endpoint; if src-ip is empty, matches either endpoint")
 	flag.UintVar(&cfg.SrcPort, "src-port", cfg.SrcPort, "filter by port endpoint; if dst-port is empty, matches either endpoint")
 	flag.UintVar(&cfg.DstPort, "dst-port", cfg.DstPort, "filter by port endpoint; if src-port is empty, matches either endpoint")
+	// 采集规则配置
 	flag.IntVar(&cfg.CaptureBytes, "capture-bytes", cfg.CaptureBytes, "maximum payload bytes captured per request/response, values above 10KB are truncated")
 	flag.IntVar(&cfg.PerfPages, "perf-pages", cfg.PerfPages, "perf buffer pages per CPU")
 	flag.IntVar(&cfg.BatchSize, "batch-size", cfg.BatchSize, "events parsed per worker batch")
 	flag.IntVar(&cfg.WorkerCount, "workers", cfg.WorkerCount, "number of parser workers")
-	flag.IntVar(&cfg.RedisWorkers, "redis-workers", cfg.RedisWorkers, "number of async redis writer workers")
-	flag.IntVar(&cfg.RedisQueueSize, "redis-queue-size", cfg.RedisQueueSize, "buffered redis write queue size")
+	flag.DurationVar(&cfg.TransactionTTL, "txn-ttl", cfg.TransactionTTL, "idle transaction eviction TTL")
+	flag.IntVar(&cfg.MaxMessageBytes, "max-message-bytes", cfg.MaxMessageBytes, "maximum reassembled bytes kept per request/response before truncation")
+
+	// 用户态日志配置
 	flag.DurationVar(&cfg.FlushInterval, "flush-interval", cfg.FlushInterval, "batch flush interval")
 	flag.DurationVar(&cfg.LogInterval, "log-interval", cfg.LogInterval, "stats log interval")
 	flag.BoolVar(&cfg.PrintHTTP, "print-http", cfg.PrintHTTP, "print parsed HTTP request/response to console")
 	flag.BoolVar(&cfg.PrintSummary, "print-summary", cfg.PrintSummary, "print one-line request/response summary to console")
 	flag.BoolVar(&cfg.DebugKernel, "debug-kernel", cfg.DebugKernel, "print extended kernel hook/branch diagnostics")
+
+	// nginx 响应等待
 	flag.DurationVar(&cfg.ResponseStallTimeout, "response-stall-timeout", cfg.ResponseStallTimeout, "flush incomplete responses after this idle timeout, useful for nginx/sendfile-style response paths")
-	flag.DurationVar(&cfg.TransactionTTL, "txn-ttl", cfg.TransactionTTL, "idle transaction eviction TTL")
-	flag.IntVar(&cfg.MaxMessageBytes, "max-message-bytes", cfg.MaxMessageBytes, "maximum reassembled bytes kept per request/response before truncation")
+
+	// redis 相关配置
+	flag.IntVar(&cfg.RedisWorkers, "redis-workers", cfg.RedisWorkers, "number of async redis writer workers")
+	flag.IntVar(&cfg.RedisQueueSize, "redis-queue-size", cfg.RedisQueueSize, "buffered redis write queue size")
 	flag.StringVar(&cfg.RedisAddr, "redis-addr", cfg.RedisAddr, "redis address, empty disables redis write")
 	flag.StringVar(&cfg.RedisPassword, "redis-password", cfg.RedisPassword, "redis password")
 	flag.IntVar(&cfg.RedisDB, "redis-db", cfg.RedisDB, "redis DB index")

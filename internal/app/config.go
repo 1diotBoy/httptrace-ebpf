@@ -54,6 +54,15 @@ type ResolvedFilter struct {
 	DstPort      uint16
 }
 
+type FilterReason string
+
+const (
+	FilterReasonPass  FilterReason = "pass"
+	FilterReasonIP    FilterReason = "ip"
+	FilterReasonPort  FilterReason = "port"
+	FilterReasonIface FilterReason = "ifname"
+)
+
 // 默认运行参数。
 func DefaultConfig() Config {
 	return Config{
@@ -172,22 +181,27 @@ func (c Config) ResolveFilter() (ResolvedFilter, error) {
 // - src/dst 给成同一个值时，也按“任意一端命中这个值”处理，适合服务端口过滤。
 // - ifname 通过接口 IPv4 做补偿，避免 bind_dev_if=0 时把流量误过滤掉。
 func (f ResolvedFilter) Match(event httptrace.Event) bool {
+	ok, _ := f.MatchDetail(event)
+	return ok
+}
+
+func (f ResolvedFilter) MatchDetail(event httptrace.Event) (bool, FilterReason) {
 	if !matchIPPair(f.SrcIP, f.DstIP, event.SrcIP, event.DstIP) {
-		return false
+		return false, FilterReasonIP
 	}
 	if !matchPortPair(f.SrcPort, f.DstPort, event.SrcPort, event.DstPort) {
-		return false
+		return false, FilterReasonPort
 	}
 	if len(f.InterfaceIPs) > 0 {
 		if _, ok := f.InterfaceIPs[event.SrcIP]; ok {
-			return true
+			return true, FilterReasonPass
 		}
 		if _, ok := f.InterfaceIPs[event.DstIP]; ok {
-			return true
+			return true, FilterReasonPass
 		}
-		return false
+		return false, FilterReasonIface
 	}
-	return true
+	return true, FilterReasonPass
 }
 
 func (f ResolvedFilter) Summary() string {

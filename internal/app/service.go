@@ -43,18 +43,46 @@ type Service struct {
 }
 
 type stats struct {
-	perfReceived  atomic.Uint64
-	perfLost      atomic.Uint64
-	requests      atomic.Uint64
-	responses     atomic.Uint64
-	redisWrites   atomic.Uint64
-	redisFailures atomic.Uint64
-	parseFailures atomic.Uint64
-	evicted       atomic.Uint64
-	userFiltered  atomic.Uint64
-	tupleResolved atomic.Uint64
-	tupleMiss     atomic.Uint64
-	stallFlushes  atomic.Uint64
+	perfReceived      atomic.Uint64
+	perfLost          atomic.Uint64
+	requests          atomic.Uint64
+	responses         atomic.Uint64
+	redisWrites       atomic.Uint64
+	redisFailures     atomic.Uint64
+	parseFailures     atomic.Uint64
+	evicted           atomic.Uint64
+	userFiltered      atomic.Uint64
+	tupleResolved     atomic.Uint64
+	tupleMiss         atomic.Uint64
+	stallFlushes      atomic.Uint64
+	filterReq         atomic.Uint64
+	filterResp        atomic.Uint64
+	filterUnknown     atomic.Uint64
+	filterByIP        atomic.Uint64
+	filterByPort      atomic.Uint64
+	filterByIface     atomic.Uint64
+	resolverCache     atomic.Uint64
+	resolverProc      atomic.Uint64
+	updateReqWorker   atomic.Uint64
+	updateRespWorker  atomic.Uint64
+	updateRespStalled atomic.Uint64
+	updateReqEvicted  atomic.Uint64
+	updateRespEvicted atomic.Uint64
+	retryQueued       atomic.Uint64
+	retryResolved     atomic.Uint64
+	retryDropped      atomic.Uint64
+	retryOverflow     atomic.Uint64
+}
+
+type resolveRetryItem struct {
+	event    httptrace.Event
+	workerID int
+}
+
+var resolveRetryBackoffs = [...]time.Duration{
+	10 * time.Millisecond,
+	30 * time.Millisecond,
+	100 * time.Millisecond,
 }
 
 func NewService(cfg Config) (*Service, error) {
@@ -81,6 +109,7 @@ func (s *Service) Close() error {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	// 移除内存锁限制
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("remove memlock: %w", err)
 	}
@@ -130,13 +159,21 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}()
 
+	retryCh, retryDone := s.startResolveRetryWorkers(ctx, workers)
+	defer func() {
+		if retryCh != nil {
+			close(retryCh)
+		}
+		retryDone.Wait()
+	}()
+
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := s.readLoop(ctx, reader, workers); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, perf.ErrClosed) {
+		if err := s.readLoop(ctx, reader, workers, retryCh); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, perf.ErrClosed) {
 			errCh <- err
 		}
 	}()
@@ -223,6 +260,33 @@ func (s *Service) startRedisWriters(ctx context.Context) (chan httptrace.Update,
 	return ch, &wg
 }
 
+// startResolveRetryWorkers 把“第一次 /proc 反查失败”的关键事件放到一个很轻的重试队列里。
+// 这样能补回少量刚建立连接时 inode/tcp 表项还没稳定、导致起始 fragment 过早被用户态过滤掉的情况。
+func (s *Service) startResolveRetryWorkers(ctx context.Context, workers []chan httptrace.Event) (chan resolveRetryItem, *sync.WaitGroup) {
+	var wg sync.WaitGroup
+
+	workerCount := max(1, min(2, runtime.NumCPU()/4))
+	ch := make(chan resolveRetryItem, 4096)
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case item, ok := <-ch:
+					if !ok {
+						return
+					}
+					s.resolveWithRetry(ctx, item, workers)
+				}
+			}
+		}()
+	}
+	return ch, &wg
+}
+
 // startWorkers 启动批量解析 worker。每个 worker 固定一个 OS 线程，减少高并发下的调度抖动。
 func (s *Service) startWorkers(ctx context.Context, writeCh chan<- httptrace.Update) []chan httptrace.Event {
 	workerCount := s.cfg.WorkerCount
@@ -284,48 +348,6 @@ func (s *Service) workerLoop(ctx context.Context, workerID int, ch <-chan httptr
 	}
 }
 
-func (s *Service) printHTTPTrace(workerID int, update httptrace.Update) {
-	view := struct {
-		Kind            string                `json:"kind"`
-		ChainID         uint64                `json:"chain_id"`
-		PID             uint32                `json:"pid"`
-		FD              int32                 `json:"fd"`
-		Comm            string                `json:"comm"`
-		CaptureSource   string                `json:"capture_source,omitempty"`
-		SrcIP           string                `json:"src_ip"`
-		DstIP           string                `json:"dst_ip"`
-		SrcPort         uint16                `json:"src_port"`
-		DstPort         uint16                `json:"dst_port"`
-		RequestTrunc    bool                  `json:"request_truncated,omitempty"`
-		ResponseTrunc   bool                  `json:"response_truncated,omitempty"`
-		ResponseLatency *float64              `json:"response_latency_ms,omitempty"`
-		Request         *consoleParsedMessage `json:"request,omitempty"`
-		Response        *consoleParsedMessage `json:"response,omitempty"`
-	}{
-		Kind:            update.Kind,
-		ChainID:         update.Trace.ChainID,
-		PID:             update.Trace.PID,
-		FD:              update.Trace.FD,
-		Comm:            update.Trace.Comm,
-		CaptureSource:   update.Trace.CaptureSource,
-		SrcIP:           update.Trace.SrcIP,
-		DstIP:           update.Trace.DstIP,
-		SrcPort:         update.Trace.SrcPort,
-		DstPort:         update.Trace.DstPort,
-		RequestTrunc:    update.Trace.RequestTruncated,
-		ResponseTrunc:   update.Trace.ResponseTruncated,
-		ResponseLatency: update.Trace.ResponseLatency,
-		Request:         newConsoleParsedMessage(update.Trace.Request),
-		Response:        newConsoleParsedMessage(update.Trace.Response),
-	}
-	body, err := json.Marshal(view)
-	if err != nil {
-		log.Printf("[worker=%d] marshal console trace error: %v", workerID, err)
-		return
-	}
-	log.Printf("[worker=%d] http=%s", workerID, string(body))
-}
-
 func (s *Service) printHTTPTraceTag(tag string, update httptrace.Update) {
 	view := struct {
 		Kind            string                `json:"kind"`
@@ -378,6 +400,7 @@ func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace
 	if tag == "stalled" && update.Kind == "response" {
 		s.stats.stallFlushes.Add(1)
 	}
+	s.recordUpdatePath(tag, update.Kind)
 	if s.cfg.PrintSummary {
 		log.Printf("[%s] %s", tag, update.Trace.SummaryLine())
 	}
@@ -389,6 +412,51 @@ func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace
 		case <-ctx.Done():
 			return
 		case writeCh <- update:
+		}
+	}
+}
+
+func (s *Service) recordFilterDrop(direction uint8, reason FilterReason) {
+	switch direction {
+	case httptrace.DirectionRequest:
+		s.stats.filterReq.Add(1)
+	case httptrace.DirectionResponse:
+		s.stats.filterResp.Add(1)
+	default:
+		s.stats.filterUnknown.Add(1)
+	}
+
+	switch reason {
+	case FilterReasonIP:
+		s.stats.filterByIP.Add(1)
+	case FilterReasonPort:
+		s.stats.filterByPort.Add(1)
+	case FilterReasonIface:
+		s.stats.filterByIface.Add(1)
+	}
+}
+
+func (s *Service) recordUpdatePath(tag, kind string) {
+	switch tag {
+	case "stalled":
+		if kind == "response" {
+			s.stats.updateRespStalled.Add(1)
+		}
+	case "evicted":
+		if kind == "request" {
+			s.stats.updateReqEvicted.Add(1)
+		}
+		if kind == "response" {
+			s.stats.updateRespEvicted.Add(1)
+		}
+	default:
+		if strings.HasPrefix(tag, "worker=") {
+			if kind == "request" {
+				s.stats.updateReqWorker.Add(1)
+			}
+			if kind == "response" {
+				s.stats.updateRespWorker.Add(1)
+			}
 		}
 	}
 }
@@ -428,8 +496,118 @@ func newConsoleParsedMessage(msg *httptrace.ParsedMessage) *consoleParsedMessage
 	}
 }
 
-// readLoop 从 perf buffer 拉取原始事件，解码后再应用一次用户态补偿过滤。
-func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []chan httptrace.Event) error {
+func (s *Service) resolveEvent(event httptrace.Event) (httptrace.Event, resolveSource) {
+	resolved, source := s.resolver.Resolve(event)
+	if source == resolveMiss {
+		return event, source
+	}
+
+	s.stats.tupleResolved.Add(1)
+	if source == resolveFromCache {
+		s.stats.resolverCache.Add(1)
+	}
+	if source == resolveFromProc {
+		s.stats.resolverProc.Add(1)
+	}
+	return resolved, source
+}
+
+func shouldRetryResolve(event httptrace.Event) bool {
+	if event.Direction == httptrace.DirectionUnknown {
+		return false
+	}
+	if event.FD < 0 || !missingTuple(event) {
+		return false
+	}
+	if event.Flags&flagControl != 0 {
+		return false
+	}
+	return true
+}
+
+func (s *Service) enqueueRetry(ctx context.Context, retryCh chan<- resolveRetryItem, event httptrace.Event, workerID int) bool {
+	if retryCh == nil || !shouldRetryResolve(event) {
+		return false
+	}
+	item := resolveRetryItem{
+		event:    event,
+		workerID: workerID,
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case retryCh <- item:
+		s.stats.retryQueued.Add(1)
+		return true
+	default:
+		s.stats.retryOverflow.Add(1)
+		return false
+	}
+}
+
+func (s *Service) dispatchEvent(ctx context.Context, event httptrace.Event, worker chan<- httptrace.Event) error {
+	if ok, reason := s.filter.MatchDetail(event); !ok {
+		count := s.stats.userFiltered.Add(1)
+		s.recordFilterDrop(event.Direction, reason)
+		if count <= 5 {
+			log.Printf(
+				"user filtered event chain=%d dir=%d source=%s fd=%d ifindex=%d %s:%d -> %s:%d comm=%s",
+				event.ChainID,
+				event.Direction,
+				event.Source,
+				event.FD,
+				event.IfIndex,
+				event.SrcIP,
+				event.SrcPort,
+				event.DstIP,
+				event.DstPort,
+				event.Comm,
+			)
+		}
+		return nil
+	}
+
+	s.stats.perfReceived.Add(1)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case worker <- event:
+		return nil
+	}
+}
+
+func (s *Service) resolveWithRetry(ctx context.Context, item resolveRetryItem, workers []chan httptrace.Event) {
+	event := item.event
+
+	for _, delay := range resolveRetryBackoffs {
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		resolved, source := s.resolveEvent(event)
+		if source == resolveMiss {
+			continue
+		}
+		s.stats.retryResolved.Add(1)
+		_ = s.dispatchEvent(ctx, resolved, workers[item.workerID%len(workers)])
+		return
+	}
+
+	if event.FD >= 0 && missingTuple(event) {
+		s.stats.tupleMiss.Add(1)
+	}
+	s.stats.retryDropped.Add(1)
+	_ = s.dispatchEvent(ctx, event, workers[item.workerID%len(workers)])
+}
+
+// readLoop 从 perf buffer 拉取原始事件，解码后做 tuple 补全、过滤和分发。
+// 这里尽量保持主循环轻量：少量第一次反查失败的关键事件会进入短暂重试队列，避免把 request/response 起始 fragment 过早丢掉。
+func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []chan httptrace.Event, retryCh chan<- resolveRetryItem) error {
+	// 循环读取 perf buffer 中的事件
 	for {
 		record, err := reader.Read()
 		if err != nil {
@@ -451,38 +629,17 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 		}
 
 		event := normalizeEvent(raw)
-		if resolved, ok := s.resolver.Resolve(event); ok {
-			event = resolved
-			s.stats.tupleResolved.Add(1)
-		} else if event.FD >= 0 && missingTuple(event) {
-			s.stats.tupleMiss.Add(1)
-		}
-		if !s.filter.Match(event) {
-			count := s.stats.userFiltered.Add(1)
-			if count <= 5 {
-				log.Printf(
-					"user filtered event chain=%d dir=%d source=%s fd=%d ifindex=%d %s:%d -> %s:%d comm=%s",
-					event.ChainID,
-					event.Direction,
-					event.Source,
-					event.FD,
-					event.IfIndex,
-					event.SrcIP,
-					event.SrcPort,
-					event.DstIP,
-					event.DstPort,
-					event.Comm,
-				)
-			}
+		event, source := s.resolveEvent(event)
+		workerID := record.CPU % len(workers)
+
+		if source == resolveMiss && s.enqueueRetry(ctx, retryCh, event, workerID) {
 			continue
 		}
-		s.stats.perfReceived.Add(1)
-		worker := workers[record.CPU%len(workers)]
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case worker <- event:
+		if source == resolveMiss && event.FD >= 0 && missingTuple(event) {
+			s.stats.tupleMiss.Add(1)
+		}
+		if err := s.dispatchEvent(ctx, event, workers[workerID]); err != nil {
+			return err
 		}
 	}
 }
@@ -549,6 +706,27 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.HttpTraceObjects, wr
 				asmStats.StalledResponseFlushes,
 				asmStats.EvictedFlushes,
 			)
+			log.Printf(
+				"user debug(filter_req=%d filter_resp=%d filter_unknown=%d filter_ip=%d filter_port=%d filter_ifname=%d resolver_cache=%d resolver_proc=%d resolver_miss=%d retry_queued=%d retry_resolved=%d retry_dropped=%d retry_overflow=%d upd_req_worker=%d upd_resp_worker=%d upd_resp_stalled=%d upd_req_evicted=%d upd_resp_evicted=%d)",
+				s.stats.filterReq.Load(),
+				s.stats.filterResp.Load(),
+				s.stats.filterUnknown.Load(),
+				s.stats.filterByIP.Load(),
+				s.stats.filterByPort.Load(),
+				s.stats.filterByIface.Load(),
+				s.stats.resolverCache.Load(),
+				s.stats.resolverProc.Load(),
+				s.stats.tupleMiss.Load(),
+				s.stats.retryQueued.Load(),
+				s.stats.retryResolved.Load(),
+				s.stats.retryDropped.Load(),
+				s.stats.retryOverflow.Load(),
+				s.stats.updateReqWorker.Load(),
+				s.stats.updateRespWorker.Load(),
+				s.stats.updateRespStalled.Load(),
+				s.stats.updateReqEvicted.Load(),
+				s.stats.updateRespEvicted.Load(),
+			)
 			if s.cfg.DebugKernel {
 				log.Printf(
 					"kernel debug(sock_send_hits=%d tcp_send_hits=%d sock_recv_hits=%d tcp_recv_hits=%d recv_store_ok=%d recv_store_no_iter=%d recv_store_meta_fail=%d recv_ret_no_meta=%d recv_dir_request=%d recv_dir_response=%d recv_dir_unknown=%d recv_fallback_local=%d recv_fallback_keepalive=%d send_no_req_chain=%d send_resp_start=%d send_resp_continue=%d send_iter_empty=%d)",
@@ -576,9 +754,9 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.HttpTraceObjects, wr
 }
 
 // attachAll 统一挂载 kprobe/kretprobe/tracepoint，并打印挂载成功信息。
-// 这里的策略是：
-// - request 固定走 sock_recvmsg/kretprobe(sock_recvmsg)，保持应用层 recv 明文语义。
-// - response 以 sock_sendmsg 为主，tcp_sendmsg 作为补充，专门覆盖 Nginx 等 TCP 发送路径。
+// 当前策略是：
+// - 请求固定走 sock_recvmsg/kretprobe(sock_recvmsg)，保持“应用层收到明文后再读”的语义。
+// - 响应以 sock_sendmsg 为主，tcp_sendmsg 只做补充，专门覆盖 Nginx 等 TCP 发送路径。
 // - 4.x 继续避开 ABI 更容易漂移的 __sock_*，但不退化到只剩 tcp_*。
 func attachAll(objs *bpfgen.HttpTraceObjects) ([]link.Link, error) {
 	var attached []link.Link
@@ -650,18 +828,6 @@ func attachAll(objs *bpfgen.HttpTraceObjects) ([]link.Link, error) {
 	}
 	if !legacySockABI {
 		log.Printf("tcp_sendmsg supplement enabled by default: sock_sendmsg stays primary, tcp_sendmsg supplements nginx/TCP send path, and per-send dedupe guard is active")
-		optionalKprobes = append(optionalKprobes,
-			struct {
-				symbols []string
-				ret     bool
-				prog    *ebpf.Program
-			}{symbols: []string{"tcp_recvmsg"}, prog: objs.KprobeTcpRecvmsg},
-			struct {
-				symbols []string
-				ret     bool
-				prog    *ebpf.Program
-			}{symbols: []string{"tcp_recvmsg"}, ret: true, prog: objs.KretprobeTcpRecvmsg},
-		)
 	}
 	for _, item := range optionalKprobes {
 		l, err := attachOne(item.symbols, item.ret, item.prog)
@@ -799,7 +965,7 @@ func decodeRawEvent(sample []byte) (bpfgen.HttpTraceHttpEvent, error) {
 	return event, nil
 }
 
-// normalizeEvent 把内核态原始事件转换成更适合用户态处理的结构。
+// 内核态原始事件转换成更适合用户态处理的结构。
 func normalizeEvent(raw bpfgen.HttpTraceHttpEvent) httptrace.Event {
 	ts := time.Unix(0, int64(raw.TsNs))
 	payloadLen := int(raw.PayloadLen)

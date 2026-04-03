@@ -1,6 +1,10 @@
 package app
 
-import "testing"
+import (
+	"testing"
+
+	"power-ebpf/internal/httptrace"
+)
 
 func TestMatchPortPairSingleSideMatchesEitherEndpoint(t *testing.T) {
 	if !matchPortPair(0, 12581, 53422, 12581) {
@@ -29,5 +33,24 @@ func TestMatchIPPairSingleSideMatchesEitherEndpoint(t *testing.T) {
 	}
 	if !matchIPPair("192.168.4.161", "", "10.0.0.8", "192.168.4.161") {
 		t.Fatalf("single-side src ip filter should match either endpoint")
+	}
+}
+
+func TestMatchDetailReason(t *testing.T) {
+	filter := ResolvedFilter{
+		SrcPort: 0,
+		DstPort: 80,
+	}
+	ok, reason := filter.MatchDetail(httptrace.Event{
+		SrcIP:   "10.0.0.1",
+		DstIP:   "10.0.0.2",
+		SrcPort: 40000,
+		DstPort: 8080,
+	})
+	if ok {
+		t.Fatalf("expected port mismatch")
+	}
+	if reason != FilterReasonPort {
+		t.Fatalf("unexpected reason: got %q want %q", reason, FilterReasonPort)
 	}
 }
