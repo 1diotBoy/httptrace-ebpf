@@ -142,3 +142,43 @@ func TestDispatchEventPassesThroughLegacyExistingChainFragment(t *testing.T) {
 		t.Fatalf("expected existing-chain fragment to pass through")
 	}
 }
+
+func TestResolveEventBypassesUserTuplePipeline(t *testing.T) {
+	svc := &Service{
+		cfg:      Config{DisableUserTuple: true},
+		resolver: newSocketResolver(time.Second),
+		stats:    &stats{},
+	}
+
+	event := httptrace.Event{
+		PID:       123,
+		FD:        7,
+		Direction: httptrace.DirectionRequest,
+		SrcIP:     "0.0.0.0",
+		DstIP:     "0.0.0.0",
+	}
+
+	got, source := svc.resolveEvent(event)
+	if source != resolveBypass {
+		t.Fatalf("expected resolveBypass, got %v", source)
+	}
+	if got.PID != event.PID || got.FD != event.FD || got.Direction != event.Direction || got.SrcIP != event.SrcIP || got.DstIP != event.DstIP {
+		t.Fatalf("event should stay unchanged when tuple pipeline disabled: got=%#v want=%#v", got, event)
+	}
+}
+
+func TestSanitizeTraceForOutputHidesTuple(t *testing.T) {
+	svc := &Service{cfg: Config{DisableUserTuple: true}}
+	trace := httptrace.TraceDocument{
+		ChainID: 1,
+		SrcIP:   "10.0.0.1",
+		DstIP:   "10.0.0.2",
+		SrcPort: 1234,
+		DstPort: 80,
+	}
+
+	got := svc.sanitizeTraceForOutput(trace)
+	if got.SrcIP != "" || got.DstIP != "" || got.SrcPort != 0 || got.DstPort != 0 {
+		t.Fatalf("tuple fields should be cleared, got %#v", got)
+	}
+}

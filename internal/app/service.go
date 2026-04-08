@@ -142,6 +142,9 @@ func (s *Service) Run(ctx context.Context) error {
 		return err
 	}
 	log.Printf("resolved filter: %s", s.filter.Summary())
+	if s.cfg.DisableUserTuple {
+		log.Printf("user tuple pipeline disabled: skip /proc tuple resolve and user-space tuple filter; redis/console output hides src/dst ip/port")
+	}
 
 	stopAttachWatch := startPhaseWatch(ctx, "probe attach", 2*time.Second)
 	links, err := attachAll(objs)
@@ -231,7 +234,11 @@ func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 		kernelFilter.DstIp = 0
 		kernelFilter.SrcPort = 0
 		kernelFilter.DstPort = 0
-		log.Printf("legacy 4.x detected: kernel endpoint filters disabled; tuple filter will be enforced in user space")
+		if s.cfg.DisableUserTuple {
+			log.Printf("legacy 4.x detected: kernel endpoint filters disabled in tuple-free diagnostic mode")
+		} else {
+			log.Printf("legacy 4.x detected: kernel endpoint filters disabled; tuple filter will be enforced in user space")
+		}
 	}
 	if err := objs.FilterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update filter map: %w", err)
@@ -380,6 +387,7 @@ func (s *Service) printHTTPTraceTag(tag string, update httptrace.Update) {
 }
 
 func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace.Update, writeCh chan<- httptrace.Update) {
+	update.Trace = s.sanitizeTraceForOutput(update.Trace)
 	if update.Kind == "request" {
 		s.stats.requests.Add(1)
 	}
@@ -403,6 +411,17 @@ func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace
 		case writeCh <- update:
 		}
 	}
+}
+
+func (s *Service) sanitizeTraceForOutput(trace httptrace.TraceDocument) httptrace.TraceDocument {
+	if !s.cfg.DisableUserTuple {
+		return trace
+	}
+	trace.SrcIP = ""
+	trace.DstIP = ""
+	trace.SrcPort = 0
+	trace.DstPort = 0
+	return trace
 }
 
 func (s *Service) recordFilterDrop(direction uint8, reason FilterReason) {
@@ -486,6 +505,9 @@ func newConsoleParsedMessage(msg *httptrace.ParsedMessage) *consoleParsedMessage
 }
 
 func (s *Service) resolveEvent(event httptrace.Event) (httptrace.Event, resolveSource) {
+	if s.cfg.DisableUserTuple {
+		return event, resolveBypass
+	}
 	resolved, source := s.resolver.Resolve(event)
 	if source == resolveMiss {
 		return event, source
@@ -553,38 +575,40 @@ func (s *Service) enqueueRetry(ctx context.Context, retrySem chan struct{}, retr
 }
 
 func (s *Service) dispatchEvent(ctx context.Context, event httptrace.Event, worker chan<- httptrace.Event) error {
-	startFilter := time.Time{}
-	if s.cfg.DebugKernel {
-		startFilter = time.Now()
-	}
-	ok, reason := s.filter.MatchDetail(event)
-	if s.cfg.DebugKernel {
-		s.stats.filterNs.Add(uint64(time.Since(startFilter)))
-	}
-	if !ok {
-		if s.shouldPassThroughFilteredEvent(event, reason) {
-			// 极少量事件在 /proc 反查还没成功时，会带着空五元组走到这里。
-			// 另外，4.19 上也会出现“首个 fragment 命中过滤，后续 fragment 五元组补全抖动导致端口临时不匹配”的情况。
-			// 对已经存在中的 chain，后续 fragment 不应再因为一次瞬时端口失配被直接误杀，否则会把整条调用链截断。
-		} else {
-			count := s.stats.userFiltered.Add(1)
-			s.recordFilterDrop(event.Direction, reason)
-			if count <= 5 {
-				log.Printf(
-					"user filtered event chain=%d dir=%d source=%s fd=%d ifindex=%d %s:%d -> %s:%d comm=%s",
-					event.ChainID,
-					event.Direction,
-					event.Source,
-					event.FD,
-					event.IfIndex,
-					event.SrcIP,
-					event.SrcPort,
-					event.DstIP,
-					event.DstPort,
-					event.Comm,
-				)
+	if !s.cfg.DisableUserTuple {
+		startFilter := time.Time{}
+		if s.cfg.DebugKernel {
+			startFilter = time.Now()
+		}
+		ok, reason := s.filter.MatchDetail(event)
+		if s.cfg.DebugKernel {
+			s.stats.filterNs.Add(uint64(time.Since(startFilter)))
+		}
+		if !ok {
+			if s.shouldPassThroughFilteredEvent(event, reason) {
+				// 极少量事件在 /proc 反查还没成功时，会带着空五元组走到这里。
+				// 另外，4.19 上也会出现“首个 fragment 命中过滤，后续 fragment 五元组补全抖动导致端口临时不匹配”的情况。
+				// 对已经存在中的 chain，后续 fragment 不应再因为一次瞬时端口失配被直接误杀，否则会把整条调用链截断。
+			} else {
+				count := s.stats.userFiltered.Add(1)
+				s.recordFilterDrop(event.Direction, reason)
+				if count <= 5 {
+					log.Printf(
+						"user filtered event chain=%d dir=%d source=%s fd=%d ifindex=%d %s:%d -> %s:%d comm=%s",
+						event.ChainID,
+						event.Direction,
+						event.Source,
+						event.FD,
+						event.IfIndex,
+						event.SrcIP,
+						event.SrcPort,
+						event.DstIP,
+						event.DstPort,
+						event.Comm,
+					)
+				}
+				return nil
 			}
-			return nil
 		}
 	}
 

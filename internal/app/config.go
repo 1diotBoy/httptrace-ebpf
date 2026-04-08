@@ -20,6 +20,7 @@ type Config struct {
 	DstIP                string
 	SrcPort              uint
 	DstPort              uint
+	DisableUserTuple     bool
 	CaptureBytes         int
 	PerfPages            int
 	BatchSize            int
@@ -67,6 +68,7 @@ const (
 func DefaultConfig() Config {
 	return Config{
 		CaptureBytes:         10 * 1024,
+		DisableUserTuple:     true,
 		PerfPages:            256,
 		BatchSize:            100,
 		WorkerCount:          runtime.NumCPU(),

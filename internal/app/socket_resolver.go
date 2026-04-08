@@ -26,6 +26,7 @@ const (
 	resolveMiss resolveSource = iota
 	resolveFromCache
 	resolveFromProc
+	resolveBypass
 )
 
 type socketKey struct {
