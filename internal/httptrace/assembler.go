@@ -58,12 +58,15 @@ type Update struct {
 }
 
 type Assembler struct {
-	shards          []stateShard
-	maxMessageBytes int
-	maxIdle         time.Duration
-	responseStall   time.Duration
-	stalledFlushes  atomic.Uint64
-	evictedFlushes  atomic.Uint64
+	shards            []stateShard
+	maxMessageBytes   int
+	maxIdle           time.Duration
+	responseStall     time.Duration
+	stalledFlushes    atomic.Uint64
+	evictedFlushes    atomic.Uint64
+	orphanResponses   atomic.Uint64
+	promotedRequests  atomic.Uint64
+	deferredResponses atomic.Uint64
 }
 
 type stateShard struct {
@@ -101,8 +104,14 @@ type pendingRequest struct {
 type Snapshot struct {
 	PendingRequests        int
 	PendingResponses       int
+	PendingNoRespBytes     int
+	RequestBufferStates    int
+	ResponseBufferStates   int
 	StalledResponseFlushes uint64
 	EvictedFlushes         uint64
+	OrphanResponses        uint64
+	PromotedRequests       uint64
+	DeferredResponses      uint64
 }
 
 // NewAssembler 创建请求/响应聚合器。
@@ -169,6 +178,7 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 		}
 		shard.traces[event.ChainID] = state
 	}
+	refreshBaseTuple(&state.base, event)
 	state.lastUpdated = time.Now()
 	switch event.Direction {
 	case DirectionRequest:
@@ -217,6 +227,27 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 		stream.drain(a.maxMessageBytes)
 	}
 	return a.tryEmitUpdates(state, shard, event.ChainID, false)
+}
+
+func refreshBaseTuple(base *TraceDocument, event Event) {
+	if base == nil {
+		return
+	}
+	if event.SrcIP != "" && event.SrcIP != "0.0.0.0" {
+		base.SrcIP = event.SrcIP
+	}
+	if event.DstIP != "" && event.DstIP != "0.0.0.0" {
+		base.DstIP = event.DstIP
+	}
+	if event.SrcPort != 0 {
+		base.SrcPort = event.SrcPort
+	}
+	if event.DstPort != 0 {
+		base.DstPort = event.DstPort
+	}
+	if event.IfIndex != 0 {
+		base.IfIndex = event.IfIndex
+	}
 }
 
 func (a *Assembler) FlushStalled(now time.Time) []Update {
@@ -269,6 +300,29 @@ func (a *Assembler) EvictExpired(now time.Time) ([]Update, int) {
 	return updates, evicted
 }
 
+// FlushAll 在进程退出前把所有残留状态按 EOF 语义做最后一次收尾。
+// 这一步非常关键：如果 tracer 在压测结束后立刻退出，尾部仍在 assembler 里的 request/response
+// 不会再等到下一次 stall/evict/tcp_close，自然也就不会出现在最终统计和 Redis 里。
+func (a *Assembler) FlushAll() ([]Update, int) {
+	updates := make([]Update, 0, 32)
+	flushedStates := 0
+
+	for i := range a.shards {
+		shard := &a.shards[i]
+		shard.mu.Lock()
+		for chainID, state := range shard.traces {
+			flushed, _ := a.tryEmitUpdates(state, shard, chainID, true)
+			if len(flushed) > 0 {
+				updates = append(updates, flushed...)
+			}
+			delete(shard.traces, chainID)
+			flushedStates++
+		}
+		shard.mu.Unlock()
+	}
+	return updates, flushedStates
+}
+
 func (a *Assembler) Snapshot() Snapshot {
 	var snap Snapshot
 
@@ -277,15 +331,39 @@ func (a *Assembler) Snapshot() Snapshot {
 		shard.mu.Lock()
 		for _, state := range shard.traces {
 			snap.PendingRequests += len(state.pendingRequests)
-			if len(state.pendingRequests) > 0 && len(state.responseStream.buffer) > 0 {
-				snap.PendingResponses++
+			if len(state.requestStream.buffer) > 0 || len(state.requestStream.received) > 0 {
+				snap.RequestBufferStates++
+			}
+			if len(state.responseStream.buffer) > 0 || len(state.responseStream.received) > 0 {
+				snap.ResponseBufferStates++
+			}
+			if len(state.pendingRequests) > 0 {
+				if len(state.responseStream.buffer) > 0 || len(state.responseStream.received) > 0 {
+					snap.PendingResponses += len(state.pendingRequests)
+				} else {
+					snap.PendingNoRespBytes += len(state.pendingRequests)
+				}
 			}
 		}
 		shard.mu.Unlock()
 	}
 	snap.StalledResponseFlushes = a.stalledFlushes.Load()
 	snap.EvictedFlushes = a.evictedFlushes.Load()
+	snap.OrphanResponses = a.orphanResponses.Load()
+	snap.PromotedRequests = a.promotedRequests.Load()
+	snap.DeferredResponses = a.deferredResponses.Load()
 	return snap
+}
+
+func (a *Assembler) HasState(chainID uint64) bool {
+	if chainID == 0 {
+		return false
+	}
+	shard := &a.shards[chainID%uint64(len(a.shards))]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	_, ok := shard.traces[chainID]
+	return ok
 }
 
 func (a *Assembler) finalizeOnClose(state *traceState, shard *stateShard, chainID uint64) ([]Update, error) {
@@ -364,6 +442,27 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error) {
 	updates := make([]Update, 0, 2)
 
+	promoted, err := a.promoteRequestForResponse(state)
+	if err != nil {
+		return nil, err
+	}
+	updates = append(updates, promoted...)
+
+	/* 同一个 chain 的 response 有时会先于 request perf 记录进入用户态。
+	 * 这在多 CPU perf buffer 交错读取时是可能发生的：
+	 * - 内核态关联已经正确，但用户态先读到了 response 片段；
+	 * - 如果这里直接把它当 orphan response 输出，后续 request 再到时，
+	 *   就会留下 pending_no_resp，同时 orphan_resp 也会上升。
+	 *
+	 * 因此当当前 state 里还没有 pending request 时，先暂存 response，
+	 * 等同链 request 到达后再配对；只有 EOF/截断这类“不会再等到 request”的场景，
+	 * 才允许真正按 orphan response 输出。
+	 */
+	if len(state.pendingRequests) == 0 && len(state.responseStream.buffer) > 0 && !eof && !state.responseStream.truncated {
+		a.deferredResponses.Add(1)
+		return updates, nil
+	}
+
 	for len(state.responseStream.buffer) > 0 {
 		opts := ParseOptions{EOF: eof}
 		if len(state.pendingRequests) > 0 && state.pendingRequests[0].request != nil {
@@ -379,6 +478,9 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 			return updates, nil
 		}
 		if complete {
+			if len(state.pendingRequests) == 0 {
+				a.orphanResponses.Add(1)
+			}
 			updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, false))
 			state.responseStream.consume(msg.ConsumedBytes)
 			continue
@@ -394,6 +496,9 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 				return updates, nil
 			}
 			if ok {
+				if len(state.pendingRequests) == 0 {
+					a.orphanResponses.Add(1)
+				}
 				updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, true))
 				state.responseStream.consume(consumed)
 				continue
@@ -415,12 +520,39 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 		if !ok {
 			return updates, nil
 		}
+		if len(state.pendingRequests) == 0 {
+			a.orphanResponses.Add(1)
+		}
 		updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, state.responseStream.truncated || msg.BodyPartial))
 		state.responseStream.consumeAll()
 		return updates, nil
 	}
 
 	return updates, nil
+}
+
+func (a *Assembler) promoteRequestForResponse(state *traceState) ([]Update, error) {
+	if len(state.pendingRequests) > 0 || len(state.requestStream.buffer) == 0 || len(state.responseStream.buffer) == 0 {
+		return nil, nil
+	}
+
+	msg, complete, err := TryParseMessage(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: false})
+	if err == nil && complete {
+		a.promotedRequests.Add(1)
+		update := state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, false)
+		state.requestStream.consume(msg.ConsumedBytes)
+		return []Update{update}, nil
+	}
+
+	msg, ok, err := TryParseMessageHead(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: true})
+	if err != nil || !ok {
+		return nil, err
+	}
+
+	a.promotedRequests.Add(1)
+	update := state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, state.requestStream.truncated || msg.BodyPartial)
+	state.requestStream.consumeAll()
+	return []Update{update}, nil
 }
 
 func splitAndParsePartialResponse(data []byte, opts ParseOptions) (*ParsedMessage, int, bool, error) {
@@ -460,6 +592,9 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 	}
 
 	if msg, complete, err := TryParseMessage(DirectionResponse, state.responseStream.buffer, opts); err == nil && complete {
+		if len(state.pendingRequests) == 0 {
+			a.orphanResponses.Add(1)
+		}
 		update := state.buildResponseUpdate(msg, state.responseStream.firstTS, false)
 		state.responseStream.consume(msg.ConsumedBytes)
 		return []Update{update}
@@ -468,6 +603,9 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 	msg, ok, err := TryParseMessageHead(DirectionResponse, state.responseStream.buffer, opts)
 	if err != nil || !ok {
 		return nil
+	}
+	if len(state.pendingRequests) == 0 {
+		a.orphanResponses.Add(1)
 	}
 	update := state.buildResponseUpdate(msg, state.responseStream.firstTS, true)
 	state.responseStream.consumeAll()

@@ -59,5 +59,9 @@ type HttpTraceKernelStats struct {
 	SendNoReqChain        uint64
 	SendRespStart         uint64
 	SendRespContinue      uint64
+	SendRespReqactive     uint64
 	SendIterEmpty         uint64
+	TupleIpv4Ok           uint64
+	TupleIpv6Portonly     uint64
+	TupleExtractFail      uint64
 }

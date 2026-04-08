@@ -43,35 +43,49 @@ type Service struct {
 }
 
 type stats struct {
-	perfReceived      atomic.Uint64
-	perfLost          atomic.Uint64
-	requests          atomic.Uint64
-	responses         atomic.Uint64
-	redisWrites       atomic.Uint64
-	redisFailures     atomic.Uint64
-	parseFailures     atomic.Uint64
-	evicted           atomic.Uint64
-	userFiltered      atomic.Uint64
-	tupleResolved     atomic.Uint64
-	tupleMiss         atomic.Uint64
-	stallFlushes      atomic.Uint64
-	filterReq         atomic.Uint64
-	filterResp        atomic.Uint64
-	filterUnknown     atomic.Uint64
-	filterByIP        atomic.Uint64
-	filterByPort      atomic.Uint64
-	filterByIface     atomic.Uint64
-	resolverCache     atomic.Uint64
-	resolverProc      atomic.Uint64
-	updateReqWorker   atomic.Uint64
-	updateRespWorker  atomic.Uint64
-	updateRespStalled atomic.Uint64
-	updateReqEvicted  atomic.Uint64
-	updateRespEvicted atomic.Uint64
-	retryQueued       atomic.Uint64
-	retryResolved     atomic.Uint64
-	retryDropped      atomic.Uint64
-	retryOverflow     atomic.Uint64
+	perfReceived       atomic.Uint64
+	perfLost           atomic.Uint64
+	requests           atomic.Uint64
+	responses          atomic.Uint64
+	redisWrites        atomic.Uint64
+	redisFailures      atomic.Uint64
+	parseFailures      atomic.Uint64
+	evicted            atomic.Uint64
+	userFiltered       atomic.Uint64
+	tupleResolved      atomic.Uint64
+	tupleMiss          atomic.Uint64
+	stallFlushes       atomic.Uint64
+	filterReq          atomic.Uint64
+	filterResp         atomic.Uint64
+	filterUnknown      atomic.Uint64
+	filterByIP         atomic.Uint64
+	filterByPort       atomic.Uint64
+	filterByIface      atomic.Uint64
+	resolverCache      atomic.Uint64
+	resolverProc       atomic.Uint64
+	updateReqWorker    atomic.Uint64
+	updateRespWorker   atomic.Uint64
+	updateRespStalled  atomic.Uint64
+	updateReqEvicted   atomic.Uint64
+	updateRespEvicted  atomic.Uint64
+	retryQueued        atomic.Uint64
+	retryResolved      atomic.Uint64
+	retryDropped       atomic.Uint64
+	retryOverflow      atomic.Uint64
+	tuplePassThrough   atomic.Uint64
+	chainPassThrough   atomic.Uint64
+	workerBackpressure atomic.Uint64
+	recordsRead        atomic.Uint64
+	decodeNs           atomic.Uint64
+	resolveNs          atomic.Uint64
+	resolveProcNs      atomic.Uint64
+	resolveProcSlow    atomic.Uint64
+	filterNs           atomic.Uint64
+	dispatchNs         atomic.Uint64
+	dispatchBlockNs    atomic.Uint64
+	dispatchBlocked    atomic.Uint64
+	workerQueuePeak    atomic.Uint64
+	shutdownFlushes    atomic.Uint64
 }
 
 type resolveRetryItem struct {
@@ -122,7 +136,7 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("load bpf objects: %w", err)
 	}
 	defer objs.Close()
-	log.Printf("bpf objects loaded")
+	log.Printf("bpf objects loaded (variant=%s)", objs.Variant)
 
 	if err := s.installFilter(objs); err != nil {
 		return err
@@ -144,28 +158,11 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	defer reader.Close()
 
-	writeCh, writersDone := s.startRedisWriters(ctx)
-	defer func() {
-		if writeCh != nil {
-			close(writeCh)
-		}
-		writersDone.Wait()
-	}()
+	writeCh, writersDone := s.startRedisWriters()
+	workers, workersDone := s.startWorkers(writeCh)
 
-	workers := s.startWorkers(ctx, writeCh)
-	defer func() {
-		for _, ch := range workers {
-			close(ch)
-		}
-	}()
-
-	retryCh, retryDone := s.startResolveRetryWorkers(ctx, workers)
-	defer func() {
-		if retryCh != nil {
-			close(retryCh)
-		}
-		retryDone.Wait()
-	}()
+	retrySem := make(chan struct{}, 32768)
+	var retryWG sync.WaitGroup
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
@@ -173,7 +170,7 @@ func (s *Service) Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := s.readLoop(ctx, reader, workers, retryCh); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, perf.ErrClosed) {
+		if err := s.readLoop(ctx, reader, workers, retrySem, &retryWG); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, perf.ErrClosed) {
 			errCh <- err
 		}
 	}()
@@ -186,21 +183,43 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}()
 
+	var runErr error
 	select {
 	case <-ctx.Done():
-		reader.Close()
-		wg.Wait()
-		return nil
 	case err := <-errCh:
-		reader.Close()
-		wg.Wait()
-		return err
+		runErr = err
 	}
+
+	reader.Close()
+	wg.Wait()
+	retryWG.Wait()
+	for _, ch := range workers {
+		close(ch)
+	}
+	workersDone.Wait()
+
+	flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	updates, flushedStates := s.assembler.FlushAll()
+	for _, update := range updates {
+		s.handleUpdate(flushCtx, "shutdown", update, writeCh)
+	}
+	if len(updates) > 0 || flushedStates > 0 {
+		s.stats.shutdownFlushes.Add(uint64(len(updates)))
+		log.Printf("shutdown flush(states=%d updates=%d)", flushedStates, len(updates))
+	}
+
+	if writeCh != nil {
+		close(writeCh)
+	}
+	writersDone.Wait()
+	s.logStatsSnapshot("final", objs)
+	return runErr
 }
 
 // installFilter 把 best-effort 规则写入内核 map。
 // 真正运行时还会叠加一层用户态补偿过滤，用来修正 socket 层 ifindex/方向翻转问题。
-func (s *Service) installFilter(objs *bpfgen.HttpTraceObjects) error {
+func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 	key := uint32(0)
 	kernelFilter := s.filter.Kernel
 	if usesLegacySockABI() {
@@ -220,7 +239,7 @@ func (s *Service) installFilter(objs *bpfgen.HttpTraceObjects) error {
 	return nil
 }
 
-func (s *Service) startRedisWriters(ctx context.Context) (chan httptrace.Update, *sync.WaitGroup) {
+func (s *Service) startRedisWriters() (chan httptrace.Update, *sync.WaitGroup) {
 	var wg sync.WaitGroup
 
 	if s.store == nil {
@@ -239,73 +258,46 @@ func (s *Service) startRedisWriters(ctx context.Context) (chan httptrace.Update,
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case update, ok := <-ch:
-					if !ok {
-						return
-					}
-					if err := s.store.Save(ctx, update.Trace); err != nil {
-						s.stats.redisFailures.Add(1)
-						log.Printf("[redis-worker=%d] save error: %v", workerID, err)
-						continue
-					}
-					s.stats.redisWrites.Add(1)
+			for update := range ch {
+				saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				err := s.store.Save(saveCtx, update.Trace)
+				cancel()
+				if err != nil {
+					s.stats.redisFailures.Add(1)
+					log.Printf("[redis-worker=%d] save error: %v", workerID, err)
+					continue
 				}
+				s.stats.redisWrites.Add(1)
 			}
 		}(i)
 	}
 	return ch, &wg
 }
 
-// startResolveRetryWorkers 把“第一次 /proc 反查失败”的关键事件放到一个很轻的重试队列里。
-// 这样能补回少量刚建立连接时 inode/tcp 表项还没稳定、导致起始 fragment 过早被用户态过滤掉的情况。
-func (s *Service) startResolveRetryWorkers(ctx context.Context, workers []chan httptrace.Event) (chan resolveRetryItem, *sync.WaitGroup) {
-	var wg sync.WaitGroup
-
-	workerCount := max(1, min(2, runtime.NumCPU()/4))
-	ch := make(chan resolveRetryItem, 4096)
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case item, ok := <-ch:
-					if !ok {
-						return
-					}
-					s.resolveWithRetry(ctx, item, workers)
-				}
-			}
-		}()
-	}
-	return ch, &wg
-}
-
 // startWorkers 启动批量解析 worker。每个 worker 固定一个 OS 线程，减少高并发下的调度抖动。
-func (s *Service) startWorkers(ctx context.Context, writeCh chan<- httptrace.Update) []chan httptrace.Event {
+func (s *Service) startWorkers(writeCh chan<- httptrace.Update) ([]chan httptrace.Event, *sync.WaitGroup) {
 	workerCount := s.cfg.WorkerCount
 	if workerCount <= 0 {
 		workerCount = runtime.NumCPU()
 	}
 
+	var wg sync.WaitGroup
 	workers := make([]chan httptrace.Event, workerCount)
 	for i := 0; i < workerCount; i++ {
-		workers[i] = make(chan httptrace.Event, s.cfg.BatchSize*16)
-		go s.workerLoop(ctx, i, workers[i], writeCh)
+		// 解析 worker 的通道适当放大，优先吸收高并发下的瞬时突刺，
+		// 避免 readLoop 因为下游短暂抖动被阻塞，进而放大 perf lost。
+		workers[i] = make(chan httptrace.Event, s.cfg.BatchSize*64)
+		wg.Add(1)
+		go s.workerLoop(i, workers[i], writeCh, &wg)
 	}
-	return workers
+	return workers, &wg
 }
 
 // workerLoop 负责批量调用 assembler、打印解析结果、落 Redis。
-func (s *Service) workerLoop(ctx context.Context, workerID int, ch <-chan httptrace.Event, writeCh chan<- httptrace.Update) {
+func (s *Service) workerLoop(workerID int, ch <-chan httptrace.Event, writeCh chan<- httptrace.Update, wg *sync.WaitGroup) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	defer wg.Done()
 
 	batch := make([]httptrace.Event, 0, s.cfg.BatchSize)
 	flushTicker := time.NewTicker(s.cfg.FlushInterval)
@@ -320,7 +312,7 @@ func (s *Service) workerLoop(ctx context.Context, workerID int, ch <-chan httptr
 				continue
 			}
 			for _, update := range updates {
-				s.handleUpdate(ctx, fmt.Sprintf("worker=%d", workerID), update, writeCh)
+				s.handleUpdate(context.Background(), fmt.Sprintf("worker=%d", workerID), update, writeCh)
 			}
 		}
 		batch = batch[:0]
@@ -328,9 +320,6 @@ func (s *Service) workerLoop(ctx context.Context, workerID int, ch <-chan httptr
 
 	for {
 		select {
-		case <-ctx.Done():
-			flush()
-			return
 		case <-flushTicker.C:
 			if len(batch) > 0 {
 				flush()
@@ -512,6 +501,18 @@ func (s *Service) resolveEvent(event httptrace.Event) (httptrace.Event, resolveS
 	return resolved, source
 }
 
+func updateAtomicMax(dst *atomic.Uint64, value uint64) {
+	for {
+		current := dst.Load()
+		if value <= current {
+			return
+		}
+		if dst.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
 func shouldRetryResolve(event httptrace.Event) bool {
 	if event.Direction == httptrace.DirectionUnknown {
 		return false
@@ -525,8 +526,8 @@ func shouldRetryResolve(event httptrace.Event) bool {
 	return true
 }
 
-func (s *Service) enqueueRetry(ctx context.Context, retryCh chan<- resolveRetryItem, event httptrace.Event, workerID int) bool {
-	if retryCh == nil || !shouldRetryResolve(event) {
+func (s *Service) enqueueRetry(ctx context.Context, retrySem chan struct{}, retryWG *sync.WaitGroup, workers []chan httptrace.Event, event httptrace.Event, workerID int) bool {
+	if retrySem == nil || !shouldRetryResolve(event) {
 		return false
 	}
 	item := resolveRetryItem{
@@ -536,8 +537,14 @@ func (s *Service) enqueueRetry(ctx context.Context, retryCh chan<- resolveRetryI
 	select {
 	case <-ctx.Done():
 		return false
-	case retryCh <- item:
+	case retrySem <- struct{}{}:
 		s.stats.retryQueued.Add(1)
+		retryWG.Add(1)
+		go func() {
+			defer retryWG.Done()
+			defer func() { <-retrySem }()
+			s.resolveWithRetry(ctx, item, workers)
+		}()
 		return true
 	default:
 		s.stats.retryOverflow.Add(1)
@@ -546,34 +553,90 @@ func (s *Service) enqueueRetry(ctx context.Context, retryCh chan<- resolveRetryI
 }
 
 func (s *Service) dispatchEvent(ctx context.Context, event httptrace.Event, worker chan<- httptrace.Event) error {
-	if ok, reason := s.filter.MatchDetail(event); !ok {
-		count := s.stats.userFiltered.Add(1)
-		s.recordFilterDrop(event.Direction, reason)
-		if count <= 5 {
-			log.Printf(
-				"user filtered event chain=%d dir=%d source=%s fd=%d ifindex=%d %s:%d -> %s:%d comm=%s",
-				event.ChainID,
-				event.Direction,
-				event.Source,
-				event.FD,
-				event.IfIndex,
-				event.SrcIP,
-				event.SrcPort,
-				event.DstIP,
-				event.DstPort,
-				event.Comm,
-			)
+	startFilter := time.Time{}
+	if s.cfg.DebugKernel {
+		startFilter = time.Now()
+	}
+	ok, reason := s.filter.MatchDetail(event)
+	if s.cfg.DebugKernel {
+		s.stats.filterNs.Add(uint64(time.Since(startFilter)))
+	}
+	if !ok {
+		if s.shouldPassThroughFilteredEvent(event, reason) {
+			// 极少量事件在 /proc 反查还没成功时，会带着空五元组走到这里。
+			// 另外，4.19 上也会出现“首个 fragment 命中过滤，后续 fragment 五元组补全抖动导致端口临时不匹配”的情况。
+			// 对已经存在中的 chain，后续 fragment 不应再因为一次瞬时端口失配被直接误杀，否则会把整条调用链截断。
+		} else {
+			count := s.stats.userFiltered.Add(1)
+			s.recordFilterDrop(event.Direction, reason)
+			if count <= 5 {
+				log.Printf(
+					"user filtered event chain=%d dir=%d source=%s fd=%d ifindex=%d %s:%d -> %s:%d comm=%s",
+					event.ChainID,
+					event.Direction,
+					event.Source,
+					event.FD,
+					event.IfIndex,
+					event.SrcIP,
+					event.SrcPort,
+					event.DstIP,
+					event.DstPort,
+					event.Comm,
+				)
+			}
+			return nil
 		}
-		return nil
 	}
 
 	s.stats.perfReceived.Add(1)
+	updateAtomicMax(&s.stats.workerQueuePeak, uint64(len(worker)))
+
+	sendStart := time.Time{}
+	if s.cfg.DebugKernel {
+		sendStart = time.Now()
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case worker <- event:
+		if s.cfg.DebugKernel {
+			s.stats.dispatchNs.Add(uint64(time.Since(sendStart)))
+		}
+		return nil
+	default:
+		s.stats.workerBackpressure.Add(1)
+		s.stats.dispatchBlocked.Add(1)
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case worker <- event:
+		if s.cfg.DebugKernel {
+			blocked := time.Since(sendStart)
+			s.stats.dispatchNs.Add(uint64(blocked))
+			s.stats.dispatchBlockNs.Add(uint64(blocked))
+		}
 		return nil
 	}
+}
+
+func (s *Service) shouldPassThroughFilteredEvent(event httptrace.Event, reason FilterReason) bool {
+	if reason != FilterReasonPort || event.Direction == httptrace.DirectionUnknown {
+		return false
+	}
+	if event.Flags&flagControl != 0 {
+		return false
+	}
+	if missingTuple(event) {
+		s.stats.tuplePassThrough.Add(1)
+		return true
+	}
+	if s.assembler != nil && s.assembler.HasState(event.ChainID) {
+		s.stats.chainPassThrough.Add(1)
+		return true
+	}
+	return false
 }
 
 func (s *Service) resolveWithRetry(ctx context.Context, item resolveRetryItem, workers []chan httptrace.Event) {
@@ -606,7 +669,7 @@ func (s *Service) resolveWithRetry(ctx context.Context, item resolveRetryItem, w
 
 // readLoop 从 perf buffer 拉取原始事件，解码后做 tuple 补全、过滤和分发。
 // 这里尽量保持主循环轻量：少量第一次反查失败的关键事件会进入短暂重试队列，避免把 request/response 起始 fragment 过早丢掉。
-func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []chan httptrace.Event, retryCh chan<- resolveRetryItem) error {
+func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []chan httptrace.Event, retrySem chan struct{}, retryWG *sync.WaitGroup) error {
 	// 循环读取 perf buffer 中的事件
 	for {
 		record, err := reader.Read()
@@ -620,19 +683,41 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 			s.stats.perfLost.Add(record.LostSamples)
 			continue
 		}
+		s.stats.recordsRead.Add(1)
 
+		startDecode := time.Time{}
+		if s.cfg.DebugKernel {
+			startDecode = time.Now()
+		}
 		raw, err := decodeRawEvent(record.RawSample)
 		if err != nil {
 			s.stats.parseFailures.Add(1)
 			log.Printf("decode raw event error: %v", err)
 			continue
 		}
+		if s.cfg.DebugKernel {
+			s.stats.decodeNs.Add(uint64(time.Since(startDecode)))
+		}
 
 		event := normalizeEvent(raw)
+		startResolve := time.Time{}
+		if s.cfg.DebugKernel {
+			startResolve = time.Now()
+		}
 		event, source := s.resolveEvent(event)
+		if s.cfg.DebugKernel {
+			resolveCost := time.Since(startResolve)
+			s.stats.resolveNs.Add(uint64(resolveCost))
+			if source == resolveFromProc {
+				s.stats.resolveProcNs.Add(uint64(resolveCost))
+				if resolveCost >= time.Millisecond {
+					s.stats.resolveProcSlow.Add(1)
+				}
+			}
+		}
 		workerID := record.CPU % len(workers)
 
-		if source == resolveMiss && s.enqueueRetry(ctx, retryCh, event, workerID) {
+		if source == resolveMiss && s.enqueueRetry(ctx, retrySem, retryWG, workers, event, workerID) {
 			continue
 		}
 		if source == resolveMiss && event.FD >= 0 && missingTuple(event) {
@@ -648,7 +733,7 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 // 这里的 request_fragments/response_fragments 是按 HTTP 语义分类后的 fragment 数，
 // 不是完整请求/响应条数；真正成功解析出来的条数看 user(requests/responses)。
 // send_calls/recv_calls 仍然是 kprobe/kretprobe 被触发的 syscall 次数。
-func (s *Service) logLoop(ctx context.Context, objs *bpfgen.HttpTraceObjects, writeCh chan<- httptrace.Update) error {
+func (s *Service) logLoop(ctx context.Context, objs *bpfgen.LoadedObjects, writeCh chan<- httptrace.Update) error {
 	statsTicker := time.NewTicker(s.cfg.LogInterval)
 	defer statsTicker.Stop()
 	stallInterval := s.cfg.ResponseStallTimeout / 2
@@ -675,81 +760,119 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.HttpTraceObjects, wr
 			if evicted > 0 {
 				s.stats.evicted.Add(uint64(evicted))
 			}
-			kstats, err := readKernelStats(objs.KernelStatsMap)
-			if err != nil {
-				log.Printf("read kernel stats error: %v", err)
-				continue
-			}
-			asmStats := s.assembler.Snapshot()
-			log.Printf(
-				"stats kernel(send_calls=%d recv_calls=%d request_fragments=%d response_fragments=%d filtered=%d perf_errors=%d truncations=%d) user(perf_received=%d lost=%d requests=%d responses=%d redis=%d redis_failures=%d parse_failures=%d evicted=%d user_filtered=%d tuple_resolved=%d tuple_miss=%d pending_req=%d pending_resp=%d stalled_flush=%d evict_flush=%d)",
-				kstats.SendCalls,
-				kstats.RecvCalls,
-				kstats.SendEvents,
-				kstats.RecvEvents,
-				kstats.Filtered,
-				kstats.PerfErrors,
-				kstats.Truncations,
-				s.stats.perfReceived.Load(),
-				s.stats.perfLost.Load(),
-				s.stats.requests.Load(),
-				s.stats.responses.Load(),
-				s.stats.redisWrites.Load(),
-				s.stats.redisFailures.Load(),
-				s.stats.parseFailures.Load(),
-				s.stats.evicted.Load(),
-				s.stats.userFiltered.Load(),
-				s.stats.tupleResolved.Load(),
-				s.stats.tupleMiss.Load(),
-				asmStats.PendingRequests,
-				asmStats.PendingResponses,
-				asmStats.StalledResponseFlushes,
-				asmStats.EvictedFlushes,
-			)
-			log.Printf(
-				"user debug(filter_req=%d filter_resp=%d filter_unknown=%d filter_ip=%d filter_port=%d filter_ifname=%d resolver_cache=%d resolver_proc=%d resolver_miss=%d retry_queued=%d retry_resolved=%d retry_dropped=%d retry_overflow=%d upd_req_worker=%d upd_resp_worker=%d upd_resp_stalled=%d upd_req_evicted=%d upd_resp_evicted=%d)",
-				s.stats.filterReq.Load(),
-				s.stats.filterResp.Load(),
-				s.stats.filterUnknown.Load(),
-				s.stats.filterByIP.Load(),
-				s.stats.filterByPort.Load(),
-				s.stats.filterByIface.Load(),
-				s.stats.resolverCache.Load(),
-				s.stats.resolverProc.Load(),
-				s.stats.tupleMiss.Load(),
-				s.stats.retryQueued.Load(),
-				s.stats.retryResolved.Load(),
-				s.stats.retryDropped.Load(),
-				s.stats.retryOverflow.Load(),
-				s.stats.updateReqWorker.Load(),
-				s.stats.updateRespWorker.Load(),
-				s.stats.updateRespStalled.Load(),
-				s.stats.updateReqEvicted.Load(),
-				s.stats.updateRespEvicted.Load(),
-			)
-			if s.cfg.DebugKernel {
-				log.Printf(
-					"kernel debug(sock_send_hits=%d tcp_send_hits=%d sock_recv_hits=%d tcp_recv_hits=%d recv_store_ok=%d recv_store_no_iter=%d recv_store_meta_fail=%d recv_ret_no_meta=%d recv_dir_request=%d recv_dir_response=%d recv_dir_unknown=%d recv_fallback_local=%d recv_fallback_keepalive=%d send_no_req_chain=%d send_resp_start=%d send_resp_continue=%d send_iter_empty=%d)",
-					kstats.SockSendHits,
-					kstats.TcpSendHits,
-					kstats.SockRecvHits,
-					kstats.TcpRecvHits,
-					kstats.RecvStoreOk,
-					kstats.RecvStoreNoIter,
-					kstats.RecvStoreMetaFail,
-					kstats.RecvRetNoMeta,
-					kstats.RecvDirRequest,
-					kstats.RecvDirResponse,
-					kstats.RecvDirUnknown,
-					kstats.RecvFallbackLocal,
-					kstats.RecvFallbackKeepalive,
-					kstats.SendNoReqChain,
-					kstats.SendRespStart,
-					kstats.SendRespContinue,
-					kstats.SendIterEmpty,
-				)
-			}
+			s.logStatsSnapshot("periodic", objs)
 		}
+	}
+}
+
+func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
+	kstats, err := readKernelStats(objs.KernelStatsMap)
+	if err != nil {
+		log.Printf("read kernel stats error: %v", err)
+		return
+	}
+	asmStats := s.assembler.Snapshot()
+	log.Printf(
+		"%s stats kernel(send_calls=%d recv_calls=%d request_fragments=%d response_fragments=%d filtered=%d perf_errors=%d truncations=%d) user(perf_received=%d lost=%d requests=%d responses=%d redis=%d redis_failures=%d parse_failures=%d evicted=%d user_filtered=%d tuple_resolved=%d tuple_miss=%d pending_req=%d pending_resp=%d pending_no_resp=%d req_buf_states=%d resp_buf_states=%d stalled_flush=%d evict_flush=%d orphan_resp=%d promoted_req=%d deferred_resp=%d)",
+		label,
+		kstats.SendCalls,
+		kstats.RecvCalls,
+		kstats.SendEvents,
+		kstats.RecvEvents,
+		kstats.Filtered,
+		kstats.PerfErrors,
+		kstats.Truncations,
+		s.stats.perfReceived.Load(),
+		s.stats.perfLost.Load(),
+		s.stats.requests.Load(),
+		s.stats.responses.Load(),
+		s.stats.redisWrites.Load(),
+		s.stats.redisFailures.Load(),
+		s.stats.parseFailures.Load(),
+		s.stats.evicted.Load(),
+		s.stats.userFiltered.Load(),
+		s.stats.tupleResolved.Load(),
+		s.stats.tupleMiss.Load(),
+		asmStats.PendingRequests,
+		asmStats.PendingResponses,
+		asmStats.PendingNoRespBytes,
+		asmStats.RequestBufferStates,
+		asmStats.ResponseBufferStates,
+		asmStats.StalledResponseFlushes,
+		asmStats.EvictedFlushes,
+		asmStats.OrphanResponses,
+		asmStats.PromotedRequests,
+		asmStats.DeferredResponses,
+	)
+	log.Printf(
+		"%s user debug(filter_req=%d filter_resp=%d filter_unknown=%d filter_ip=%d filter_port=%d filter_ifname=%d resolver_cache=%d resolver_proc=%d resolver_miss=%d retry_queued=%d retry_resolved=%d retry_dropped=%d retry_overflow=%d tuple_passthrough=%d chain_passthrough=%d worker_backpressure=%d upd_req_worker=%d upd_resp_worker=%d upd_resp_stalled=%d upd_req_evicted=%d upd_resp_evicted=%d shutdown_flush=%d)",
+		label,
+		s.stats.filterReq.Load(),
+		s.stats.filterResp.Load(),
+		s.stats.filterUnknown.Load(),
+		s.stats.filterByIP.Load(),
+		s.stats.filterByPort.Load(),
+		s.stats.filterByIface.Load(),
+		s.stats.resolverCache.Load(),
+		s.stats.resolverProc.Load(),
+		s.stats.tupleMiss.Load(),
+		s.stats.retryQueued.Load(),
+		s.stats.retryResolved.Load(),
+		s.stats.retryDropped.Load(),
+		s.stats.retryOverflow.Load(),
+		s.stats.tuplePassThrough.Load(),
+		s.stats.chainPassThrough.Load(),
+		s.stats.workerBackpressure.Load(),
+		s.stats.updateReqWorker.Load(),
+		s.stats.updateRespWorker.Load(),
+		s.stats.updateRespStalled.Load(),
+		s.stats.updateReqEvicted.Load(),
+		s.stats.updateRespEvicted.Load(),
+		s.stats.shutdownFlushes.Load(),
+	)
+	if s.cfg.DebugKernel {
+		recordsRead := s.stats.recordsRead.Load()
+		resolveProcCount := s.stats.resolverProc.Load()
+		dispatchBlocked := s.stats.dispatchBlocked.Load()
+		log.Printf(
+			"%s user stage(records_read=%d decode_avg_us=%.2f resolve_avg_us=%.2f resolve_proc_avg_us=%.2f resolve_proc_slow=%d filter_avg_us=%.2f dispatch_avg_us=%.2f dispatch_blocked=%d dispatch_block_avg_us=%.2f worker_queue_peak=%d)",
+			label,
+			recordsRead,
+			avgMicros(s.stats.decodeNs.Load(), recordsRead),
+			avgMicros(s.stats.resolveNs.Load(), recordsRead),
+			avgMicros(s.stats.resolveProcNs.Load(), resolveProcCount),
+			s.stats.resolveProcSlow.Load(),
+			avgMicros(s.stats.filterNs.Load(), recordsRead),
+			avgMicros(s.stats.dispatchNs.Load(), s.stats.perfReceived.Load()),
+			dispatchBlocked,
+			avgMicros(s.stats.dispatchBlockNs.Load(), dispatchBlocked),
+			s.stats.workerQueuePeak.Load(),
+		)
+		log.Printf(
+			"%s kernel debug(sock_send_hits=%d tcp_send_hits=%d sock_recv_hits=%d tcp_recv_hits=%d recv_store_ok=%d recv_store_no_iter=%d recv_store_meta_fail=%d recv_ret_no_meta=%d recv_dir_request=%d recv_dir_response=%d recv_dir_unknown=%d recv_fallback_local=%d recv_fallback_keepalive=%d send_no_req_chain=%d send_resp_start=%d send_resp_continue=%d send_resp_reqactive=%d send_iter_empty=%d tuple_ipv4_ok=%d tuple_ipv6_portonly=%d tuple_extract_fail=%d)",
+			label,
+			kstats.SockSendHits,
+			kstats.TcpSendHits,
+			kstats.SockRecvHits,
+			kstats.TcpRecvHits,
+			kstats.RecvStoreOk,
+			kstats.RecvStoreNoIter,
+			kstats.RecvStoreMetaFail,
+			kstats.RecvRetNoMeta,
+			kstats.RecvDirRequest,
+			kstats.RecvDirResponse,
+			kstats.RecvDirUnknown,
+			kstats.RecvFallbackLocal,
+			kstats.RecvFallbackKeepalive,
+			kstats.SendNoReqChain,
+			kstats.SendRespStart,
+			kstats.SendRespContinue,
+			kstats.SendRespReqactive,
+			kstats.SendIterEmpty,
+			kstats.TupleIpv4Ok,
+			kstats.TupleIpv6Portonly,
+			kstats.TupleExtractFail,
+		)
 	}
 }
 
@@ -758,7 +881,7 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.HttpTraceObjects, wr
 // - 请求固定走 sock_recvmsg/kretprobe(sock_recvmsg)，保持“应用层收到明文后再读”的语义。
 // - 响应以 sock_sendmsg 为主，tcp_sendmsg 只做补充，专门覆盖 Nginx 等 TCP 发送路径。
 // - 4.x 继续避开 ABI 更容易漂移的 __sock_*，但不退化到只剩 tcp_*。
-func attachAll(objs *bpfgen.HttpTraceObjects) ([]link.Link, error) {
+func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 	var attached []link.Link
 	legacySockABI := usesLegacySockABI()
 
@@ -1028,6 +1151,13 @@ func cString(raw []int8) string {
 	return b.String()
 }
 
+func avgMicros(total, count uint64) float64 {
+	if count == 0 {
+		return 0
+	}
+	return float64(total) / float64(count) / 1000.0
+}
+
 // readKernelStats 汇总 per-cpu 统计，便于观察内核态有没有命中 hook、有没有被过滤掉。
 func readKernelStats(m *ebpf.Map) (bpfgen.HttpTraceKernelStats, error) {
 	var total bpfgen.HttpTraceKernelStats
@@ -1063,7 +1193,11 @@ func readKernelStats(m *ebpf.Map) (bpfgen.HttpTraceKernelStats, error) {
 		total.SendNoReqChain += v.SendNoReqChain
 		total.SendRespStart += v.SendRespStart
 		total.SendRespContinue += v.SendRespContinue
+		total.SendRespReqactive += v.SendRespReqactive
 		total.SendIterEmpty += v.SendIterEmpty
+		total.TupleIpv4Ok += v.TupleIpv4Ok
+		total.TupleIpv6Portonly += v.TupleIpv6Portonly
+		total.TupleExtractFail += v.TupleExtractFail
 	}
 	return total, nil
 }

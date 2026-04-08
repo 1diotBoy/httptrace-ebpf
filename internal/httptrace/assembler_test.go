@@ -355,3 +355,70 @@ func TestAssemblerEvictExpiredFlushesPartialResponse(t *testing.T) {
 		t.Fatalf("eviction flush should mark response partial/truncated")
 	}
 }
+
+func TestAssemblerDefersResponseUntilRequestArrives(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
+	now := time.Unix(1711717000, 0)
+
+	respUpdates, err := asm.Process(Event{
+		Timestamp: now.Add(10 * time.Millisecond),
+		ChainID:   7001,
+		PID:       102,
+		FD:        15,
+		SrcIP:     "10.0.0.2",
+		DstIP:     "10.0.0.1",
+		SrcPort:   80,
+		DstPort:   54002,
+		FragIdx:   0,
+		Direction: DirectionResponse,
+		Payload:   []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
+	})
+	if err != nil {
+		t.Fatalf("response-first process failed: %v", err)
+	}
+	if len(respUpdates) != 0 {
+		t.Fatalf("response should wait for matching request, got %#v", respUpdates)
+	}
+
+	snap := asm.Snapshot()
+	if snap.DeferredResponses == 0 {
+		t.Fatalf("expected deferred response counter to increase")
+	}
+	if snap.OrphanResponses != 0 {
+		t.Fatalf("response should not be marked orphan before request arrives")
+	}
+
+	updates, err := asm.Process(Event{
+		Timestamp: now,
+		ChainID:   7001,
+		PID:       102,
+		FD:        15,
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+		SrcPort:   54002,
+		DstPort:   80,
+		FragIdx:   0,
+		Direction: DirectionRequest,
+		Payload:   []byte("GET /late HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+	})
+	if err != nil {
+		t.Fatalf("request-after-response process failed: %v", err)
+	}
+	if len(updates) != 2 {
+		t.Fatalf("expected request + matched response, got %d updates", len(updates))
+	}
+	if updates[0].Kind != "request" || updates[1].Kind != "response" {
+		t.Fatalf("unexpected update order: %#v", updates)
+	}
+	if updates[1].Trace.Response == nil || updates[1].Trace.Response.StatusCode != 200 {
+		t.Fatalf("expected parsed response, got %#v", updates[1].Trace.Response)
+	}
+
+	snap = asm.Snapshot()
+	if snap.PendingRequests != 0 || snap.PendingNoRespBytes != 0 {
+		t.Fatalf("all pending requests should be matched after late request arrives: %#v", snap)
+	}
+	if snap.OrphanResponses != 0 {
+		t.Fatalf("should not accumulate orphan responses after successful rematch")
+	}
+}

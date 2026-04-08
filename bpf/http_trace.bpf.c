@@ -56,6 +56,13 @@ struct bpf_map_def SEC("maps") scratch_heap = {
 	.max_entries = 1,
 };
 
+struct bpf_map_def SEC("maps") send_scratch_map = {
+	.type = BPF_MAP_TYPE_PERCPU_ARRAY,
+	.key_size = sizeof(__u32),
+	.value_size = sizeof(struct send_capture_scratch),
+	.max_entries = 1,
+};
+
 struct bpf_map_def SEC("maps") kernel_stats_map = {
 	.type = BPF_MAP_TYPE_PERCPU_ARRAY,
 	.key_size = sizeof(__u32),
@@ -100,21 +107,43 @@ static __always_inline int extract_sk(void *sock_ptr, struct sock_compat **sk)
 static __always_inline __attribute__((unused)) int extract_tuple(struct sock_compat *sk, struct recv_args *meta)
 {
 	struct sock_common_compat common = {};
+	struct kernel_stats *stats = stats_lookup();
 
 	if (!sk)
-		return -1;
+		goto fail;
 	if (bpf_probe_read(&common, sizeof(common), sk) < 0)
-		return -1;
-	if (common.skc_family != AF_INET)
-		return -1;
+		goto fail;
 
 	meta->ifindex = common.skc_bound_dev_if;
-	meta->src_ip = common.skc_rcv_saddr;
-	meta->dst_ip = common.skc_daddr;
 	meta->src_port = common.skc_num;
 	meta->dst_port = bpf_ntohs(common.skc_dport);
 	meta->family = common.skc_family;
-	return 0;
+
+	if (common.skc_family == AF_INET) {
+		meta->src_ip = common.skc_rcv_saddr;
+		meta->dst_ip = common.skc_daddr;
+		if (stats)
+			stats->tuple_ipv4_ok += 1;
+		return 0;
+	}
+
+	/* 很多 Nginx/Java 进程会用 AF_INET6 双栈监听 IPv4 请求。
+	 * 这类 socket 在 sock_common 里仍然能稳定拿到本地/对端端口，
+	 * 但 IPv6 地址布局跨内核更敏感。这里先退一步：只保留端口和 ifindex，
+	 * 让“按端口过滤”的流量尽量在内核里就被挡住，降低 perf 压力。
+	 */
+	if (common.skc_family == AF_INET6) {
+		meta->src_ip = 0;
+		meta->dst_ip = 0;
+		if (stats)
+			stats->tuple_ipv6_portonly += 1;
+		return 0;
+	}
+
+fail:
+	if (stats)
+		stats->tuple_extract_fail += 1;
+	return -1;
 }
 
 /* src/dst 同时存在时，按链路对称匹配：
@@ -179,20 +208,30 @@ reject:
 	return 0;
 }
 
-static __always_inline int lookup_or_init_flow(__u64 sock_id, struct flow_state **state)
+/* 4.19 verifier 对“子函数把 map value 指针经由出参写回调用方栈，再由调用方解引用”
+ * 的类型跟踪很弱，容易把 map value 指针降级成普通标量，最终出现：
+ *   R7 invalid mem access 'inv'
+ * 因此这里的子函数只负责确保 flow_map 中存在该项，不直接把指针传回调用方。
+ * 调用方会在本地再次 bpf_map_lookup_elem，这样 verifier 能保住 map value 指针类型。
+ *
+ * 仍然保留 noinline，是为了把 zero 这个较大的局部对象留在子函数栈里，
+ * 避免 sock_sendmsg 主链路的组合栈再次超过 4.19 的限制。
+ */
+static __attribute__((noinline)) int ensure_flow_exists(__u64 sock_id)
 {
 	struct flow_state zero = {};
+	struct flow_state *state = NULL;
 
-	*state = bpf_map_lookup_elem(&flow_map, &sock_id);
-	if (*state)
+	state = bpf_map_lookup_elem(&flow_map, &sock_id);
+	if (state)
 		return 0;
 
 	zero.conn_id = ((__u64)bpf_get_prandom_u32() << 32) ^ bpf_ktime_get_ns() ^ sock_id;
 	if (bpf_map_update_elem(&flow_map, &sock_id, &zero, BPF_NOEXIST) < 0)
 		return -1;
 
-	*state = bpf_map_lookup_elem(&flow_map, &sock_id);
-	return *state ? 0 : -1;
+	state = bpf_map_lookup_elem(&flow_map, &sock_id);
+	return state ? 0 : -1;
 }
 
 /* next_chain_id 为每条连接生成稳定但不重复的请求编号：
@@ -211,6 +250,68 @@ static __always_inline __u64 next_chain_id(struct flow_state *state)
 	return state->conn_id ^ seq_component ^ state->rx_cursor;
 }
 
+static __always_inline void push_pending_request(struct flow_state *state, __u64 chain_id)
+{
+	if (!state || !chain_id)
+		return;
+
+	if (state->pending_count == 3) {
+		state->pending_req_chain3 = chain_id;
+		state->pending_count = 4;
+		return;
+	}
+	if (state->pending_count == 2) {
+		state->pending_req_chain2 = chain_id;
+		state->pending_count = 3;
+		return;
+	}
+	if (state->pending_count == 1) {
+		state->pending_req_chain1 = chain_id;
+		state->pending_count = 2;
+		return;
+	}
+	if (state->pending_count == 0) {
+		state->pending_req_chain0 = chain_id;
+		state->pending_count = 1;
+		return;
+	}
+
+	/* 队列满时丢掉最老的一条，整体左移。
+	 * 固定槽位 + 显式赋值是为了兼容 4.19 verifier，避免任何回边。
+	 */
+	state->pending_req_chain0 = state->pending_req_chain1;
+	state->pending_req_chain1 = state->pending_req_chain2;
+	state->pending_req_chain2 = state->pending_req_chain3;
+	state->pending_req_chain3 = chain_id;
+}
+
+static __always_inline __u64 pop_pending_request(struct flow_state *state)
+{
+	__u64 chain_id = 0;
+
+	if (!state || !state->pending_count)
+		return 0;
+
+	chain_id = state->pending_req_chain0;
+	if (state->pending_count > 1)
+		state->pending_req_chain0 = state->pending_req_chain1;
+	else
+		state->pending_req_chain0 = 0;
+	if (state->pending_count > 2)
+		state->pending_req_chain1 = state->pending_req_chain2;
+	else
+		state->pending_req_chain1 = 0;
+	if (state->pending_count > 3)
+		state->pending_req_chain2 = state->pending_req_chain3;
+	else
+		state->pending_req_chain2 = 0;
+	state->pending_req_chain3 = 0;
+	if (state->pending_count > 0) {
+		state->pending_count -= 1;
+	}
+	return chain_id;
+}
+
 static __always_inline void start_request_capture(struct flow_state *state, __u64 chain_id)
 {
 	if (!state)
@@ -221,25 +322,19 @@ static __always_inline void start_request_capture(struct flow_state *state, __u6
 	state->req_capture_bytes = 0;
 	state->req_capture_stopped = 0;
 	state->req_active = 1;
-	state->response_pending = 1;
-
-	/* 新请求开始后，旧响应状态已经结束或失效，直接清掉，避免 keep-alive 上串流。 */
-	state->resp_active = 0;
-	state->resp_frag_idx = 0;
-	state->resp_capture_bytes = 0;
-	state->resp_capture_stopped = 0;
+	push_pending_request(state, chain_id);
 }
 
-static __always_inline void start_response_capture(struct flow_state *state)
+static __always_inline void start_response_capture(struct flow_state *state, __u64 chain_id)
 {
 	if (!state)
 		return;
 
+	state->resp_chain_id = chain_id;
 	state->resp_frag_idx = 0;
 	state->resp_capture_bytes = 0;
 	state->resp_capture_stopped = 0;
 	state->resp_active = 1;
-	state->response_pending = 0;
 	state->req_active = 0;
 }
 
@@ -386,6 +481,20 @@ static __always_inline int looks_like_http_response(const char *buf, __u32 len)
 	return buf[0] == 'H' && buf[1] == 'T' && buf[2] == 'T' && buf[3] == 'P' && buf[4] == '/';
 }
 
+/* 4.19 verifier 很容易把“读取 iov 前缀 + 判断 HTTP/”这段内联逻辑折叠成回边。
+ * 单独拆成 noinline helper 后，发送主链路只拿一个布尔结果，控制流会稳定很多。
+ */
+static __attribute__((noinline)) int starts_with_http_response(const struct iov_iter_compat *iter)
+{
+	char prefix[8] = {};
+	int prefix_len = 0;
+
+	if (!iter)
+		return 0;
+	prefix_len = read_prefix_from_iter(iter, prefix, sizeof(prefix));
+	return looks_like_http_response(prefix, prefix_len);
+}
+
 static __always_inline __u8 detect_http_direction(const char *buf, __u32 len)
 {
 	if (looks_like_http_request(buf, len))
@@ -409,8 +518,8 @@ static __always_inline __u32 pick_capture_limit(void)
 }
 
 /* emit_control_event 上报 close 之类的控制事件，用户态收到后可以把“靠 EOF 结束”的响应收尾。 */
-static __attribute__((noinline)) int emit_control_event(void *ctx, const struct recv_args *meta,
-							__u64 chain_id, __u64 sock_id, __u8 flags)
+static __attribute__((noinline)) __attribute__((unused)) int emit_control_event(void *ctx, const struct recv_args *meta,
+									 __u64 chain_id, __u64 sock_id, __u8 flags)
 {
 	struct http_event *event = NULL;
 	__u32 key = 0;
@@ -455,12 +564,19 @@ static __attribute__((noinline)) int emit_control_event(void *ctx, const struct 
  * 如果像旧版本那样固定读 MAX_PAYLOAD_SIZE，在 4.19 上很容易因为越过用户缓冲区边界而失败，
  * 最终表现成：send/recv hook 都命中了，但 request/response fragment 始终是 0。
  */
-static __attribute__((noinline)) int emit_data_event(void *ctx, const struct emit_call *call)
+/* 这里直接接收 capture_call 和打包后的 fragment 元数据，避免在调用链上再额外构造
+ * 一个 emit_call 大对象，降低 4.19 verifier 统计到的组合栈占用。
+ */
+static __attribute__((noinline)) int emit_data_event(void *ctx, const struct capture_call *call,
+						     const char *src, __u32 payload_len,
+						     __u32 frag_meta)
 {
 	struct http_event *event = NULL;
 	struct kernel_stats *stats = stats_lookup();
 	__u32 key = 0;
-	__u32 safe_len = call->payload_len & MAX_PAYLOAD_MASK;
+	__u32 safe_len = payload_len & MAX_PAYLOAD_MASK;
+	__u16 frag_idx = (__u16)(frag_meta & 0xffff);
+	__u16 flags = (__u16)(frag_meta >> 16);
 
 	event = bpf_map_lookup_elem(&scratch_heap, &key);
 	if (!event)
@@ -484,13 +600,13 @@ static __attribute__((noinline)) int emit_data_event(void *ctx, const struct emi
 	event->dst_port = call->meta->dst_port;
 	event->payload_len = safe_len;
 	event->total_len = call->total_len;
-	event->frag_idx = call->frag_idx;
+	event->frag_idx = frag_idx;
 	event->direction = call->direction;
-	event->flags = call->flags;
+	event->flags = flags;
 	event->source = call->source;
 	event->family = call->meta->family;
 	__builtin_memcpy(event->comm, call->meta->comm, sizeof(event->comm));
-	if (safe_len > 0 && bpf_probe_read(event->payload, safe_len, call->src) < 0) {
+	if (safe_len > 0 && bpf_probe_read(event->payload, safe_len, src) < 0) {
 		if (stats)
 			stats->perf_errors += 1;
 		return -1;
@@ -514,6 +630,179 @@ static __attribute__((noinline)) int emit_data_event(void *ctx, const struct emi
 /* capture_message 负责把一个 sendmsg/recvmsg 调用切成多个 fragment 事件。
  * 每个 fragment 都带相同的 chain_id，用户态按 frag_idx 重组即可。
  */
+static __always_inline int emit_chunk_once(void *ctx, const struct capture_call *call,
+					   const char **base, __u64 *seg_len,
+					   __u32 *captured, __u32 *total_captured,
+					   __u16 *frag_idx, __u16 common_flags,
+					   __u32 capture_limit)
+{
+	__u32 chunk = 0;
+	__u16 flags = common_flags;
+	__u32 frag_meta = 0;
+
+	if (!*seg_len || *captured >= call->total_len || *total_captured >= capture_limit)
+		return 0;
+
+	chunk = *seg_len > MAX_PAYLOAD_SIZE ? MAX_PAYLOAD_SIZE : (__u32)*seg_len;
+	if (*frag_idx == *call->frag_cursor)
+		flags |= EVT_FLAG_START;
+	if (*captured + chunk >= call->total_len || *total_captured + chunk >= capture_limit)
+		flags |= EVT_FLAG_END;
+	frag_meta = ((__u32)flags << 16) | *frag_idx;
+	if (emit_data_event(ctx, call, *base, chunk, frag_meta) < 0)
+		return -1;
+
+	*base += chunk;
+	*seg_len -= chunk;
+	*captured += chunk;
+	*total_captured += chunk;
+	*frag_idx += 1;
+	return 0;
+}
+
+#ifdef LEGACY_VERIFIER
+struct legacy_capture_state {
+	const char *base;
+	__u64 seg_len;
+	__u32 captured;
+	__u32 total_captured;
+	__u16 frag_idx;
+	__u16 common_flags;
+	__u32 capture_limit;
+};
+
+static __attribute__((noinline)) int emit_chunk_once_legacy(void *ctx,
+							    const struct capture_call *call,
+							    struct legacy_capture_state *state)
+{
+	return emit_chunk_once(ctx, call, &state->base, &state->seg_len, &state->captured,
+			       &state->total_captured, &state->frag_idx,
+			       state->common_flags, state->capture_limit);
+}
+
+static __attribute__((noinline)) int capture_iov_slot0_legacy(void *ctx, struct capture_call *call,
+							      struct legacy_capture_state *state)
+{
+	struct iovec_compat iov = {};
+	__u64 seg_skip = 0;
+
+	if (!call->iter || !call->iter->iov || call->iter->nr_segs == 0)
+		return 0;
+	if (state->captured >= call->total_len || state->total_captured >= state->capture_limit)
+		return 0;
+	if (bpf_probe_read(&iov, sizeof(iov), &call->iter->iov[0]) < 0)
+		return 0;
+
+	seg_skip = call->iter->iov_offset;
+	if (seg_skip >= iov.iov_len)
+		return 0;
+
+	state->seg_len = iov.iov_len - seg_skip;
+	if (state->seg_len > call->total_len - state->captured)
+		state->seg_len = call->total_len - state->captured;
+	if (state->seg_len > state->capture_limit - state->total_captured)
+		state->seg_len = state->capture_limit - state->total_captured;
+	state->base = (const char *)iov.iov_base + seg_skip;
+
+	if (emit_chunk_once_legacy(ctx, call, state) < 0)
+		return -1;
+	if (emit_chunk_once_legacy(ctx, call, state) < 0)
+		return -1;
+	if (emit_chunk_once_legacy(ctx, call, state) < 0)
+		return -1;
+	if (emit_chunk_once_legacy(ctx, call, state) < 0)
+		return -1;
+	if (emit_chunk_once_legacy(ctx, call, state) < 0)
+		return -1;
+	return 0;
+}
+
+static __attribute__((noinline)) int capture_iov_slot1_legacy(void *ctx, struct capture_call *call,
+							      struct legacy_capture_state *state)
+{
+	struct iovec_compat iov = {};
+
+	if (!call->iter || !call->iter->iov || call->iter->nr_segs <= 1)
+		return 0;
+	if (state->captured >= call->total_len || state->total_captured >= state->capture_limit)
+		return 0;
+	if (bpf_probe_read(&iov, sizeof(iov), &call->iter->iov[1]) < 0)
+		return 0;
+	if (iov.iov_len == 0)
+		return 0;
+
+	state->seg_len = iov.iov_len;
+	if (state->seg_len > call->total_len - state->captured)
+		state->seg_len = call->total_len - state->captured;
+	if (state->seg_len > state->capture_limit - state->total_captured)
+		state->seg_len = state->capture_limit - state->total_captured;
+	state->base = (const char *)iov.iov_base;
+
+	if (emit_chunk_once_legacy(ctx, call, state) < 0)
+		return -1;
+	if (emit_chunk_once_legacy(ctx, call, state) < 0)
+		return -1;
+	if (emit_chunk_once_legacy(ctx, call, state) < 0)
+		return -1;
+	if (emit_chunk_once_legacy(ctx, call, state) < 0)
+		return -1;
+	if (emit_chunk_once_legacy(ctx, call, state) < 0)
+		return -1;
+	return 0;
+}
+
+/* 4.19 verifier 不接受 capture_message_from_iter 里编译器残留的回边。
+ * legacy 对象把 iov/chunk 展开成固定分支，专门换取“稳定可加载”。
+ */
+static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct capture_call *call)
+{
+	struct kernel_stats *stats = stats_lookup();
+	__u32 capture_limit = pick_capture_limit();
+	__u32 captured = 0;
+	__u32 total_captured = call->message_captured ? *call->message_captured : 0;
+	__u16 frag_idx = (__u16)*call->frag_cursor;
+	__u16 common_flags = call->base_flags;
+
+	if (!call->iter || !call->iter->iov || !call->iter->nr_segs)
+		return 0;
+	if (call->capture_stopped && *call->capture_stopped)
+		return 0;
+	if (total_captured >= capture_limit) {
+		if (call->capture_stopped)
+			*call->capture_stopped = 1;
+		return 0;
+	}
+	if (total_captured + call->total_len > capture_limit) {
+		common_flags |= EVT_FLAG_CAPTURE_TRUNC;
+		if (stats && (!call->capture_stopped || !*call->capture_stopped))
+			stats->truncations += 1;
+	}
+
+	{
+		struct legacy_capture_state state = {};
+
+		state.captured = captured;
+		state.total_captured = total_captured;
+		state.frag_idx = frag_idx;
+		state.common_flags = common_flags;
+		state.capture_limit = capture_limit;
+		if (capture_iov_slot0_legacy(ctx, call, &state) < 0)
+			return -1;
+		if (capture_iov_slot1_legacy(ctx, call, &state) < 0)
+			return -1;
+		captured = state.captured;
+		total_captured = state.total_captured;
+		frag_idx = state.frag_idx;
+	}
+
+	*call->frag_cursor = frag_idx;
+	if (call->message_captured)
+		*call->message_captured = total_captured;
+	if (call->capture_stopped && total_captured >= capture_limit)
+		*call->capture_stopped = 1;
+	return 0;
+}
+#else
 static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct capture_call *call)
 {
 	struct kernel_stats *stats = stats_lookup();
@@ -563,35 +852,10 @@ static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct
 
 #pragma unroll
 		for (int j = 0; j < MAX_CHUNKS_PER_IOV; j++) {
-			__u32 chunk = 0;
-			__u16 flags = common_flags;
-			struct emit_call emit = {};
-
-			if (!seg_len || captured >= call->total_len || total_captured >= capture_limit)
-				break;
-			chunk = seg_len > MAX_PAYLOAD_SIZE ? MAX_PAYLOAD_SIZE : (__u32)seg_len;
-			if (frag_idx == *call->frag_cursor)
-				flags |= EVT_FLAG_START;
-			if (captured + chunk >= call->total_len || total_captured + chunk >= capture_limit)
-				flags |= EVT_FLAG_END;
-			emit.meta = call->meta;
-			emit.chain_id = call->chain_id;
-			emit.seq_hint = call->seq_hint;
-			emit.frag_idx = frag_idx;
-			emit.flags = flags;
-			emit.total_len = (__u16)call->total_len;
-			emit.direction = call->direction;
-			emit.source = call->source;
-			emit.src = base;
-			emit.payload_len = chunk;
-			if (emit_data_event(ctx, &emit) < 0)
+			if (emit_chunk_once(ctx, call, &base, &seg_len, &captured,
+					    &total_captured, &frag_idx,
+					    common_flags, capture_limit) < 0)
 				return -1;
-
-			base += chunk;
-			seg_len -= chunk;
-			captured += chunk;
-			total_captured += chunk;
-			frag_idx += 1;
 		}
 	}
 
@@ -601,6 +865,35 @@ static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct
 	if (call->capture_stopped && total_captured >= capture_limit)
 		*call->capture_stopped = 1;
 	return 0;
+}
+#endif
+
+/* 发送路径单独包一层 helper，把 capture_call 的本地对象挪出 handle_send_entry。
+ * 4.19 verifier 统计“组合栈”时，发送主链路每少一个大局部结构体都很关键。
+ */
+static __attribute__((noinline)) int capture_response_message(void *ctx,
+							       const struct iov_iter_compat *iter,
+							       const struct recv_args *meta,
+							       struct flow_state *state,
+							       __u8 source)
+{
+	struct capture_call call = {};
+
+	if (!iter || !meta || !state)
+		return 0;
+
+	call.iter = iter;
+	call.meta = meta;
+	call.chain_id = state->resp_chain_id;
+	call.seq_hint = meta->seq_hint;
+	call.frag_cursor = &state->resp_frag_idx;
+	call.message_captured = &state->resp_capture_bytes;
+	call.capture_stopped = &state->resp_capture_stopped;
+	call.total_len = (__u32)iter->count;
+	call.base_flags = 0;
+	call.direction = DIR_RESPONSE;
+	call.source = source;
+	return capture_message_from_iter(ctx, &call);
 }
 
 /* fill_common_meta 统一补齐 PID/TID/FD/comm 等基础元数据。
@@ -675,15 +968,19 @@ static __always_inline int store_recv_args(struct sock_compat *sk, struct msghdr
 	struct iov_iter_compat iter = {};
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	struct kernel_stats *stats = stats_lookup();
+#ifndef LEGACY_VERIFIER
 	struct recv_args *existing = NULL;
 
 	existing = bpf_map_lookup_elem(&recv_args_map, &pid_tgid);
 	if (existing && fd < 0)
 		return 0;
+#endif
 
 	fill_common_meta(&meta, sk, fd, source);
+#ifndef LEGACY_VERIFIER
 	if (extract_tuple(sk, &meta) == 0 && !matches_filter(&meta))
 		return 0;
+#endif
 
 	meta.msg_ptr = (__u64)msg;
 	if (read_msg_iter(msg, &iter) < 0 || !iter.count) {
@@ -696,6 +993,79 @@ static __always_inline int store_recv_args(struct sock_compat *sk, struct msghdr
 	if (stats)
 		stats->recv_store_ok += 1;
 	return 0;
+}
+
+static __attribute__((noinline)) __u64 prepare_send_scratch(struct sock_compat *sk,
+							    struct msghdr_compat *msg,
+							    __s32 fd, __u8 source)
+{
+	struct send_capture_scratch *scratch = NULL;
+	struct kernel_stats *stats = stats_lookup();
+	__u32 key = 0;
+
+	if (!sk)
+		return 0;
+	scratch = bpf_map_lookup_elem(&send_scratch_map, &key);
+	if (!scratch)
+		return 0;
+
+	fill_common_meta(&scratch->meta, sk, fd, source);
+#ifndef LEGACY_VERIFIER
+	if (extract_tuple(sk, &scratch->meta) == 0 && !matches_filter(&scratch->meta))
+		return 0;
+#endif
+	if (read_msg_iter(msg, &scratch->iter) < 0 || !scratch->iter.count) {
+		if (stats)
+			stats->send_iter_empty += 1;
+		return 0;
+	}
+
+	return scratch->meta.sock_id;
+}
+
+// 响应链起点判断，如果请求链路已经存在，并且有 pending 请求，则优先从队首取新的 chain_id。
+static __attribute__((noinline)) __u64 select_response_chain(struct flow_state *state,
+							     const struct iov_iter_compat *iter)
+{
+	struct kernel_stats *stats = stats_lookup();
+	__u64 chain_id = 0;
+	int starts_new_response = starts_with_http_response(iter);
+	int req_active_start = 0;
+
+	if (!state)
+		return 0;
+
+	/* keep-alive 连接上，下一条 request 可能已经在 recv 路径里起链了，
+	 * 但对应 response 的第一段 send 不一定总是从 "HTTP/1.1" 开头开始。
+	 * 如果这里只看 resp_active/响应行前缀，就会把新的 response 误续到上一条 resp_chain 上，
+	 * 最终在用户态表现成 orphan_resp 和 pending_no_resp 同时升高。
+	 *
+	 * 因此这里把 req_active 也视作“应该开启新 response”的强信号：
+	 * - 只要连接上已经有新的 pending request，send 路径就优先从队首取新的 chain_id。
+	 * - 这样即便 send 的第一段只带 body 或 chunk 数据，也不会继续写到上一条 response 上。
+	 */
+	if (state->req_active && state->pending_count)
+		req_active_start = 1;
+
+	if (req_active_start || !state->resp_active || starts_new_response) {
+		chain_id = pop_pending_request(state);
+		if (!chain_id) {
+			if (stats)
+				stats->send_no_req_chain += 1;
+			return 0;
+		}
+		start_response_capture(state, chain_id);
+		if (stats) {
+			stats->send_resp_start += 1;
+			if (req_active_start)
+				stats->send_resp_reqactive += 1;
+		}
+		return chain_id;
+	}
+
+	if (stats)
+		stats->send_resp_continue += 1;
+	return state->resp_chain_id;
 }
 
 /* handle_recv_return 统一处理 sock_recvmsg/tcp_recvmsg 的返回路径：
@@ -725,7 +1095,10 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 		stats->recv_calls += 1;
 	if (ret <= 0)
 		goto cleanup;
-	if (lookup_or_init_flow(meta->sock_id, &state) < 0)
+	if (ensure_flow_exists(meta->sock_id) < 0)
+		goto cleanup;
+	state = bpf_map_lookup_elem(&flow_map, &meta->sock_id);
+	if (!state)
 		goto cleanup;
 
 	emit_meta = *meta;
@@ -750,18 +1123,6 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 		if (stats)
 			stats->recv_dir_unknown += 1;
 		chain_id = state->last_req_chain_id;
-		flags = 0;
-	} else if (state->last_req_chain_id && !state->response_pending) {
-		if (stats) {
-			stats->recv_dir_unknown += 1;
-			stats->recv_fallback_keepalive += 1;
-		}
-		/* 长连接顺序调用时，下一条请求未必总是从当前 recv 缓冲的第一个字节开始，
-		 * 这时仅靠方法行前缀判断会漏掉第二、第三个接口。
-		 * 这里在“上一轮已经进入响应阶段”的前提下，允许把新的 recv 直接视作下一条 request。
-		 */
-		chain_id = next_chain_id(state);
-		start_request_capture(state, chain_id);
 		flags = 0;
 	} else {
 		if (stats)
@@ -796,79 +1157,37 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 						       struct msghdr_compat *msg, __s32 fd,
 						       __u8 source)
 {
-	struct recv_args meta = {};
 	struct flow_state *state = NULL;
-	struct iov_iter_compat iter = {};
+	struct send_capture_scratch *scratch = NULL;
 	struct kernel_stats *stats = stats_lookup();
+	__u32 key = 0;
 	__u64 sock_id = 0;
 	__u64 chain_id = 0;
-	__u64 seq_hint = 0;
-	__u16 flags = 0;
 
 	if (stats)
 		stats->send_calls += 1;
-	if (!sk)
+	sock_id = prepare_send_scratch(sk, msg, fd, source);
+	if (!sock_id)
 		return 0;
-	fill_common_meta(&meta, sk, fd, source);
-	if (extract_tuple(sk, &meta) == 0 && !matches_filter(&meta))
+	scratch = bpf_map_lookup_elem(&send_scratch_map, &key);
+	if (!scratch)
 		return 0;
-	if (read_msg_iter(msg, &iter) < 0 || !iter.count) {
-		if (stats)
-			stats->send_iter_empty += 1;
+	if (ensure_flow_exists(sock_id) < 0)
 		return 0;
-	}
-
-	sock_id = meta.sock_id;
-	if (lookup_or_init_flow(sock_id, &state) < 0)
+	state = bpf_map_lookup_elem(&flow_map, &sock_id);
+	if (!state)
 		return 0;
 
-	state->tx_cursor += iter.count;
-	seq_hint = state->tx_cursor;
-	meta.seq_hint = seq_hint;
-
-	/* 对 TCP 响应来说，tcp_sendmsg 的第一段不一定都以 "HTTP/" 开头。
-	 * 只要同一连接上已经有活跃 request，就直接把 send 路径视作 response。
-	 */
-	if (!state->last_req_chain_id) {
-		if (stats)
-			stats->send_no_req_chain += 1;
+	state->tx_cursor += scratch->iter.count;
+	scratch->meta.seq_hint = state->tx_cursor;
+	chain_id = select_response_chain(state, &scratch->iter);
+	if (!chain_id)
 		return 0;
-	}
-
-	if (state->resp_active && !state->resp_capture_stopped) {
-		if (stats)
-			stats->send_resp_continue += 1;
-		chain_id = state->last_req_chain_id;
-	} else if (state->response_pending) {
-		start_response_capture(state);
-		if (stats)
-			stats->send_resp_start += 1;
-		chain_id = state->last_req_chain_id;
-	} else {
-		if (stats)
-			stats->send_no_req_chain += 1;
-		return 0;
-	}
 	if (!claim_send_guard(bpf_get_current_pid_tgid(), msg, source))
 		return 0;
 
-	{
-		struct capture_call call = {};
-
-		call.iter = &iter;
-		call.meta = &meta;
-		call.chain_id = chain_id;
-		call.seq_hint = seq_hint;
-		call.frag_cursor = &state->resp_frag_idx;
-		call.message_captured = &state->resp_capture_bytes;
-		call.capture_stopped = &state->resp_capture_stopped;
-		call.total_len = (__u32)iter.count;
-		call.base_flags = flags;
-		call.direction = DIR_RESPONSE;
-		call.source = source;
-		if (capture_message_from_iter(ctx, &call) < 0)
-			return 0;
-	}
+	if (capture_response_message(ctx, &scratch->iter, &scratch->meta, state, source) < 0)
+		return 0;
 
 	return 0;
 }
@@ -1042,6 +1361,9 @@ int BPF_KRETPROBE(kretprobe_tcp_recvmsg)
 SEC("kprobe/tcp_close")
 int BPF_KPROBE(kprobe_tcp_close, struct sock_compat *sk)
 {
+#ifdef LEGACY_VERIFIER
+	return 0;
+#else
 	struct flow_state *state = NULL;
 	struct recv_args meta = {};
 	struct kernel_stats *stats = stats_lookup();
@@ -1068,6 +1390,7 @@ int BPF_KPROBE(kprobe_tcp_close, struct sock_compat *sk)
 		stats->close_events += 1;
 	bpf_map_delete_elem(&flow_map, &sock_id);
 	return 0;
+#endif
 }
 
 char LICENSE[] SEC("license") = "GPL";
