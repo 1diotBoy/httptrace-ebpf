@@ -59,6 +59,7 @@ func missingTuple(event httptrace.Event) bool {
 	return srcMissing || dstMissing
 }
 
+// 解析五元组
 func (r *socketResolver) Resolve(event httptrace.Event) (httptrace.Event, resolveSource) {
 	if event.PID == 0 || event.FD < 0 || !missingTuple(event) {
 		return event, resolveMiss

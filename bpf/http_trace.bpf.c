@@ -1378,6 +1378,7 @@ int BPF_KPROBE(kprobe_tcp_close, struct sock_compat *sk)
 		return 0;
 	}
 	fill_common_meta(&meta, sk, -1, SRC_TCP_CLOSE);
+	
 	if (extract_tuple(sk, &meta) == 0 && !matches_filter(&meta)) {
 		bpf_map_delete_elem(&flow_map, &sock_id);
 		return 0;

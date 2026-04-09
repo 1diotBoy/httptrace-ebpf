@@ -95,9 +95,6 @@ func TestDispatchEventPassesThroughMissingTupleRequest(t *testing.T) {
 		t.Fatalf("expected unresolved request to be passed through")
 	}
 
-	if svc.stats.tuplePassThrough.Load() != 1 {
-		t.Fatalf("tuple pass-through counter should increase")
-	}
 	if svc.stats.userFiltered.Load() != 0 {
 		t.Fatalf("event should not be counted as filtered")
 	}

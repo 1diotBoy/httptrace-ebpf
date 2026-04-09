@@ -227,17 +227,18 @@ func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 	kernelFilter := s.filter.Kernel
 	if usesLegacySockABI() {
 		// 4.x 上 sock 结构布局在不同发行版/回移内核间差异更大，
-		// 内核态五元组提取并不总是可靠。这里关闭 endpoint 过滤，
-		// 先保证 payload 能上送，再由用户态用 pid+fd 反查 socket tuple 后精确过滤。
+		// 内核态五元组提取并不总是可靠。这里保留端口过滤，
+		// 但关闭 IP/ifname 相关的 endpoint 过滤：
+		// - 端口在 4.x/双栈 socket 上仍然相对稳定，先在内核里挡掉一批无关流量；
+		// - ifindex 在 socket hook 上更接近 bind_dev_if，老内核更不适合作为强过滤条件；
+		// - IP 提取在 4.x 和双栈场景下也更容易受布局差异影响。
 		kernelFilter.Ifindex = 0
 		kernelFilter.SrcIp = 0
 		kernelFilter.DstIp = 0
-		kernelFilter.SrcPort = 0
-		kernelFilter.DstPort = 0
 		if s.cfg.DisableUserTuple {
-			log.Printf("legacy 4.x detected: kernel endpoint filters disabled in tuple-free diagnostic mode")
+ 			log.Printf("legacy 4.x detected: keep kernel port filter, disable kernel ip/ifname filter in tuple-free diagnostic mode")
 		} else {
-			log.Printf("legacy 4.x detected: kernel endpoint filters disabled; tuple filter will be enforced in user space")
+			log.Printf("legacy 4.x detected: keep kernel port filter, disable kernel ip/ifname filter; user space still补充 tuple filter")
 		}
 	}
 	if err := objs.FilterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
@@ -413,6 +414,7 @@ func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace
 	}
 }
 
+// 关闭五元组过滤时，不输出 src/dst ip/port
 func (s *Service) sanitizeTraceForOutput(trace httptrace.TraceDocument) httptrace.TraceDocument {
 	if !s.cfg.DisableUserTuple {
 		return trace
@@ -424,6 +426,7 @@ func (s *Service) sanitizeTraceForOutput(trace httptrace.TraceDocument) httptrac
 	return trace
 }
 
+// 记录过滤事件
 func (s *Service) recordFilterDrop(direction uint8, reason FilterReason) {
 	switch direction {
 	case httptrace.DirectionRequest:
@@ -504,6 +507,7 @@ func newConsoleParsedMessage(msg *httptrace.ParsedMessage) *consoleParsedMessage
 	}
 }
 
+// 解析五元组
 func (s *Service) resolveEvent(event httptrace.Event) (httptrace.Event, resolveSource) {
 	if s.cfg.DisableUserTuple {
 		return event, resolveBypass
