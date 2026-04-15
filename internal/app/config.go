@@ -20,26 +20,27 @@ type Config struct {
 	DstIP                string
 	SrcPort              uint
 	DstPort              uint
-	DisableUserTuple     bool
-	CaptureBytes         int
-	PerfPages            int
-	BatchSize            int
-	WorkerCount          int
+	DisableKernelFilter  bool // 是否禁用内核态过滤 ，默认不禁用
+	DisableUserTuple     bool // 是否禁用用户态过滤 ，默认禁用
+	CaptureBytes         int  // 采集字节数 ，默认10KB
+	PerfPages            int  // 性能页数 ，默认256页
+	BatchSize            int  // 批量大小 ，默认100
+	WorkerCount          int  // 工作线程数 ，默认CPU核心数
 	RedisWorkers         int
-	RedisQueueSize       int
-	FlushInterval        time.Duration
-	LogInterval          time.Duration
-	PrintHTTP            bool
-	PrintSummary         bool
-	DebugKernel          bool
+	RedisQueueSize       int           // 队列大小 ，默认8192
+	FlushInterval        time.Duration // 刷新间隔 ，默认200毫秒
+	LogInterval          time.Duration // 日志间隔 ，默认5秒
+	PrintHTTP            bool          // 是否打印HTTP请求/响应 ，默认打印
+	PrintSummary         bool          // 是否打印摘要 ，默认打印
+	DebugKernel          bool          // 是否打印内核态调试信息 ，默认不打印
 	ResponseStallTimeout time.Duration
-	TransactionTTL       time.Duration
+	TransactionTTL       time.Duration // 事务超时时间 ，默认2分钟
 	MaxMessageBytes      int
-	RedisAddr            string
+	RedisAddr            string // Redis地址 ，默认空
 	RedisPassword        string
-	RedisDB              int
-	RedisKeyPrefix       string
-	RedisTTL             time.Duration
+	RedisDB              int           // RedisDB ，默认0
+	RedisKeyPrefix       string        // RedisKeyPrefix ，默认http-trace
+	RedisTTL             time.Duration // RedisTTL ，默认24小时
 }
 
 // ResolvedFilter 同时保存：
@@ -68,6 +69,7 @@ const (
 func DefaultConfig() Config {
 	return Config{
 		CaptureBytes:         10 * 1024,
+		DisableKernelFilter:  false,
 		DisableUserTuple:     true,
 		PerfPages:            256,
 		BatchSize:            100,

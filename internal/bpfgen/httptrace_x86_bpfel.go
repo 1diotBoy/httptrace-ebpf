@@ -54,27 +54,34 @@ type HttpTraceSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type HttpTraceProgramSpecs struct {
-	KprobeSockRecvmsg          *ebpf.ProgramSpec `ebpf:"kprobe_sock_recvmsg"`
-	KprobeSockSendmsg          *ebpf.ProgramSpec `ebpf:"kprobe_sock_sendmsg"`
-	KprobeTcpClose             *ebpf.ProgramSpec `ebpf:"kprobe_tcp_close"`
-	KprobeTcpRecvmsg           *ebpf.ProgramSpec `ebpf:"kprobe_tcp_recvmsg"`
-	KprobeTcpSendmsg           *ebpf.ProgramSpec `ebpf:"kprobe_tcp_sendmsg"`
-	KretprobeSockRecvmsg       *ebpf.ProgramSpec `ebpf:"kretprobe_sock_recvmsg"`
-	KretprobeTcpRecvmsg        *ebpf.ProgramSpec `ebpf:"kretprobe_tcp_recvmsg"`
-	TracepointSysEnterRead     *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_read"`
-	TracepointSysEnterReadv    *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_readv"`
-	TracepointSysEnterRecvfrom *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_recvfrom"`
-	TracepointSysEnterRecvmsg  *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_recvmsg"`
-	TracepointSysEnterSendmsg  *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_sendmsg"`
-	TracepointSysEnterSendto   *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_sendto"`
-	TracepointSysEnterWrite    *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_write"`
-	TracepointSysEnterWritev   *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_writev"`
+	KprobeSockRecvmsg              *ebpf.ProgramSpec `ebpf:"kprobe_sock_recvmsg"`
+	KprobeSockSendmsg              *ebpf.ProgramSpec `ebpf:"kprobe_sock_sendmsg"`
+	KprobeTcpClose                 *ebpf.ProgramSpec `ebpf:"kprobe_tcp_close"`
+	KprobeTcpRecvmsg               *ebpf.ProgramSpec `ebpf:"kprobe_tcp_recvmsg"`
+	KprobeTcpSendmsg               *ebpf.ProgramSpec `ebpf:"kprobe_tcp_sendmsg"`
+	KprobeTcpV4Connect             *ebpf.ProgramSpec `ebpf:"kprobe_tcp_v4_connect"`
+	KprobeTcpV6Connect             *ebpf.ProgramSpec `ebpf:"kprobe_tcp_v6_connect"`
+	KretprobeInetCskAccept         *ebpf.ProgramSpec `ebpf:"kretprobe_inet_csk_accept"`
+	KretprobeSockRecvmsg           *ebpf.ProgramSpec `ebpf:"kretprobe_sock_recvmsg"`
+	KretprobeTcpRecvmsg            *ebpf.ProgramSpec `ebpf:"kretprobe_tcp_recvmsg"`
+	KretprobeTcpV4Connect          *ebpf.ProgramSpec `ebpf:"kretprobe_tcp_v4_connect"`
+	KretprobeTcpV6Connect          *ebpf.ProgramSpec `ebpf:"kretprobe_tcp_v6_connect"`
+	TracepointSockInetSockSetState *ebpf.ProgramSpec `ebpf:"tracepoint_sock_inet_sock_set_state"`
+	TracepointSysEnterRead         *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_read"`
+	TracepointSysEnterReadv        *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_readv"`
+	TracepointSysEnterRecvfrom     *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_recvfrom"`
+	TracepointSysEnterRecvmsg      *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_recvmsg"`
+	TracepointSysEnterSendmsg      *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_sendmsg"`
+	TracepointSysEnterSendto       *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_sendto"`
+	TracepointSysEnterWrite        *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_write"`
+	TracepointSysEnterWritev       *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_writev"`
 }
 
 // HttpTraceMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type HttpTraceMapSpecs struct {
+	ConnectArgsMap *ebpf.MapSpec `ebpf:"connect_args_map"`
 	Events         *ebpf.MapSpec `ebpf:"events"`
 	FilterMap      *ebpf.MapSpec `ebpf:"filter_map"`
 	FlowMap        *ebpf.MapSpec `ebpf:"flow_map"`
@@ -85,6 +92,7 @@ type HttpTraceMapSpecs struct {
 	SendFdMap      *ebpf.MapSpec `ebpf:"send_fd_map"`
 	SendGuardMap   *ebpf.MapSpec `ebpf:"send_guard_map"`
 	SendScratchMap *ebpf.MapSpec `ebpf:"send_scratch_map"`
+	TupleCache     *ebpf.MapSpec `ebpf:"tuple_cache"`
 }
 
 // HttpTraceVariableSpecs contains global variables before they are loaded into the kernel.
@@ -113,6 +121,7 @@ func (o *HttpTraceObjects) Close() error {
 //
 // It can be passed to LoadHttpTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type HttpTraceMaps struct {
+	ConnectArgsMap *ebpf.Map `ebpf:"connect_args_map"`
 	Events         *ebpf.Map `ebpf:"events"`
 	FilterMap      *ebpf.Map `ebpf:"filter_map"`
 	FlowMap        *ebpf.Map `ebpf:"flow_map"`
@@ -123,10 +132,12 @@ type HttpTraceMaps struct {
 	SendFdMap      *ebpf.Map `ebpf:"send_fd_map"`
 	SendGuardMap   *ebpf.Map `ebpf:"send_guard_map"`
 	SendScratchMap *ebpf.Map `ebpf:"send_scratch_map"`
+	TupleCache     *ebpf.Map `ebpf:"tuple_cache"`
 }
 
 func (m *HttpTraceMaps) Close() error {
 	return _HttpTraceClose(
+		m.ConnectArgsMap,
 		m.Events,
 		m.FilterMap,
 		m.FlowMap,
@@ -137,6 +148,7 @@ func (m *HttpTraceMaps) Close() error {
 		m.SendFdMap,
 		m.SendGuardMap,
 		m.SendScratchMap,
+		m.TupleCache,
 	)
 }
 
@@ -150,21 +162,27 @@ type HttpTraceVariables struct {
 //
 // It can be passed to LoadHttpTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type HttpTracePrograms struct {
-	KprobeSockRecvmsg          *ebpf.Program `ebpf:"kprobe_sock_recvmsg"`
-	KprobeSockSendmsg          *ebpf.Program `ebpf:"kprobe_sock_sendmsg"`
-	KprobeTcpClose             *ebpf.Program `ebpf:"kprobe_tcp_close"`
-	KprobeTcpRecvmsg           *ebpf.Program `ebpf:"kprobe_tcp_recvmsg"`
-	KprobeTcpSendmsg           *ebpf.Program `ebpf:"kprobe_tcp_sendmsg"`
-	KretprobeSockRecvmsg       *ebpf.Program `ebpf:"kretprobe_sock_recvmsg"`
-	KretprobeTcpRecvmsg        *ebpf.Program `ebpf:"kretprobe_tcp_recvmsg"`
-	TracepointSysEnterRead     *ebpf.Program `ebpf:"tracepoint_sys_enter_read"`
-	TracepointSysEnterReadv    *ebpf.Program `ebpf:"tracepoint_sys_enter_readv"`
-	TracepointSysEnterRecvfrom *ebpf.Program `ebpf:"tracepoint_sys_enter_recvfrom"`
-	TracepointSysEnterRecvmsg  *ebpf.Program `ebpf:"tracepoint_sys_enter_recvmsg"`
-	TracepointSysEnterSendmsg  *ebpf.Program `ebpf:"tracepoint_sys_enter_sendmsg"`
-	TracepointSysEnterSendto   *ebpf.Program `ebpf:"tracepoint_sys_enter_sendto"`
-	TracepointSysEnterWrite    *ebpf.Program `ebpf:"tracepoint_sys_enter_write"`
-	TracepointSysEnterWritev   *ebpf.Program `ebpf:"tracepoint_sys_enter_writev"`
+	KprobeSockRecvmsg              *ebpf.Program `ebpf:"kprobe_sock_recvmsg"`
+	KprobeSockSendmsg              *ebpf.Program `ebpf:"kprobe_sock_sendmsg"`
+	KprobeTcpClose                 *ebpf.Program `ebpf:"kprobe_tcp_close"`
+	KprobeTcpRecvmsg               *ebpf.Program `ebpf:"kprobe_tcp_recvmsg"`
+	KprobeTcpSendmsg               *ebpf.Program `ebpf:"kprobe_tcp_sendmsg"`
+	KprobeTcpV4Connect             *ebpf.Program `ebpf:"kprobe_tcp_v4_connect"`
+	KprobeTcpV6Connect             *ebpf.Program `ebpf:"kprobe_tcp_v6_connect"`
+	KretprobeInetCskAccept         *ebpf.Program `ebpf:"kretprobe_inet_csk_accept"`
+	KretprobeSockRecvmsg           *ebpf.Program `ebpf:"kretprobe_sock_recvmsg"`
+	KretprobeTcpRecvmsg            *ebpf.Program `ebpf:"kretprobe_tcp_recvmsg"`
+	KretprobeTcpV4Connect          *ebpf.Program `ebpf:"kretprobe_tcp_v4_connect"`
+	KretprobeTcpV6Connect          *ebpf.Program `ebpf:"kretprobe_tcp_v6_connect"`
+	TracepointSockInetSockSetState *ebpf.Program `ebpf:"tracepoint_sock_inet_sock_set_state"`
+	TracepointSysEnterRead         *ebpf.Program `ebpf:"tracepoint_sys_enter_read"`
+	TracepointSysEnterReadv        *ebpf.Program `ebpf:"tracepoint_sys_enter_readv"`
+	TracepointSysEnterRecvfrom     *ebpf.Program `ebpf:"tracepoint_sys_enter_recvfrom"`
+	TracepointSysEnterRecvmsg      *ebpf.Program `ebpf:"tracepoint_sys_enter_recvmsg"`
+	TracepointSysEnterSendmsg      *ebpf.Program `ebpf:"tracepoint_sys_enter_sendmsg"`
+	TracepointSysEnterSendto       *ebpf.Program `ebpf:"tracepoint_sys_enter_sendto"`
+	TracepointSysEnterWrite        *ebpf.Program `ebpf:"tracepoint_sys_enter_write"`
+	TracepointSysEnterWritev       *ebpf.Program `ebpf:"tracepoint_sys_enter_writev"`
 }
 
 func (p *HttpTracePrograms) Close() error {
@@ -174,8 +192,14 @@ func (p *HttpTracePrograms) Close() error {
 		p.KprobeTcpClose,
 		p.KprobeTcpRecvmsg,
 		p.KprobeTcpSendmsg,
+		p.KprobeTcpV4Connect,
+		p.KprobeTcpV6Connect,
+		p.KretprobeInetCskAccept,
 		p.KretprobeSockRecvmsg,
 		p.KretprobeTcpRecvmsg,
+		p.KretprobeTcpV4Connect,
+		p.KretprobeTcpV6Connect,
+		p.TracepointSockInetSockSetState,
 		p.TracepointSysEnterRead,
 		p.TracepointSysEnterReadv,
 		p.TracepointSysEnterRecvfrom,

@@ -25,8 +25,14 @@ type LoadedObjects struct {
 	KprobeSockSendmsg    *ebpf.Program
 	KprobeTcpClose       *ebpf.Program
 	KprobeTcpSendmsg     *ebpf.Program
+	KprobeTcpV4Connect   *ebpf.Program
+	KretprobeTcpV4Connect *ebpf.Program
+	KprobeTcpV6Connect   *ebpf.Program
+	KretprobeTcpV6Connect *ebpf.Program
+	KretprobeInetCskAccept *ebpf.Program
 	KretprobeSockRecvmsg *ebpf.Program
 
+	TracepointSockInetSockSetState *ebpf.Program
 	TracepointSysEnterRead     *ebpf.Program
 	TracepointSysEnterReadv    *ebpf.Program
 	TracepointSysEnterRecvfrom *ebpf.Program
@@ -86,7 +92,13 @@ func loadModernObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
 		KprobeSockSendmsg:        raw.KprobeSockSendmsg,
 		KprobeTcpClose:           raw.KprobeTcpClose,
 		KprobeTcpSendmsg:         raw.KprobeTcpSendmsg,
+		KprobeTcpV4Connect:       raw.KprobeTcpV4Connect,
+		KretprobeTcpV4Connect:    raw.KretprobeTcpV4Connect,
+		KprobeTcpV6Connect:       raw.KprobeTcpV6Connect,
+		KretprobeTcpV6Connect:    raw.KretprobeTcpV6Connect,
+		KretprobeInetCskAccept:   raw.KretprobeInetCskAccept,
 		KretprobeSockRecvmsg:     raw.KretprobeSockRecvmsg,
+		TracepointSockInetSockSetState: raw.TracepointSockInetSockSetState,
 		TracepointSysEnterRead:     raw.TracepointSysEnterRead,
 		TracepointSysEnterReadv:    raw.TracepointSysEnterReadv,
 		TracepointSysEnterRecvfrom: raw.TracepointSysEnterRecvfrom,
@@ -114,7 +126,13 @@ func loadLegacyObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
 		KprobeSockSendmsg:        raw.KprobeSockSendmsg,
 		KprobeTcpClose:           raw.KprobeTcpClose,
 		KprobeTcpSendmsg:         raw.KprobeTcpSendmsg,
+		KprobeTcpV4Connect:       raw.KprobeTcpV4Connect,
+		KretprobeTcpV4Connect:    raw.KretprobeTcpV4Connect,
+		KprobeTcpV6Connect:       raw.KprobeTcpV6Connect,
+		KretprobeTcpV6Connect:    raw.KretprobeTcpV6Connect,
+		KretprobeInetCskAccept:   raw.KretprobeInetCskAccept,
 		KretprobeSockRecvmsg:     raw.KretprobeSockRecvmsg,
+		TracepointSockInetSockSetState: raw.TracepointSockInetSockSetState,
 		TracepointSysEnterRead:     raw.TracepointSysEnterRead,
 		TracepointSysEnterReadv:    raw.TracepointSysEnterReadv,
 		TracepointSysEnterRecvfrom: raw.TracepointSysEnterRecvfrom,

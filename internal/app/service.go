@@ -143,7 +143,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	log.Printf("resolved filter: %s", s.filter.Summary())
 	if s.cfg.DisableUserTuple {
-		log.Printf("user tuple pipeline disabled: skip /proc tuple resolve and user-space tuple filter; redis/console output hides src/dst ip/port")
+		log.Printf("user tuple pipeline disabled: skip /proc tuple resolve and user-space tuple filter; redis/console output keeps kernel tuple when available")
 	}
 
 	stopAttachWatch := startPhaseWatch(ctx, "probe attach", 2*time.Second)
@@ -220,26 +220,35 @@ func (s *Service) Run(ctx context.Context) error {
 	return runErr
 }
 
-// installFilter 把 best-effort 规则写入内核 map。
-// 真正运行时还会叠加一层用户态补偿过滤，用来修正 socket 层 ifindex/方向翻转问题。
+// installFilter 把内核侧过滤规则写入 map。
+// 当前 tuple-cache 方案先只强化端口/IP 过滤，不在 socket hook 上强依赖 ifindex。
 func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 	key := uint32(0)
 	kernelFilter := s.filter.Kernel
-	if usesLegacySockABI() {
-		// 4.x 上 sock 结构布局在不同发行版/回移内核间差异更大，
-		// 内核态五元组提取并不总是可靠。这里保留端口过滤，
-		// 但关闭 IP/ifname 相关的 endpoint 过滤：
-		// - 端口在 4.x/双栈 socket 上仍然相对稳定，先在内核里挡掉一批无关流量；
-		// - ifindex 在 socket hook 上更接近 bind_dev_if，老内核更不适合作为强过滤条件；
-		// - IP 提取在 4.x 和双栈场景下也更容易受布局差异影响。
+	if s.cfg.DisableKernelFilter {
+		log.Printf("kernel endpoint filter disabled by flag: all IP/port checks are skipped before perf output")
 		kernelFilter.Ifindex = 0
 		kernelFilter.SrcIp = 0
 		kernelFilter.DstIp = 0
-		if s.cfg.DisableUserTuple {
- 			log.Printf("legacy 4.x detected: keep kernel port filter, disable kernel ip/ifname filter in tuple-free diagnostic mode")
-		} else {
-			log.Printf("legacy 4.x detected: keep kernel port filter, disable kernel ip/ifname filter; user space still补充 tuple filter")
+		kernelFilter.SrcPort = 0
+		kernelFilter.DstPort = 0
+		if s.cfg.CaptureBytes > 0 {
+			kernelFilter.CaptureBytes = uint32(s.cfg.CaptureBytes)
 		}
+		if err := objs.FilterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update filter map: %w", err)
+		}
+		return nil
+	}
+	if kernelFilter.Ifindex != 0 {
+		log.Printf("ifname filter is not enforced in kernel tuple-cache mode: socket-layer ifindex is not reliable enough")
+	}
+	kernelFilter.Ifindex = 0
+	if usesLegacySockABI() {
+		// 4.x 上 sock 结构布局在不同发行版/回移内核间差异更大，
+		// 改成用 inet_sock_set_state 维护 tuple cache，send/recv 路径优先查 cache 做端口/IP 过滤。
+		// 这样 4.x 不再依赖收发现场直接读 sock_common 来做强过滤。
+		log.Printf("legacy 4.x detected: prefer tuple-cache based kernel port/IP filter and ignore socket-layer ifname filter")
 	}
 	if err := objs.FilterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update filter map: %w", err)
@@ -388,6 +397,7 @@ func (s *Service) printHTTPTraceTag(tag string, update httptrace.Update) {
 }
 
 func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace.Update, writeCh chan<- httptrace.Update) {
+	update.Trace = s.enrichTraceTupleForOutput(update.Trace)
 	update.Trace = s.sanitizeTraceForOutput(update.Trace)
 	if update.Kind == "request" {
 		s.stats.requests.Add(1)
@@ -414,15 +424,45 @@ func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace
 	}
 }
 
-// 关闭五元组过滤时，不输出 src/dst ip/port
-func (s *Service) sanitizeTraceForOutput(trace httptrace.TraceDocument) httptrace.TraceDocument {
-	if !s.cfg.DisableUserTuple {
+func (s *Service) enrichTraceTupleForOutput(trace httptrace.TraceDocument) httptrace.TraceDocument {
+	if trace.PID == 0 || trace.FD < 0 {
 		return trace
 	}
-	trace.SrcIP = ""
-	trace.DstIP = ""
-	trace.SrcPort = 0
-	trace.DstPort = 0
+	if (trace.SrcIP != "" && trace.SrcIP != "0.0.0.0" && trace.SrcPort != 0) &&
+		(trace.DstIP != "" && trace.DstIP != "0.0.0.0" && trace.DstPort != 0) {
+		return trace
+	}
+
+	event := httptrace.Event{
+		PID:     trace.PID,
+		FD:      trace.FD,
+		SockID:  trace.SockID,
+		SrcIP:   trace.SrcIP,
+		DstIP:   trace.DstIP,
+		SrcPort: trace.SrcPort,
+		DstPort: trace.DstPort,
+	}
+	switch trace.Kind {
+	case "request":
+		event.Direction = httptrace.DirectionRequest
+	case "response":
+		event.Direction = httptrace.DirectionResponse
+	}
+
+	resolved, source := s.resolver.Resolve(event)
+	if source == resolveMiss || missingTuple(resolved) {
+		return trace
+	}
+	trace.SrcIP = resolved.SrcIP
+	trace.DstIP = resolved.DstIP
+	trace.SrcPort = resolved.SrcPort
+	trace.DstPort = resolved.DstPort
+	return trace
+}
+
+// 关闭用户态 tuple 管线后，仍然保留内核侧已经采到的 src/dst ip/port。
+// 这样可以在不走 /proc 反解析的情况下，直接把 tuple cache 或 best-effort 内核 tuple 输出到控制台和 Redis。
+func (s *Service) sanitizeTraceForOutput(trace httptrace.TraceDocument) httptrace.TraceDocument {
 	return trace
 }
 
@@ -877,7 +917,7 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 			s.stats.workerQueuePeak.Load(),
 		)
 		log.Printf(
-			"%s kernel debug(sock_send_hits=%d tcp_send_hits=%d sock_recv_hits=%d tcp_recv_hits=%d recv_store_ok=%d recv_store_no_iter=%d recv_store_meta_fail=%d recv_ret_no_meta=%d recv_dir_request=%d recv_dir_response=%d recv_dir_unknown=%d recv_fallback_local=%d recv_fallback_keepalive=%d send_no_req_chain=%d send_resp_start=%d send_resp_continue=%d send_resp_reqactive=%d send_iter_empty=%d tuple_ipv4_ok=%d tuple_ipv6_portonly=%d tuple_extract_fail=%d)",
+			"%s kernel debug(sock_send_hits=%d tcp_send_hits=%d sock_recv_hits=%d tcp_recv_hits=%d recv_store_ok=%d recv_store_no_iter=%d recv_store_meta_fail=%d recv_ret_no_meta=%d recv_dir_request=%d recv_dir_response=%d recv_dir_unknown=%d recv_fallback_local=%d recv_fallback_keepalive=%d send_no_req_chain=%d send_resp_start=%d send_resp_continue=%d send_resp_reqactive=%d send_iter_empty=%d tuple_ipv4_ok=%d tuple_ipv6_portonly=%d tuple_extract_fail=%d prefix_second_iov=%d prefix_trimmed=%d)",
 			label,
 			kstats.SockSendHits,
 			kstats.TcpSendHits,
@@ -900,6 +940,16 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 			kstats.TupleIpv4Ok,
 			kstats.TupleIpv6Portonly,
 			kstats.TupleExtractFail,
+			kstats.PrefixSecondIov,
+			kstats.PrefixTrimmed,
+		)
+		log.Printf(
+			"%s kernel tuple-cache(updates=%d deletes=%d hits=%d misses=%d)",
+			label,
+			kstats.TupleCacheUpdates,
+			kstats.TupleCacheDeletes,
+			kstats.TupleCacheHits,
+			kstats.TupleCacheMisses,
 		)
 	}
 }
@@ -977,6 +1027,36 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 		// 用来覆盖 Nginx/部分 TCP 发送栈里 sock_sendmsg 看不全的响应场景。
 		{symbols: []string{"tcp_sendmsg"}, prog: objs.KprobeTcpSendmsg},
 	}
+	if legacySockABI {
+		optionalKprobes = append(optionalKprobes,
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_v4_connect"}, prog: objs.KprobeTcpV4Connect},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_v4_connect"}, ret: true, prog: objs.KretprobeTcpV4Connect},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_v6_connect"}, prog: objs.KprobeTcpV6Connect},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_v6_connect"}, ret: true, prog: objs.KretprobeTcpV6Connect},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"inet_csk_accept"}, ret: true, prog: objs.KretprobeInetCskAccept},
+		)
+		log.Printf("legacy tuple-cache fallback enabled: use tcp_v4/tcp_v6_connect and inet_csk_accept instead of inet_sock_set_state")
+	}
 	if !legacySockABI {
 		log.Printf("tcp_sendmsg supplement enabled by default: sock_sendmsg stays primary, tcp_sendmsg supplements nginx/TCP send path, and per-send dedupe guard is active")
 	}
@@ -1002,6 +1082,15 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 		{group: "syscalls", name: "sys_enter_recvmsg", prog: objs.TracepointSysEnterRecvmsg},
 		{group: "syscalls", name: "sys_enter_read", prog: objs.TracepointSysEnterRead},
 		{group: "syscalls", name: "sys_enter_readv", prog: objs.TracepointSysEnterReadv},
+	}
+	if !legacySockABI {
+		tracepoints = append([]struct {
+			group string
+			name  string
+			prog  *ebpf.Program
+		}{
+			{group: "sock", name: "inet_sock_set_state", prog: objs.TracepointSockInetSockSetState},
+		}, tracepoints...)
 	}
 	// 多个挂载点挂载
 	for _, tp := range tracepoints {

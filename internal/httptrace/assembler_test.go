@@ -5,6 +5,7 @@ import (
 	"time"
 )
 
+// 测试请求完整后立即返回 update，响应完整后再返回完整链路 update
 func TestAssemblerEmitsPartialResponseOnClose(t *testing.T) {
 	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
 	now := time.Unix(1711717000, 0)
@@ -74,6 +75,7 @@ func TestAssemblerEmitsPartialResponseOnClose(t *testing.T) {
 	}
 }
 
+// 测试同一个 chain_id 上多个请求/响应片段的聚合
 func TestAssemblerEmitsMultipleMessagesFromSingleChain(t *testing.T) {
 	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
 	now := time.Unix(1711717000, 0)

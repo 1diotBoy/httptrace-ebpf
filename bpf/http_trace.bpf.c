@@ -14,6 +14,13 @@ struct bpf_map_def SEC("maps") filter_map = {
 	.max_entries = 1,
 };
 
+struct bpf_map_def SEC("maps") tuple_cache = {
+	.type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(__u64),
+	.value_size = sizeof(struct tuple_cache_entry),
+	.max_entries = 131072,
+};
+
 struct bpf_map_def SEC("maps") flow_map = {
 	.type = BPF_MAP_TYPE_HASH,
 	.key_size = sizeof(__u64),
@@ -46,6 +53,13 @@ struct bpf_map_def SEC("maps") recv_fd_map = {
 	.type = BPF_MAP_TYPE_HASH,
 	.key_size = sizeof(__u64),
 	.value_size = sizeof(__s32),
+	.max_entries = 65535,
+};
+
+struct bpf_map_def SEC("maps") connect_args_map = {
+	.type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(__u64),
+	.value_size = sizeof(__u64),
 	.max_entries = 65535,
 };
 
@@ -144,6 +158,85 @@ fail:
 	if (stats)
 		stats->tuple_extract_fail += 1;
 	return -1;
+}
+
+static __always_inline __attribute__((unused)) int extract_ipv4_mapped_v6(const __u8 addr[16], __u32 *ip)
+{
+	if (addr[0] != 0 || addr[1] != 0 || addr[2] != 0 || addr[3] != 0 ||
+	    addr[4] != 0 || addr[5] != 0 || addr[6] != 0 || addr[7] != 0 ||
+	    addr[8] != 0 || addr[9] != 0 || addr[10] != 0xff || addr[11] != 0xff)
+		return -1;
+
+	__builtin_memcpy(ip, &addr[12], sizeof(*ip));
+	return 0;
+}
+
+static __always_inline __attribute__((unused)) int store_tuple_cache(__u64 sock_id, const struct tuple_cache_entry *entry)
+{
+	struct kernel_stats *stats = stats_lookup();
+
+	if (!sock_id || !entry)
+		return -1;
+	if (bpf_map_update_elem(&tuple_cache, &sock_id, entry, BPF_ANY) < 0)
+		return -1;
+	if (stats)
+		stats->tuple_cache_updates += 1;
+	return 0;
+}
+
+static __always_inline __attribute__((unused)) int load_cached_tuple(__u64 sock_id, struct recv_args *meta)
+{
+	const struct tuple_cache_entry *entry = NULL;
+	struct kernel_stats *stats = stats_lookup();
+
+	if (!sock_id || !meta)
+		return -1;
+	entry = bpf_map_lookup_elem(&tuple_cache, &sock_id);
+	if (!entry) {
+		if (stats)
+			stats->tuple_cache_misses += 1;
+		return -1;
+	}
+
+	meta->src_ip = entry->src_ip;
+	meta->dst_ip = entry->dst_ip;
+	meta->src_port = entry->src_port;
+	meta->dst_port = entry->dst_port;
+	meta->family = entry->family;
+	if (stats)
+		stats->tuple_cache_hits += 1;
+	return 0;
+}
+
+static __always_inline __attribute__((unused)) int load_best_effort_tuple(struct sock_compat *sk, struct recv_args *meta)
+{
+	if (!meta)
+		return -1;
+	if (load_cached_tuple(meta->sock_id, meta) == 0)
+		return 0;
+	return extract_tuple(sk, meta);
+}
+
+static __always_inline void fill_common_meta(struct recv_args *meta, struct sock_compat *sk,
+					     __s32 fd, __u8 source);
+
+static __always_inline __attribute__((unused)) int cache_tuple_from_sock(struct sock_compat *sk)
+{
+	struct recv_args meta = {};
+	struct tuple_cache_entry entry = {};
+
+	if (!sk)
+		return -1;
+	fill_common_meta(&meta, sk, -1, SRC_UNKNOWN);
+	if (extract_tuple(sk, &meta) < 0)
+		return -1;
+
+	entry.src_ip = meta.src_ip;
+	entry.dst_ip = meta.dst_ip;
+	entry.src_port = meta.src_port;
+	entry.dst_port = meta.dst_port;
+	entry.family = meta.family;
+	return store_tuple_cache(meta.sock_id, &entry);
 }
 
 /* src/dst 同时存在时，按链路对称匹配：
@@ -345,30 +438,143 @@ static __always_inline int read_msg_iter(struct msghdr_compat *msg, struct iov_i
 	return bpf_probe_read(iter, sizeof(*iter), &msg->msg_iter);
 }
 
+static __always_inline int is_http_prefix_padding(char c)
+{
+	return c == '\r' || c == '\n' || c == ' ' || c == '\t';
+}
+
+static __always_inline __u32 trim_http_prefix_padding(const char *buf, __u32 len)
+{
+	__u32 off = 0;
+
+	if (len > off && is_http_prefix_padding(buf[off]))
+		off++;
+	if (len > off && is_http_prefix_padding(buf[off]))
+		off++;
+	if (len > off && is_http_prefix_padding(buf[off]))
+		off++;
+	if (len > off && is_http_prefix_padding(buf[off]))
+		off++;
+	if (len > off && is_http_prefix_padding(buf[off]))
+		off++;
+	if (len > off && is_http_prefix_padding(buf[off]))
+		off++;
+	if (len > off && is_http_prefix_padding(buf[off]))
+		off++;
+	if (len > off && is_http_prefix_padding(buf[off]))
+		off++;
+
+	return off;
+}
+
+#ifdef LEGACY_VERIFIER
+static __always_inline __u32 read_prefix_legacy_bytes(const char *base, __u64 skip, __u64 available, char *buf, __u32 buf_len)
+{
+	__u32 copied = 0;
+
+	if (!base || !buf || !buf_len || !available)
+		return 0;
+	if (buf_len > 0 && available > 0 && bpf_probe_read(&buf[0], 1, base + skip + 0) == 0)
+		copied = 1;
+	if (buf_len > 1 && available > 1 && bpf_probe_read(&buf[1], 1, base + skip + 1) == 0)
+		copied = 2;
+	if (buf_len > 2 && available > 2 && bpf_probe_read(&buf[2], 1, base + skip + 2) == 0)
+		copied = 3;
+	if (buf_len > 3 && available > 3 && bpf_probe_read(&buf[3], 1, base + skip + 3) == 0)
+		copied = 4;
+	if (buf_len > 4 && available > 4 && bpf_probe_read(&buf[4], 1, base + skip + 4) == 0)
+		copied = 5;
+	if (buf_len > 5 && available > 5 && bpf_probe_read(&buf[5], 1, base + skip + 5) == 0)
+		copied = 6;
+	if (buf_len > 6 && available > 6 && bpf_probe_read(&buf[6], 1, base + skip + 6) == 0)
+		copied = 7;
+	if (buf_len > 7 && available > 7 && bpf_probe_read(&buf[7], 1, base + skip + 7) == 0)
+		copied = 8;
+	if (buf_len > 8 && available > 8 && bpf_probe_read(&buf[8], 1, base + skip + 8) == 0)
+		copied = 9;
+	if (buf_len > 9 && available > 9 && bpf_probe_read(&buf[9], 1, base + skip + 9) == 0)
+		copied = 10;
+	if (buf_len > 10 && available > 10 && bpf_probe_read(&buf[10], 1, base + skip + 10) == 0)
+		copied = 11;
+	if (buf_len > 11 && available > 11 && bpf_probe_read(&buf[11], 1, base + skip + 11) == 0)
+		copied = 12;
+	if (buf_len > 12 && available > 12 && bpf_probe_read(&buf[12], 1, base + skip + 12) == 0)
+		copied = 13;
+	if (buf_len > 13 && available > 13 && bpf_probe_read(&buf[13], 1, base + skip + 13) == 0)
+		copied = 14;
+	if (buf_len > 14 && available > 14 && bpf_probe_read(&buf[14], 1, base + skip + 14) == 0)
+		copied = 15;
+	if (buf_len > 15 && available > 15 && bpf_probe_read(&buf[15], 1, base + skip + 15) == 0)
+		copied = 16;
+
+	return copied;
+}
+#endif
+
 static __always_inline int read_prefix_from_iter(const struct iov_iter_compat *iter, char *buf, __u32 buf_len)
 {
-	struct iovec_compat iov = {};
+	struct iovec_compat iov0 = {};
+	struct iovec_compat iov1 = {};
+	struct kernel_stats *stats = stats_lookup();
 	__u64 skip = 0;
+	__u64 second_skip = 0;
 	__u64 available = 0;
+	__u32 copied = 0;
 
 	if (!iter || !iter->iov || !iter->nr_segs)
 		return 0;
-	if (bpf_probe_read(&iov, sizeof(iov), &iter->iov[0]) < 0)
+	if (bpf_probe_read(&iov0, sizeof(iov0), &iter->iov[0]) < 0)
 		return 0;
 
+#ifdef LEGACY_VERIFIER
 	skip = iter->iov_offset;
-	if (skip >= iov.iov_len)
+	if (skip < iov0.iov_len) {
+		available = iov0.iov_len - skip;
+		return read_prefix_legacy_bytes((const char *)iov0.iov_base, skip, available, buf, buf_len);
+	}
+	if (iter->nr_segs < 2)
 		return 0;
+	if (bpf_probe_read(&iov1, sizeof(iov1), &iter->iov[1]) < 0)
+		return 0;
+	second_skip = skip - iov0.iov_len;
+	if (second_skip >= iov1.iov_len)
+		return 0;
+	available = iov1.iov_len - second_skip;
+	copied = read_prefix_legacy_bytes((const char *)iov1.iov_base, second_skip, available, buf, buf_len);
+	if (copied > 0 && stats)
+		stats->prefix_second_iov += 1;
+	return copied;
+#else
+	skip = iter->iov_offset;
+	if (skip < iov0.iov_len) {
+		available = iov0.iov_len - skip;
+		if (available > buf_len)
+			available = buf_len;
+		if (available && bpf_probe_read(buf, available, (const char *)iov0.iov_base + skip) == 0)
+			copied = available;
+		second_skip = 0;
+	} else {
+		second_skip = skip - iov0.iov_len;
+	}
 
-	available = iov.iov_len - skip;
-	if (available > buf_len)
-		available = buf_len;
+	if (copied >= buf_len || iter->nr_segs < 2)
+		return copied;
+	if (bpf_probe_read(&iov1, sizeof(iov1), &iter->iov[1]) < 0)
+		return copied;
+	if (second_skip >= iov1.iov_len)
+		return copied;
+
+	available = iov1.iov_len - second_skip;
+	if (available > buf_len - copied)
+		available = buf_len - copied;
 	if (!available)
-		return 0;
-
-	if (bpf_probe_read(buf, available, (const char *)iov.iov_base + skip) < 0)
-		return 0;
-	return available;
+		return copied;
+	if (bpf_probe_read(buf + copied, available, (const char *)iov1.iov_base + second_skip) < 0)
+		return copied;
+	if (stats)
+		stats->prefix_second_iov += 1;
+	return copied + available;
+#endif
 }
 
 static __always_inline int looks_like_http_request(const char *buf, __u32 len)
@@ -481,6 +687,66 @@ static __always_inline int looks_like_http_response(const char *buf, __u32 len)
 	return buf[0] == 'H' && buf[1] == 'T' && buf[2] == 'T' && buf[3] == 'P' && buf[4] == '/';
 }
 
+static __always_inline __u8 detect_http_direction(const char *buf, __u32 len);
+
+static __always_inline __attribute__((unused)) __u8 detect_http_direction_trimmed(const char *buf, __u32 len, __u32 *trimmed)
+{
+	__u32 off = trim_http_prefix_padding(buf, len);
+
+	if (trimmed)
+		*trimmed = off;
+
+	switch (off) {
+	case 0:
+		return detect_http_direction(buf, len);
+	case 1:
+		return len > 1 ? detect_http_direction(buf + 1, len - 1) : DIR_UNKNOWN;
+	case 2:
+		return len > 2 ? detect_http_direction(buf + 2, len - 2) : DIR_UNKNOWN;
+	case 3:
+		return len > 3 ? detect_http_direction(buf + 3, len - 3) : DIR_UNKNOWN;
+	case 4:
+		return len > 4 ? detect_http_direction(buf + 4, len - 4) : DIR_UNKNOWN;
+	case 5:
+		return len > 5 ? detect_http_direction(buf + 5, len - 5) : DIR_UNKNOWN;
+	case 6:
+		return len > 6 ? detect_http_direction(buf + 6, len - 6) : DIR_UNKNOWN;
+	case 7:
+		return len > 7 ? detect_http_direction(buf + 7, len - 7) : DIR_UNKNOWN;
+	default:
+		return len > 8 ? detect_http_direction(buf + 8, len - 8) : DIR_UNKNOWN;
+	}
+}
+
+static __always_inline __attribute__((unused)) int looks_like_http_request_prefix_trimmed(const char *buf, __u32 len, __u32 *trimmed)
+{
+	__u32 off = trim_http_prefix_padding(buf, len);
+
+	if (trimmed)
+		*trimmed = off;
+
+	switch (off) {
+	case 0:
+		return looks_like_http_request_prefix(buf, len);
+	case 1:
+		return len > 1 ? looks_like_http_request_prefix(buf + 1, len - 1) : 0;
+	case 2:
+		return len > 2 ? looks_like_http_request_prefix(buf + 2, len - 2) : 0;
+	case 3:
+		return len > 3 ? looks_like_http_request_prefix(buf + 3, len - 3) : 0;
+	case 4:
+		return len > 4 ? looks_like_http_request_prefix(buf + 4, len - 4) : 0;
+	case 5:
+		return len > 5 ? looks_like_http_request_prefix(buf + 5, len - 5) : 0;
+	case 6:
+		return len > 6 ? looks_like_http_request_prefix(buf + 6, len - 6) : 0;
+	case 7:
+		return len > 7 ? looks_like_http_request_prefix(buf + 7, len - 7) : 0;
+	default:
+		return len > 8 ? looks_like_http_request_prefix(buf + 8, len - 8) : 0;
+	}
+}
+
 /* 4.19 verifier 很容易把“读取 iov 前缀 + 判断 HTTP/”这段内联逻辑折叠成回边。
  * 单独拆成 noinline helper 后，发送主链路只拿一个布尔结果，控制流会稳定很多。
  */
@@ -492,7 +758,15 @@ static __attribute__((noinline)) int starts_with_http_response(const struct iov_
 	if (!iter)
 		return 0;
 	prefix_len = read_prefix_from_iter(iter, prefix, sizeof(prefix));
+#ifdef LEGACY_VERIFIER
 	return looks_like_http_response(prefix, prefix_len);
+#else
+	struct kernel_stats *stats = stats_lookup();
+	__u32 off = trim_http_prefix_padding(prefix, prefix_len);
+	if (off && stats)
+		stats->prefix_trimmed += 1;
+	return detect_http_direction_trimmed(prefix, prefix_len, NULL) == DIR_RESPONSE;
+#endif
 }
 
 static __always_inline __u8 detect_http_direction(const char *buf, __u32 len)
@@ -977,10 +1251,8 @@ static __always_inline int store_recv_args(struct sock_compat *sk, struct msghdr
 #endif
 
 	fill_common_meta(&meta, sk, fd, source);
-#ifndef LEGACY_VERIFIER
-	if (extract_tuple(sk, &meta) == 0 && !matches_filter(&meta))
+	if (load_best_effort_tuple(sk, &meta) == 0 && !matches_filter(&meta))
 		return 0;
-#endif
 
 	meta.msg_ptr = (__u64)msg;
 	if (read_msg_iter(msg, &iter) < 0 || !iter.count) {
@@ -1010,10 +1282,8 @@ static __attribute__((noinline)) __u64 prepare_send_scratch(struct sock_compat *
 		return 0;
 
 	fill_common_meta(&scratch->meta, sk, fd, source);
-#ifndef LEGACY_VERIFIER
-	if (extract_tuple(sk, &scratch->meta) == 0 && !matches_filter(&scratch->meta))
+	if (load_best_effort_tuple(sk, &scratch->meta) == 0 && !matches_filter(&scratch->meta))
 		return 0;
-#endif
 	if (read_msg_iter(msg, &scratch->iter) < 0 || !scratch->iter.count) {
 		if (stats)
 			stats->send_iter_empty += 1;
@@ -1107,9 +1377,19 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 	seq_hint = state->rx_cursor;
 
 	prefix_len = read_prefix_from_iter(&meta->saved_iter, prefix, sizeof(prefix));
+#ifdef LEGACY_VERIFIER
 	direction = detect_http_direction(prefix, prefix_len);
 	if (direction == DIR_UNKNOWN && looks_like_http_request_prefix(prefix, prefix_len))
 		direction = DIR_REQUEST;
+#else
+	__u32 prefix_off = 0;
+	direction = detect_http_direction_trimmed(prefix, prefix_len, &prefix_off);
+	if (prefix_off && stats)
+		stats->prefix_trimmed += 1;
+	if (direction == DIR_UNKNOWN &&
+	    looks_like_http_request_prefix_trimmed(prefix, prefix_len, NULL))
+		direction = DIR_REQUEST;
+#endif
 	if (direction == DIR_REQUEST) {
 		if (stats)
 			stats->recv_dir_request += 1;
@@ -1276,6 +1556,126 @@ int tracepoint_sys_enter_readv(struct trace_event_raw_sys_enter_compat *ctx)
 	return 0;
 }
 
+SEC("tracepoint/sock/inet_sock_set_state")
+int tracepoint_sock_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state_compat *ctx)
+{
+	struct tuple_cache_entry entry = {};
+	struct kernel_stats *stats = stats_lookup();
+	__u64 sock_id = (__u64)ctx->skaddr;
+
+	if (!sock_id || ctx->protocol != IPPROTO_TCP)
+		return 0;
+
+	if (ctx->newstate == TCP_CLOSE) {
+		bpf_map_delete_elem(&tuple_cache, &sock_id);
+		if (stats)
+			stats->tuple_cache_deletes += 1;
+		return 0;
+	}
+
+	if (ctx->newstate != TCP_ESTABLISHED && ctx->newstate != TCP_SYN_RECV)
+		return 0;
+
+	entry.src_port = ctx->sport;
+	entry.dst_port = ctx->dport;
+	entry.family = ctx->family;
+
+	if (ctx->family == AF_INET) {
+		__builtin_memcpy(&entry.src_ip, ctx->saddr, sizeof(entry.src_ip));
+		__builtin_memcpy(&entry.dst_ip, ctx->daddr, sizeof(entry.dst_ip));
+	} else if (ctx->family == AF_INET6) {
+		if (extract_ipv4_mapped_v6(ctx->saddr_v6, &entry.src_ip) == 0 &&
+		    extract_ipv4_mapped_v6(ctx->daddr_v6, &entry.dst_ip) == 0) {
+			entry.family = AF_INET;
+		} else {
+			entry.src_ip = 0;
+			entry.dst_ip = 0;
+		}
+	} else {
+		return 0;
+	}
+
+	store_tuple_cache(sock_id, &entry);
+	return 0;
+}
+
+SEC("kprobe/tcp_v4_connect")
+int BPF_KPROBE(kprobe_tcp_v4_connect, struct sock_compat *sk)
+{
+#ifdef LEGACY_VERIFIER
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u64 sock_id = (__u64)sk;
+
+	if (!sock_id)
+		return 0;
+	bpf_map_update_elem(&connect_args_map, &pid_tgid, &sock_id, BPF_ANY);
+#endif
+	return 0;
+}
+
+SEC("kretprobe/tcp_v4_connect")
+int BPF_KRETPROBE(kretprobe_tcp_v4_connect)
+{
+#ifdef LEGACY_VERIFIER
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u64 *sock_id = NULL;
+	__s64 ret = PT_REGS_RC(ctx);
+
+	sock_id = bpf_map_lookup_elem(&connect_args_map, &pid_tgid);
+	if (!sock_id)
+		return 0;
+	if (ret == 0)
+		cache_tuple_from_sock((struct sock_compat *)*sock_id);
+	bpf_map_delete_elem(&connect_args_map, &pid_tgid);
+#endif
+	return 0;
+}
+
+SEC("kprobe/tcp_v6_connect")
+int BPF_KPROBE(kprobe_tcp_v6_connect, struct sock_compat *sk)
+{
+#ifdef LEGACY_VERIFIER
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u64 sock_id = (__u64)sk;
+
+	if (!sock_id)
+		return 0;
+	bpf_map_update_elem(&connect_args_map, &pid_tgid, &sock_id, BPF_ANY);
+#endif
+	return 0;
+}
+
+SEC("kretprobe/tcp_v6_connect")
+int BPF_KRETPROBE(kretprobe_tcp_v6_connect)
+{
+#ifdef LEGACY_VERIFIER
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u64 *sock_id = NULL;
+	__s64 ret = PT_REGS_RC(ctx);
+
+	sock_id = bpf_map_lookup_elem(&connect_args_map, &pid_tgid);
+	if (!sock_id)
+		return 0;
+	if (ret == 0)
+		cache_tuple_from_sock((struct sock_compat *)*sock_id);
+	bpf_map_delete_elem(&connect_args_map, &pid_tgid);
+#endif
+	return 0;
+}
+
+SEC("kretprobe/inet_csk_accept")
+int BPF_KRETPROBE(kretprobe_inet_csk_accept)
+{
+#ifdef LEGACY_VERIFIER
+	struct sock_compat *newsk = (struct sock_compat *)PT_REGS_RC(ctx);
+
+	if (!newsk)
+		return 0;
+	cache_tuple_from_sock(newsk);
+#endif
+	return 0;
+}
+
 SEC("kprobe/sock_sendmsg")
 int BPF_KPROBE(kprobe_sock_sendmsg, void *sock_ptr, struct msghdr_compat *msg)
 {
@@ -1379,8 +1779,9 @@ int BPF_KPROBE(kprobe_tcp_close, struct sock_compat *sk)
 	}
 	fill_common_meta(&meta, sk, -1, SRC_TCP_CLOSE);
 	
-	if (extract_tuple(sk, &meta) == 0 && !matches_filter(&meta)) {
+	if (load_best_effort_tuple(sk, &meta) == 0 && !matches_filter(&meta)) {
 		bpf_map_delete_elem(&flow_map, &sock_id);
+		bpf_map_delete_elem(&tuple_cache, &sock_id);
 		return 0;
 	}
 
@@ -1390,6 +1791,7 @@ int BPF_KPROBE(kprobe_tcp_close, struct sock_compat *sk)
 	if (stats)
 		stats->close_events += 1;
 	bpf_map_delete_elem(&flow_map, &sock_id);
+	bpf_map_delete_elem(&tuple_cache, &sock_id);
 	return 0;
 #endif
 }

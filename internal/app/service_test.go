@@ -164,7 +164,7 @@ func TestResolveEventBypassesUserTuplePipeline(t *testing.T) {
 	}
 }
 
-func TestSanitizeTraceForOutputHidesTuple(t *testing.T) {
+func TestSanitizeTraceForOutputKeepsKernelTuple(t *testing.T) {
 	svc := &Service{cfg: Config{DisableUserTuple: true}}
 	trace := httptrace.TraceDocument{
 		ChainID: 1,
@@ -175,7 +175,7 @@ func TestSanitizeTraceForOutputHidesTuple(t *testing.T) {
 	}
 
 	got := svc.sanitizeTraceForOutput(trace)
-	if got.SrcIP != "" || got.DstIP != "" || got.SrcPort != 0 || got.DstPort != 0 {
-		t.Fatalf("tuple fields should be cleared, got %#v", got)
+	if got.SrcIP != trace.SrcIP || got.DstIP != trace.DstIP || got.SrcPort != trace.SrcPort || got.DstPort != trace.DstPort {
+		t.Fatalf("kernel tuple fields should be preserved, got %#v want %#v", got, trace)
 	}
 }

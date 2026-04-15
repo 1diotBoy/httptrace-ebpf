@@ -64,4 +64,10 @@ type HttpTraceKernelStats struct {
 	TupleIpv4Ok           uint64
 	TupleIpv6Portonly     uint64
 	TupleExtractFail      uint64
+	TupleCacheUpdates     uint64
+	TupleCacheDeletes     uint64
+	TupleCacheHits        uint64
+	TupleCacheMisses      uint64
+	PrefixSecondIov       uint64
+	PrefixTrimmed         uint64
 }

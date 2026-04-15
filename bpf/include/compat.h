@@ -18,6 +18,22 @@
 #define AF_INET6 10
 #endif
 
+#ifndef IPPROTO_TCP
+#define IPPROTO_TCP 6
+#endif
+
+#ifndef TCP_ESTABLISHED
+#define TCP_ESTABLISHED 1
+#endif
+
+#ifndef TCP_SYN_RECV
+#define TCP_SYN_RECV 3
+#endif
+
+#ifndef TCP_CLOSE
+#define TCP_CLOSE 7
+#endif
+
 #define DEFAULT_MESSAGE_LIMIT (10 * 1024)
 /*
  * 为了兼容 4.19 上更严格的 verifier，这里把单次展开的分支数控制在可加载范围内。
@@ -138,6 +154,15 @@ struct filter_config {
 	__u16 src_port;
 	__u16 dst_port;
 	__u32 capture_bytes;
+};
+
+struct tuple_cache_entry {
+	__u32 src_ip;
+	__u32 dst_ip;
+	__u16 src_port;
+	__u16 dst_port;
+	__u16 family;
+	__u16 pad0;
 };
 
 struct flow_state {
@@ -262,6 +287,12 @@ struct kernel_stats {
 	__u64 tuple_ipv4_ok;
 	__u64 tuple_ipv6_portonly;
 	__u64 tuple_extract_fail;
+	__u64 tuple_cache_updates;
+	__u64 tuple_cache_deletes;
+	__u64 tuple_cache_hits;
+	__u64 tuple_cache_misses;
+	__u64 prefix_second_iov;
+	__u64 prefix_trimmed;
 };
 
 struct trace_event_raw_sys_enter_compat {
@@ -271,6 +302,24 @@ struct trace_event_raw_sys_enter_compat {
 	__s32 common_pid;
 	__s64 id;
 	unsigned long args[6];
+};
+
+struct trace_event_raw_inet_sock_set_state_compat {
+	__u16 common_type;
+	__u8 common_flags;
+	__u8 common_preempt_count;
+	__s32 common_pid;
+	const void *skaddr;
+	__s32 oldstate;
+	__s32 newstate;
+	__u16 sport;
+	__u16 dport;
+	__u16 family;
+	__u16 protocol;
+	__u8 saddr[4];
+	__u8 daddr[4];
+	__u8 saddr_v6[16];
+	__u8 daddr_v6[16];
 };
 
 #endif
