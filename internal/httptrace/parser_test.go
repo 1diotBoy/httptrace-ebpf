@@ -77,3 +77,34 @@ func TestFindMessageStartResponse(t *testing.T) {
 		t.Fatalf("response start mismatch: got %d want %d", got, 4)
 	}
 }
+
+func TestBuildSyntheticResponseFromJSONBody(t *testing.T) {
+	raw := []byte("{\"timestamp\":\"2026-04-19 21:56:31\",\"status\":518,\"error\":\"Http Status 518\",\"path\":\"/power-asm/v2/serviceinfo/update\"}")
+	msg, ok := BuildSyntheticResponse(raw)
+	if !ok {
+		t.Fatalf("expected synthetic response")
+	}
+	if got, want := msg.StatusCode, 518; got != want {
+		t.Fatalf("status mismatch: got %d want %d", got, want)
+	}
+	if got, want := msg.Body, string(raw); got != want {
+		t.Fatalf("body mismatch: got %q want %q", got, want)
+	}
+	if !msg.BodyPartial {
+		t.Fatalf("synthetic response should be marked partial")
+	}
+}
+
+func TestBuildSyntheticResponseFromHTMLBody(t *testing.T) {
+	raw := []byte("<!doctype html><html lang=\"en\"><head><title>HTTP Status 404 – Not Found</title></head><body><h1>HTTP Status 404 – Not Found</h1></body></html>")
+	msg, ok := BuildSyntheticResponse(raw)
+	if !ok {
+		t.Fatalf("expected synthetic response")
+	}
+	if got, want := msg.StatusCode, 404; got != want {
+		t.Fatalf("status mismatch: got %d want %d", got, want)
+	}
+	if got, want := msg.Reason, "Not Found"; got != want {
+		t.Fatalf("reason mismatch: got %q want %q", got, want)
+	}
+}

@@ -150,6 +150,110 @@ func FindMessageStart(direction uint8, data []byte) int {
 	return -1
 }
 
+// BuildSyntheticResponse 在“完全没抓到 HTTP 响应头，但已经拿到响应 body”的场景下，
+// 构造一条最小可用的响应对象，避免整条异常响应（404/500/认证失败页）完全丢失。
+// 这条路径只用于兜底，不影响正常能解析出 HTTP 头的响应。
+func BuildSyntheticResponse(data []byte) (*ParsedMessage, bool) {
+	body := strings.TrimSpace(string(data))
+	if body == "" {
+		return nil, false
+	}
+
+	status, reason := inferStatusFromBody(body)
+	msg := &ParsedMessage{
+		Direction:    DirectionResponse,
+		StartLine:    syntheticStartLine(status, reason),
+		Version:      "HTTP/1.1",
+		StatusCode:   status,
+		Reason:       reason,
+		Headers:      map[string]string{},
+		Body:         string(data),
+		RawPayload:   string(data),
+		BodyPartial:  true,
+		ConsumedBytes: len(data),
+	}
+	return msg, true
+}
+
+func syntheticStartLine(status int, reason string) string {
+	if status <= 0 {
+		return "HTTP/1.1"
+	}
+	if reason == "" {
+		return fmt.Sprintf("HTTP/1.1 %d", status)
+	}
+	return fmt.Sprintf("HTTP/1.1 %d %s", status, reason)
+}
+
+func inferStatusFromBody(body string) (int, string) {
+	if status, ok := inferJSONStatus(body); ok {
+		return status, ""
+	}
+	if status, reason, ok := inferHTMLStatus(body); ok {
+		return status, reason
+	}
+	return 0, ""
+}
+
+func inferJSONStatus(body string) (int, bool) {
+	idx := strings.Index(body, "\"status\"")
+	if idx < 0 {
+		return 0, false
+	}
+	rest := body[idx+len("\"status\""):]
+	colon := strings.IndexByte(rest, ':')
+	if colon < 0 {
+		return 0, false
+	}
+	rest = strings.TrimSpace(rest[colon+1:])
+	digits := make([]byte, 0, 3)
+	for i := 0; i < len(rest); i++ {
+		c := rest[i]
+		if c >= '0' && c <= '9' {
+			digits = append(digits, c)
+			continue
+		}
+		if len(digits) > 0 {
+			break
+		}
+		if c == ' ' || c == '\t' {
+			continue
+		}
+		return 0, false
+	}
+	if len(digits) != 3 {
+		return 0, false
+	}
+	status, err := strconv.Atoi(string(digits))
+	if err != nil {
+		return 0, false
+	}
+	return status, true
+}
+
+func inferHTMLStatus(body string) (int, string, bool) {
+	idx := strings.Index(body, "HTTP Status ")
+	if idx < 0 {
+		return 0, "", false
+	}
+	rest := body[idx+len("HTTP Status "):]
+	if len(rest) < 3 {
+		return 0, "", false
+	}
+	status, err := strconv.Atoi(rest[:3])
+	if err != nil {
+		return 0, "", false
+	}
+	reason := ""
+	if sep := strings.Index(rest, "–"); sep >= 0 {
+		reason = strings.TrimSpace(rest[sep+len("–"):])
+		if end := strings.Index(reason, "<"); end >= 0 {
+			reason = strings.TrimSpace(reason[:end])
+		}
+	}
+	return status, reason, true
+}
+
 func parseMessageHead(direction uint8, data []byte) (*ParsedMessage, textproto.MIMEHeader, int, bool, error) {
 	headerEnd := bytes.Index(data, headerSeparator)
 	if headerEnd < 0 {

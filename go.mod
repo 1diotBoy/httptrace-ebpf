@@ -5,6 +5,7 @@ go 1.23.0
 require (
 	github.com/cilium/ebpf v0.19.0
 	github.com/redis/go-redis/v9 v9.7.0
+	github.com/tjfoc/gmsm v1.4.1
 )
 
 require (

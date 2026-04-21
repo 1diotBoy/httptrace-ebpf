@@ -44,8 +44,8 @@ type TraceDocument struct {
 	SrcPort           uint16         `json:"src_port"`
 	DstPort           uint16         `json:"dst_port"`
 	RequestTS         *time.Time     `json:"request_ts,omitempty"`
-	ResponseTS        *time.Time     `json:"response_ts,omitempty"`
-	ResponseLatency   *float64       `json:"response_latency_ms,omitempty"`
+	ResponseTS        *time.Time     `json:"response_ts,omitempty"`         // 响应时间戳
+	ResponseLatency   *float64       `json:"response_latency_ms,omitempty"` // 响应延迟时间，请求开始到响应开始
 	Request           *ParsedMessage `json:"request,omitempty"`
 	Response          *ParsedMessage `json:"response,omitempty"`
 	RequestTruncated  bool           `json:"request_truncated"`
@@ -404,8 +404,7 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 	for len(state.requestStream.buffer) > 0 {
 		msg, complete, err := TryParseMessage(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: eof})
 		if err != nil {
-			if idx := FindMessageStart(DirectionRequest, state.requestStream.buffer); idx > 0 {
-				state.requestStream.consume(idx)
+			if resyncStream(DirectionRequest, &state.requestStream) {
 				continue
 			}
 			return updates, nil
@@ -416,19 +415,25 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 			continue
 		}
 
+		if resyncStream(DirectionRequest, &state.requestStream) {
+			continue
+		}
+
 		if !(state.requestStream.truncated || eof) {
 			return updates, nil
 		}
 
 		msg, ok, err := TryParseMessageHead(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: eof})
 		if err != nil {
-			if idx := FindMessageStart(DirectionRequest, state.requestStream.buffer); idx > 0 {
-				state.requestStream.consume(idx)
+			if resyncStream(DirectionRequest, &state.requestStream) {
 				continue
 			}
 			return updates, nil
 		}
 		if !ok {
+			if resyncStream(DirectionRequest, &state.requestStream) {
+				continue
+			}
 			return updates, nil
 		}
 		updates = append(updates, state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, state.requestStream.truncated || msg.BodyPartial))
@@ -471,8 +476,7 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 
 		msg, complete, err := TryParseMessage(DirectionResponse, state.responseStream.buffer, opts)
 		if err != nil {
-			if idx := FindMessageStart(DirectionResponse, state.responseStream.buffer); idx > 0 {
-				state.responseStream.consume(idx)
+			if resyncStream(DirectionResponse, &state.responseStream) {
 				continue
 			}
 			return updates, nil
@@ -483,6 +487,10 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 			}
 			updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, false))
 			state.responseStream.consume(msg.ConsumedBytes)
+			continue
+		}
+
+		if resyncStream(DirectionResponse, &state.responseStream) {
 			continue
 		}
 
@@ -511,13 +519,29 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 
 		msg, ok, err := TryParseMessageHead(DirectionResponse, state.responseStream.buffer, opts)
 		if err != nil {
-			if idx := FindMessageStart(DirectionResponse, state.responseStream.buffer); idx > 0 {
-				state.responseStream.consume(idx)
+			if resyncStream(DirectionResponse, &state.responseStream) {
 				continue
+			}
+			if synthetic, ok := BuildSyntheticResponse(state.responseStream.buffer); ok {
+				if len(state.pendingRequests) == 0 {
+					a.orphanResponses.Add(1)
+				}
+				updates = append(updates, state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true))
+				state.responseStream.consumeAll()
 			}
 			return updates, nil
 		}
 		if !ok {
+			if resyncStream(DirectionResponse, &state.responseStream) {
+				continue
+			}
+			if synthetic, ok := BuildSyntheticResponse(state.responseStream.buffer); ok {
+				if len(state.pendingRequests) == 0 {
+					a.orphanResponses.Add(1)
+				}
+				updates = append(updates, state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true))
+				state.responseStream.consumeAll()
+			}
 			return updates, nil
 		}
 		if len(state.pendingRequests) == 0 {
@@ -600,8 +624,20 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 		return []Update{update}
 	}
 
+	if resyncStream(DirectionResponse, &state.responseStream) {
+		return a.flushPartialResponse(state)
+	}
+
 	msg, ok, err := TryParseMessageHead(DirectionResponse, state.responseStream.buffer, opts)
 	if err != nil || !ok {
+		if synthetic, ok := BuildSyntheticResponse(state.responseStream.buffer); ok {
+			if len(state.pendingRequests) == 0 {
+				a.orphanResponses.Add(1)
+			}
+			update := state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true)
+			state.responseStream.consumeAll()
+			return []Update{update}
+		}
 		return nil
 	}
 	if len(state.pendingRequests) == 0 {
@@ -644,6 +680,7 @@ func (t *traceState) buildRequestUpdate(chainID uint64, msg *ParsedMessage, ts *
 	return Update{Kind: "request", Trace: doc}
 }
 
+// 构建响应更新
 func (t *traceState) buildResponseUpdate(msg *ParsedMessage, ts *time.Time, truncated bool) Update {
 	doc := t.base
 	doc.Kind = "response"
@@ -655,6 +692,8 @@ func (t *traceState) buildResponseUpdate(msg *ParsedMessage, ts *time.Time, trun
 	doc.RequestTruncated = false
 	doc.ResponseTruncated = truncated
 
+	// 如果存在 pending request，则使用 pending request 的 chainID
+	// 否则使用 base 的 chainID
 	if len(t.pendingRequests) > 0 {
 		pending := t.pendingRequests[0]
 		t.pendingRequests = t.pendingRequests[1:]
@@ -697,6 +736,18 @@ func cloneTimePtr(ts *time.Time) *time.Time {
 	}
 	v := *ts
 	return &v
+}
+
+func resyncStream(direction uint8, stream *fragmentStream) bool {
+	if stream == nil || len(stream.buffer) == 0 {
+		return false
+	}
+	idx := FindMessageStart(direction, stream.buffer)
+	if idx > 0 {
+		stream.consume(idx)
+		return true
+	}
+	return false
 }
 
 func (s *fragmentStream) drain(maxMessageBytes int) {

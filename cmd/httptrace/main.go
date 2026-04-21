@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -18,6 +19,9 @@ func main() {
 	ensureStableBPFLoad()
 
 	cfg := app.DefaultConfig()
+	// 加密
+	sm4encryptStr := flag.String("sm4encryptStr", "", "传入密码，使用SM4加密后输出（不启动服务）")
+
 	// 过滤规则配置
 	flag.StringVar(&cfg.IfName, "ifname", cfg.IfName, "filter by interface name")
 	flag.StringVar(&cfg.SrcIP, "src-ip", cfg.SrcIP, "filter by IPv4 endpoint; if dst-ip is empty, matches either endpoint")
@@ -53,7 +57,28 @@ func main() {
 	flag.IntVar(&cfg.RedisDB, "redis-db", cfg.RedisDB, "redis DB index")
 	flag.StringVar(&cfg.RedisKeyPrefix, "redis-prefix", cfg.RedisKeyPrefix, "redis key prefix")
 	flag.DurationVar(&cfg.RedisTTL, "redis-ttl", cfg.RedisTTL, "redis key ttl")
+
+	flag.Usage = func() {
+		fmt.Println("power-httptrace 工具使用说明")
+		fmt.Println("=====================================")
+		fmt.Println("固定 SM4 密钥 (key):", app.SM4Key)
+		fmt.Println("固定 SM4 偏移量 (iv):", app.SM4IV)
+		fmt.Println("=====================================")
+		fmt.Println("其他命令行参数:")
+		flag.PrintDefaults()
+	}
 	flag.Parse()
+
+	if *sm4encryptStr != "" {
+		encryptStr, err := app.SM4Encrypt(*sm4encryptStr)
+		if err != nil {
+			fmt.Println("加密失败：", err)
+			os.Exit(1)
+		}
+		fmt.Println("加密结果：", encryptStr)
+		os.Exit(0)
+	}
+
 	log.Printf("starting httptrace pid=%d", os.Getpid())
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

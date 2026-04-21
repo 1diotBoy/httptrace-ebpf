@@ -424,3 +424,54 @@ func TestAssemblerDefersResponseUntilRequestArrives(t *testing.T) {
 		t.Fatalf("should not accumulate orphan responses after successful rematch")
 	}
 }
+
+func TestAssemblerResyncsResponseAfterLeadingJunk(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
+	now := time.Unix(1711718000, 0)
+
+	reqUpdates, err := asm.Process(Event{
+		Timestamp: now,
+		ChainID:   8001,
+		PID:       103,
+		FD:        16,
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+		SrcPort:   54003,
+		DstPort:   80,
+		FragIdx:   0,
+		Direction: DirectionRequest,
+		Payload:   []byte("GET /broken HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+	})
+	if err != nil || len(reqUpdates) != 1 {
+		t.Fatalf("request emit failed: updates=%d err=%v", len(reqUpdates), err)
+	}
+
+	respUpdates, err := asm.Process(Event{
+		Timestamp: now.Add(10 * time.Millisecond),
+		ChainID:   8001,
+		PID:       103,
+		FD:        16,
+		SrcIP:     "10.0.0.2",
+		DstIP:     "10.0.0.1",
+		SrcPort:   80,
+		DstPort:   54003,
+		FragIdx:   0,
+		Direction: DirectionResponse,
+		Payload:   []byte("junkHTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nbad"),
+	})
+	if err != nil {
+		t.Fatalf("response process failed: %v", err)
+	}
+	if len(respUpdates) != 1 {
+		t.Fatalf("expected one resynced response update, got %d", len(respUpdates))
+	}
+	if respUpdates[0].Trace.Response == nil {
+		t.Fatalf("expected parsed response")
+	}
+	if got, want := respUpdates[0].Trace.Response.StatusCode, 404; got != want {
+		t.Fatalf("status code = %d, want %d", got, want)
+	}
+	if got, want := respUpdates[0].Trace.Response.Body, "bad"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}

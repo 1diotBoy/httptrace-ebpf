@@ -104,9 +104,19 @@ func NewService(cfg Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	store, err := storage.NewRedisStore(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, cfg.RedisKeyPrefix, cfg.RedisTTL)
-	if err != nil {
-		return nil, err
+	var store *storage.RedisStore
+	// redis地址空时不存储
+	if cfg.RedisAddr != "" {
+		if cfg.RedisPassword == "" {
+			cfg.RedisPassword = "9/L16DcUm3zIJgui54F/hayuh/bsXcdLdv3De12EkH4="
+		}
+		redisPsw, err := SM4Decrypt(cfg.RedisPassword)
+		store, err = storage.NewRedisStore(cfg.RedisAddr, redisPsw, cfg.RedisDB, cfg.RedisKeyPrefix, cfg.RedisTTL)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		log.Printf("redis 地址为空， 不存储到redis ...")
 	}
 	return &Service{
 		cfg:       cfg,
@@ -368,7 +378,7 @@ func (s *Service) printHTTPTraceTag(tag string, update httptrace.Update) {
 		DstPort         uint16                `json:"dst_port"`
 		RequestTrunc    bool                  `json:"request_truncated,omitempty"`
 		ResponseTrunc   bool                  `json:"response_truncated,omitempty"`
-		ResponseLatency *float64              `json:"response_latency_ms,omitempty"`
+		ResponseLatency *float64              `json:"response_latency_ms,omitempty"` //请求开始到响应开始
 		Request         *consoleParsedMessage `json:"request,omitempty"`
 		Response        *consoleParsedMessage `json:"response,omitempty"`
 	}{
@@ -773,6 +783,7 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 			startResolve = time.Now()
 		}
 		event, source := s.resolveEvent(event)
+		// 内核日志打印
 		if s.cfg.DebugKernel {
 			resolveCost := time.Since(startResolve)
 			s.stats.resolveNs.Add(uint64(resolveCost))

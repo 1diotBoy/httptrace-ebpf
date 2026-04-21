@@ -1,0 +1,22 @@
+[Unit]
+Description=Power HTTP eBPF Collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/app/soft/power-httptrace
+EnvironmentFile=-/etc/sysconfig/power-httptrace
+Environment=HTTPTRACE_BIN=/app/soft/power-httptrace/bin/httptrace
+Environment=HTTPTRACE_LOG_DIR=/app/log/power-httptrace
+ExecStart=/bin/bash -lc 'umask 022; mkdir -p "${HTTPTRACE_LOG_DIR}"; exec "${HTTPTRACE_BIN}" ${HTTPTRACE_ARGS:-} >> "${HTTPTRACE_LOG_DIR}/console.log" 2>&1'
+Restart=on-failure
+RestartSec=5s
+LimitMEMLOCK=infinity
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=multi-user.target

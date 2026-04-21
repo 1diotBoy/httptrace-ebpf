@@ -1,7 +1,10 @@
 package app
 
 import (
+	"crypto/cipher"
+	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -12,6 +15,8 @@ import (
 
 	"power-ebpf/internal/bpfgen"
 	"power-ebpf/internal/httptrace"
+
+	"github.com/tjfoc/gmsm/sm4"
 )
 
 type Config struct {
@@ -65,24 +70,29 @@ const (
 	FilterReasonIface FilterReason = "ifname"
 )
 
+const (
+	SM4Key = "4gppTsa7bJUKc76t" // 16字节
+	SM4IV  = "T465lnDSeDSfXe6a"
+)
+
 // 默认运行参数。
 func DefaultConfig() Config {
 	return Config{
 		CaptureBytes:         10 * 1024,
 		DisableKernelFilter:  false,
 		DisableUserTuple:     true,
-		PerfPages:            256,
+		PerfPages:            1024,
 		BatchSize:            100,
 		WorkerCount:          runtime.NumCPU(),
 		RedisWorkers:         max(1, runtime.NumCPU()/2),
-		RedisQueueSize:       8192,
+		RedisQueueSize:       32768,
 		FlushInterval:        200 * time.Millisecond,
 		LogInterval:          5 * time.Second,
 		PrintHTTP:            true,
 		PrintSummary:         true,
 		DebugKernel:          false,
 		ResponseStallTimeout: 500 * time.Millisecond,
-		TransactionTTL:       2 * time.Minute,
+		TransactionTTL:       10 * time.Minute,
 		MaxMessageBytes:      10 * 1024,
 		RedisKeyPrefix:       "http-trace",
 		RedisTTL:             24 * time.Hour,
@@ -306,4 +316,60 @@ func ipv4ToBE(raw string) (uint32, error) {
 		return 0, fmt.Errorf("ip %q is not ipv4", raw)
 	}
 	return binary.BigEndian.Uint32(ip), nil
+}
+
+func SM4Decrypt(cipherText string) (string, error) {
+	key := []byte(SM4Key)
+	iv := []byte(SM4IV)
+	cipherData, _ := base64.StdEncoding.DecodeString(cipherText)
+	// 创建sm4解密器
+	block, err := sm4.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	//CBC解密模式
+	blockMode := cipher.NewCBCDecrypter(block, iv)
+	plainData := make([]byte, len(cipherData))
+	blockMode.CryptBlocks(plainData, cipherData)
+	plainData, err = pkcs7UnPadding(plainData)
+	return string(plainData), err
+}
+
+// 去除填充
+func pkcs7UnPadding(data []byte) ([]byte, error) {
+	length := len(data)
+	unPadding := int(data[length-1])
+	if unPadding > length {
+		return nil, errors.New("unpadding error")
+	}
+	return data[:length-unPadding], nil
+}
+
+// SM4Encrypt 加密
+func SM4Encrypt(plainText string) (string, error) {
+	key := []byte(SM4Key)
+	iv := []byte(SM4IV)
+	plainData := []byte(plainText)
+	plainData = pkcs7Padding(plainData, sm4.BlockSize)
+
+	block, err := sm4.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+
+	blockMode := cipher.NewCBCEncrypter(block, iv) // 这里修复了
+	cipherData := make([]byte, len(plainData))
+	blockMode.CryptBlocks(cipherData, plainData)
+
+	return base64.StdEncoding.EncodeToString(cipherData), nil
+}
+
+// 填充
+func pkcs7Padding(data []byte, blockSize int) []byte {
+	padding := blockSize - len(data)%blockSize
+	padText := make([]byte, padding)
+	for i := range padText {
+		padText[i] = byte(padding)
+	}
+	return append(data, padText...)
 }

@@ -1,0 +1,11 @@
+/app/log/power-httptrace/*.log {
+    size 200M
+    rotate 10
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    dateext
+    create 0644 root root
+}

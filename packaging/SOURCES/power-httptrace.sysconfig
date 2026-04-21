@@ -1,0 +1,6 @@
+HTTPTRACE_ARGS="-dst-port 55555 -ifname ens192 -disable-kernel-filter=true \
+-disable-user-tuple=true  -txn-ttl 30m   -response-stall-timeout 500ms  \
+-capture-bytes 10240   -max-message-bytes 10240   -perf-pages 1024 \
+-workers 8   -redis-workers 8   -redis-queue-size 32768   -print-summary=false \
+-print-http=false -debug-kernel=true  -log-interval 10s  \
+-redis-db 6   -redis-addr 127.0.0.1:16379   -redis-password 'Powersi@redis202312' "

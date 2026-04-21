@@ -1,9 +1,9 @@
 package app
 
 import (
-	"testing"
-
+	"fmt"
 	"power-ebpf/internal/httptrace"
+	"testing"
 )
 
 func TestMatchPortPairSingleSideMatchesEitherEndpoint(t *testing.T) {
@@ -53,4 +53,14 @@ func TestMatchDetailReason(t *testing.T) {
 	if reason != FilterReasonPort {
 		t.Fatalf("unexpected reason: got %q want %q", reason, FilterReasonPort)
 	}
+}
+
+func TestRedisPasswordSM4Decrypt(t *testing.T) {
+	password := "Powersi@redis202312"
+	// 加密
+	encryptStr, _ := SM4Encrypt(password)
+	fmt.Println(encryptStr)
+	// 解密
+	decryptStr, _ := SM4Decrypt(encryptStr)
+	fmt.Println(decryptStr)
 }
