@@ -165,7 +165,12 @@ func shouldFallbackToLegacy(err error) bool {
 	return strings.Contains(msg, "back-edge") ||
 		strings.Contains(msg, "program is too large") ||
 		strings.Contains(msg, "argument list too long") ||
-		strings.Contains(msg, "jump out of range")
+		strings.Contains(msg, "jump out of range") ||
+		strings.Contains(msg, "pointer prohibited") ||
+		strings.Contains(msg, "bitwise operator |= on pointer prohibited") ||
+		strings.Contains(msg, "bitwise operator") ||
+		strings.Contains(msg, "unbounded memory access") ||
+		strings.Contains(msg, "min value is negative")
 }
 
 func cStringInt8(raw []int8) string {

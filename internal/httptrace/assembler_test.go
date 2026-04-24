@@ -339,22 +339,22 @@ func TestAssemblerEvictExpiredFlushesPartialResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("response process failed: %v", err)
 	}
-	if len(respUpdates) != 0 {
-		t.Fatalf("partial response should wait before eviction flush, got %#v", respUpdates)
+	if len(respUpdates) != 1 {
+		t.Fatalf("error response should be eagerly flushed, got %#v", respUpdates)
+	}
+	if respUpdates[0].Kind != "response" || respUpdates[0].Trace.Response == nil {
+		t.Fatalf("expected response update, got %#v", respUpdates)
+	}
+	if !respUpdates[0].Trace.ResponseTruncated || !respUpdates[0].Trace.Response.BodyPartial {
+		t.Fatalf("eager error flush should mark response partial/truncated")
 	}
 
 	evictedUpdates, evicted := asm.EvictExpired(now.Add(200 * time.Millisecond))
-	if evicted != 1 {
-		t.Fatalf("expected one evicted state, got %d", evicted)
+	if evicted != 0 {
+		t.Fatalf("state should already be closed after eager error flush, got evicted=%d", evicted)
 	}
-	if len(evictedUpdates) != 1 {
-		t.Fatalf("expected one eviction-flushed response, got %d", len(evictedUpdates))
-	}
-	if evictedUpdates[0].Kind != "response" || evictedUpdates[0].Trace.Response == nil {
-		t.Fatalf("expected response update on eviction, got %#v", evictedUpdates)
-	}
-	if !evictedUpdates[0].Trace.ResponseTruncated || !evictedUpdates[0].Trace.Response.BodyPartial {
-		t.Fatalf("eviction flush should mark response partial/truncated")
+	if len(evictedUpdates) != 0 {
+		t.Fatalf("did not expect extra eviction updates, got %#v", evictedUpdates)
 	}
 }
 
@@ -473,5 +473,55 @@ func TestAssemblerResyncsResponseAfterLeadingJunk(t *testing.T) {
 	}
 	if got, want := respUpdates[0].Trace.Response.Body, "bad"; got != want {
 		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+func TestAssemblerEagerFlushesErrorResponse(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
+	now := time.Unix(1711719000, 0)
+
+	reqUpdates, err := asm.Process(Event{
+		Timestamp: now,
+		ChainID:   9001,
+		PID:       104,
+		FD:        17,
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+		SrcPort:   54004,
+		DstPort:   80,
+		FragIdx:   0,
+		Direction: DirectionRequest,
+		Payload:   []byte("GET /missing HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+	})
+	if err != nil || len(reqUpdates) != 1 {
+		t.Fatalf("request emit failed: updates=%d err=%v", len(reqUpdates), err)
+	}
+
+	respUpdates, err := asm.Process(Event{
+		Timestamp: now.Add(10 * time.Millisecond),
+		ChainID:   9001,
+		PID:       104,
+		FD:        17,
+		SrcIP:     "10.0.0.2",
+		DstIP:     "10.0.0.1",
+		SrcPort:   80,
+		DstPort:   54004,
+		FragIdx:   0,
+		Direction: DirectionResponse,
+		Payload:   []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 100\r\nContent-Type: text/html\r\n\r\n<html>bad"),
+	})
+	if err != nil {
+		t.Fatalf("response process failed: %v", err)
+	}
+	if len(respUpdates) != 1 {
+		t.Fatalf("expected eager response flush, got %d", len(respUpdates))
+	}
+	if respUpdates[0].Trace.Response == nil {
+		t.Fatalf("expected response payload")
+	}
+	if got, want := respUpdates[0].Trace.Response.StatusCode, 404; got != want {
+		t.Fatalf("status code = %d, want %d", got, want)
+	}
+	if !respUpdates[0].Trace.ResponseTruncated || !respUpdates[0].Trace.Response.BodyPartial {
+		t.Fatalf("error response should be marked partial/truncated")
 	}
 }

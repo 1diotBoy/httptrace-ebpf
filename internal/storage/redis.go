@@ -60,6 +60,13 @@ func (s *RedisStore) Save(ctx context.Context, trace httptrace.TraceDocument) er
 			kind = "trace"
 		}
 	}
+	if kind == "request" {
+		// 增加 chain id map 供java端消费
+		setkey := fmt.Sprintf("%s", s.keyPrefix)
+		if err := s.client.LPush(ctx, setkey, trace.ChainID).Err(); err != nil {
+			return fmt.Errorf("set redis key %s: %w", setkey, err)
+		}
+	}
 	// 请求和响应分开存，使用同一个 chain_id 去关联，避免 response 覆盖 request。
 	key := fmt.Sprintf("%s:%s:%d", s.keyPrefix, kind, trace.ChainID)
 	if err := s.client.Set(ctx, key, body, s.ttl).Err(); err != nil {

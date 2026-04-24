@@ -50,6 +50,7 @@ type TraceDocument struct {
 	Response          *ParsedMessage `json:"response,omitempty"`
 	RequestTruncated  bool           `json:"request_truncated"`
 	ResponseTruncated bool           `json:"response_truncated"`
+	// TraceID           string         `json:trace_id`
 }
 
 type Update struct {
@@ -490,6 +491,18 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 			continue
 		}
 
+		// 对 4xx/5xx 这类异常响应，优先保证“有记录、有 body”，而不是一直等到完整 body。
+		// 这些异常页/错误 JSON 在不同框架/容器/Nginx 路径里，body 很容易被拆到后续 send 中，
+		// 如果这里仍按 200 的策略等待完整响应，经常会在高并发下积压成 pending_resp。
+		if head, ok, err := TryParseMessageHead(DirectionResponse, state.responseStream.buffer, opts); err == nil && ok && shouldEagerFlushErrorResponse(head) {
+			if len(state.pendingRequests) == 0 {
+				a.orphanResponses.Add(1)
+			}
+			updates = append(updates, state.buildResponseUpdate(head, state.responseStream.firstTS, true))
+			state.responseStream.consumeAll()
+			continue
+		}
+
 		if resyncStream(DirectionResponse, &state.responseStream) {
 			continue
 		}
@@ -594,7 +607,7 @@ func splitAndParsePartialResponse(data []byte, opts ParseOptions) (*ParsedMessag
 		msg.Body = ""
 		msg.BodyPartial = true
 		msg.ConsumedBytes = limit
-		msg.RawPayload = string(data[:limit])
+		// msg.RawPayload = string(data[:limit])
 		return msg, limit, true, nil
 	}
 
@@ -748,6 +761,13 @@ func resyncStream(direction uint8, stream *fragmentStream) bool {
 		return true
 	}
 	return false
+}
+
+func shouldEagerFlushErrorResponse(msg *ParsedMessage) bool {
+	if msg == nil {
+		return false
+	}
+	return msg.Direction == DirectionResponse && msg.StatusCode >= 400
 }
 
 func (s *fragmentStream) drain(maxMessageBytes int) {

@@ -286,7 +286,8 @@ func (s *Service) startRedisWriters() (chan httptrace.Update, *sync.WaitGroup) {
 		go func(workerID int) {
 			defer wg.Done()
 			for update := range ch {
-				saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				// 超时
+				saveCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				err := s.store.Save(saveCtx, update.Trace)
 				cancel()
 				if err != nil {
@@ -332,6 +333,7 @@ func (s *Service) workerLoop(workerID int, ch <-chan httptrace.Event, writeCh ch
 
 	flush := func() {
 		for _, event := range batch {
+			// 聚合入口
 			updates, err := s.assembler.Process(event)
 			if err != nil {
 				s.stats.parseFailures.Add(1)

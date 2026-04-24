@@ -34,24 +34,24 @@ type ParseOptions struct {
 }
 
 type ParsedMessage struct {
-	Direction          uint8               `json:"direction"`
-	StartLine          string              `json:"start_line"`
-	Version            string              `json:"version,omitempty"`
-	Method             string              `json:"method,omitempty"`
-	URL                string              `json:"url,omitempty"`
-	StatusCode         int                 `json:"status_code,omitempty"`
-	Reason             string              `json:"reason,omitempty"`
-	Headers            map[string]string   `json:"headers"`
-	HeaderValues       map[string][]string `json:"header_values,omitempty"`
-	RawHeader          string              `json:"raw_header"`
-	Body               string              `json:"body"`
-	RawPayload         string              `json:"raw_payload"`
-	ContentLength      int64               `json:"content_length,omitempty"`
-	TransferEncoding   string              `json:"transfer_encoding,omitempty"`
-	Chunked            bool                `json:"chunked"`
-	BodyPartial        bool                `json:"body_partial,omitempty"`
-	ConnectionCloseEOF bool                `json:"connection_close_eof"`
-	ConsumedBytes      int                 `json:"consumed_bytes"`
+	Direction    uint8               `json:"direction"`
+	StartLine    string              `json:"start_line"`
+	Version      string              `json:"version,omitempty"`
+	Method       string              `json:"method,omitempty"`
+	URL          string              `json:"url,omitempty"`
+	StatusCode   int                 `json:"status_code,omitempty"`
+	Reason       string              `json:"reason,omitempty"`
+	Headers      map[string]string   `json:"headers"`
+	HeaderValues map[string][]string `json:"header_values,omitempty"`
+	// RawHeader          string              `json:"raw_header"`
+	Body string `json:"body"`
+	// RawPayload         string `json:"raw_payload"`
+	ContentLength      int64  `json:"content_length,omitempty"`
+	TransferEncoding   string `json:"transfer_encoding,omitempty"`
+	Chunked            bool   `json:"chunked"`
+	BodyPartial        bool   `json:"body_partial,omitempty"`
+	ConnectionCloseEOF bool   `json:"connection_close_eof"`
+	ConsumedBytes      int    `json:"consumed_bytes"`
 }
 
 // TryParseMessage 负责把聚合后的 HTTP 明文切成起始行、头和 body，
@@ -74,7 +74,7 @@ func TryParseMessageHead(direction uint8, data []byte, opts ParseOptions) (*Pars
 	}
 
 	body := data[bodyStart:]
-	msg.RawPayload = string(data)
+	// msg.RawPayload = string(data)
 	msg.ConsumedBytes = len(data)
 
 	noBody := hasNoBody(direction, msg, headers, opts)
@@ -87,7 +87,7 @@ func TryParseMessageHead(direction uint8, data []byte, opts ParseOptions) (*Pars
 		if complete {
 			msg.Body = string(decoded)
 			msg.ConsumedBytes = bodyStart + consumed
-			msg.RawPayload = string(data[:msg.ConsumedBytes])
+			// msg.RawPayload = string(data[:msg.ConsumedBytes])
 			return msg, true, nil
 		}
 		if len(body) > 0 {
@@ -106,17 +106,17 @@ func TryParseMessageHead(direction uint8, data []byte, opts ParseOptions) (*Pars
 		msg.BodyPartial = int64(available) < msg.ContentLength
 		if !msg.BodyPartial {
 			msg.ConsumedBytes = bodyStart + available
-			msg.RawPayload = string(data[:msg.ConsumedBytes])
+			// msg.RawPayload = string(data[:msg.ConsumedBytes])
 		}
 		return msg, true, nil
 	case noBody:
 		msg.ConsumedBytes = bodyStart
-		msg.RawPayload = string(data[:bodyStart])
+		// msg.RawPayload = string(data[:bodyStart])
 		return msg, true, nil
 	case opts.EOF || strings.EqualFold(headers.Get("Connection"), "close"):
 		msg.Body = string(body)
 		msg.ConsumedBytes = len(data)
-		msg.RawPayload = string(data)
+		// msg.RawPayload = string(data)
 		msg.ConnectionCloseEOF = true
 		return msg, true, nil
 	default:
@@ -161,15 +161,15 @@ func BuildSyntheticResponse(data []byte) (*ParsedMessage, bool) {
 
 	status, reason := inferStatusFromBody(body)
 	msg := &ParsedMessage{
-		Direction:    DirectionResponse,
-		StartLine:    syntheticStartLine(status, reason),
-		Version:      "HTTP/1.1",
-		StatusCode:   status,
-		Reason:       reason,
-		Headers:      map[string]string{},
-		Body:         string(data),
-		RawPayload:   string(data),
-		BodyPartial:  true,
+		Direction:  DirectionResponse,
+		StartLine:  syntheticStartLine(status, reason),
+		Version:    "HTTP/1.1",
+		StatusCode: status,
+		Reason:     reason,
+		Headers:    map[string]string{},
+		Body:       string(data),
+		// RawPayload:    string(data),
+		BodyPartial:   true,
 		ConsumedBytes: len(data),
 	}
 	return msg, true
@@ -283,13 +283,13 @@ func parseMessageHead(direction uint8, data []byte) (*ParsedMessage, textproto.M
 
 	bodyStart := headerEnd + len(headerSeparator)
 	msg := &ParsedMessage{
-		Direction:     direction,
-		StartLine:     startLine,
-		Headers:       flattenHeaders(headers),
-		HeaderValues:  cloneHeaders(headers),
-		RawHeader:     string(data[:bodyStart]),
+		Direction:    direction,
+		StartLine:    startLine,
+		Headers:      flattenHeaders(headers),
+		HeaderValues: cloneHeaders(headers),
+		// RawHeader:     string(data[:bodyStart]),
 		ContentLength: -1,
-		RawPayload:    string(data[:bodyStart]),
+		// RawPayload:    string(data[:bodyStart]),
 		ConsumedBytes: bodyStart,
 	}
 	if raw := headers.Get("Content-Length"); raw != "" {
@@ -332,7 +332,7 @@ func finalizeMessage(msg *ParsedMessage, headers textproto.MIMEHeader, bodyStart
 		}
 		msg.Body = string(body)
 		msg.ConsumedBytes = bodyStart + consumed
-		msg.RawPayload = string(data[:msg.ConsumedBytes])
+		// msg.RawPayload = string(data[:msg.ConsumedBytes])
 		return msg, true, nil
 	case msg.ContentLength >= 0:
 		total := bodyStart + int(msg.ContentLength)
@@ -341,16 +341,16 @@ func finalizeMessage(msg *ParsedMessage, headers textproto.MIMEHeader, bodyStart
 		}
 		msg.Body = string(data[bodyStart:total])
 		msg.ConsumedBytes = total
-		msg.RawPayload = string(data[:total])
+		// msg.RawPayload = string(data[:total])
 		return msg, true, nil
 	case noBody:
 		msg.ConsumedBytes = bodyStart
-		msg.RawPayload = string(data[:bodyStart])
+		// msg.RawPayload = string(data[:bodyStart])
 		return msg, true, nil
 	case opts.EOF || connectionClose:
 		msg.Body = string(data[bodyStart:])
 		msg.ConsumedBytes = len(data)
-		msg.RawPayload = string(data)
+		// msg.RawPayload = string(data)
 		msg.ConnectionCloseEOF = true
 		return msg, true, nil
 	default:

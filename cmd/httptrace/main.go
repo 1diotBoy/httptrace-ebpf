@@ -83,7 +83,6 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
 	svc, err := app.NewService(cfg)
 	if err != nil {
 		log.Fatal(err)
