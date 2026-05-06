@@ -41,7 +41,10 @@ func NewRedisStore(addr, password string, db int, keyPrefix string, ttl time.Dur
 }
 
 func (s *RedisStore) Save(ctx context.Context, trace httptrace.TraceDocument) error {
-	if s == nil || s.client == nil {
+	if s == nil {
+		return nil
+	}
+	if s.client == nil {
 		return nil
 	}
 
@@ -49,27 +52,21 @@ func (s *RedisStore) Save(ctx context.Context, trace httptrace.TraceDocument) er
 	if err != nil {
 		return fmt.Errorf("marshal trace %d: %w", trace.ChainID, err)
 	}
-	kind := trace.Kind
-	if kind == "" {
-		switch {
-		case trace.Request != nil && trace.Response == nil:
-			kind = "request"
-		case trace.Request == nil && trace.Response != nil:
-			kind = "response"
-		default:
-			kind = "trace"
-		}
-	}
-	if kind == "request" {
-		// 增加 chain id map 供java端消费
-		setkey := fmt.Sprintf("%s", s.keyPrefix)
-		if err := s.client.LPush(ctx, setkey, trace.ChainID).Err(); err != nil {
-			return fmt.Errorf("set redis key %s: %w", setkey, err)
-		}
-	}
-	// 请求和响应分开存，使用同一个 chain_id 去关联，避免 response 覆盖 request。
-	key := fmt.Sprintf("%s:%s:%d", s.keyPrefix, kind, trace.ChainID)
-	if err := s.client.Set(ctx, key, body, s.ttl).Err(); err != nil {
+
+	// if kind == "request" {
+	// 	// 增加 chain id map 供java端消费
+	// 	setkey := fmt.Sprintf("%s", s.keyPrefix)
+	// 	if err := s.client.LPush(ctx, setkey, trace.ChainID).Err(); err != nil {
+	// 		return fmt.Errorf("set redis key %s: %w", setkey, err)
+	// 	}
+	// }
+	// // 请求和响应分开存，使用同一个 chain_id 去关联，避免 response 覆盖 request。
+	// key := fmt.Sprintf("%s:%s:%d", s.keyPrefix, kind, trace.ChainID)
+	// if err := s.client.Set(ctx, key, body, s.ttl).Err(); err != nil {
+	// 	return fmt.Errorf("set redis key %s: %w", key, err)
+	// }
+	key := "POWER-HTTP-TRACE"
+	if err := s.client.LPush(ctx, key, body).Err(); err != nil {
 		return fmt.Errorf("set redis key %s: %w", key, err)
 	}
 	return nil
