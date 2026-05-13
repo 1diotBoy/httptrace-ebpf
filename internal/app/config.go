@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"crypto/cipher"
 	"encoding/base64"
 	"encoding/binary"
@@ -10,8 +11,10 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"power-ebpf/internal/bpfgen"
 	"power-ebpf/internal/httptrace"
@@ -27,12 +30,14 @@ type Config struct {
 	DstPort              uint
 	DisableKernelFilter  bool // 是否禁用内核态过滤 ，默认不禁用
 	DisableUserTuple     bool // 是否禁用用户态过滤 ，默认禁用
-	CaptureBytes         int  // 采集字节数 ，默认10KB
-	PerfPages            int  // 性能页数 ，默认256页
+	CaptureBytes         int  // 内核侧每个请求/响应最大采集字节数，默认32KB
+	PerfPages            int  // perf buffer 页数，默认64页
 	BatchSize            int  // 批量大小 ，默认100
-	WorkerCount          int  // 工作线程数 ，默认CPU核心数
+	WorkerCount          int  // 工作线程数 ，默认最多8个
+	WorkerQueueSize      int  // 每个解析 worker 的缓冲队列深度，0 表示自动调优
 	RedisWorkers         int
-	RedisQueueSize       int           // 队列大小 ，默认8192
+	RedisQueueSize       int           // Redis 队列大小 ，默认4096
+	RetryQueueSize       int           // tuple 重试队列大小，0 表示自动调优
 	FlushInterval        time.Duration // 刷新间隔 ，默认200毫秒
 	LogInterval          time.Duration // 日志间隔 ，默认5秒
 	PrintHTTP            bool          // 是否打印HTTP请求/响应 ，默认打印
@@ -75,17 +80,49 @@ const (
 	SM4IV  = "T465lnDSeDSfXe6a"
 )
 
+type runtimeResourcePlan struct {
+	CPUCount          int
+	MemAvailableBytes uint64
+	MemAvailableKnown bool
+	EventBytes        uintptr
+	PerfPages         int
+	PerfBufferBytes   int
+	PerfTotalBytes    uint64
+	WorkerCount       int
+	WorkerQueueSize   int
+	WorkerQueueBytes  uint64
+	RedisWorkers      int
+	RedisQueueSize    int
+	RetryQueueSize    int
+}
+
+type resourceTier struct {
+	maxWorkers         int
+	maxRedisWorkers    int
+	defaultPerfPages   int
+	minPerfPages       int
+	perfBudgetBytes    uint64
+	workerQueueBudget  uint64
+	maxWorkerQueueSize int
+	defaultRedisQueue  int
+	maxRedisQueue      int
+	defaultRetryQueue  int
+	maxRetryQueue      int
+}
+
 // 默认运行参数。
 func DefaultConfig() Config {
 	return Config{
-		CaptureBytes:         10 * 1024,
+		CaptureBytes:         32 * 1024,
 		DisableKernelFilter:  false,
 		DisableUserTuple:     true,
-		PerfPages:            1024,
+		PerfPages:            64,
 		BatchSize:            100,
-		WorkerCount:          runtime.NumCPU(),
-		RedisWorkers:         max(1, runtime.NumCPU()/2),
-		RedisQueueSize:       32768,
+		WorkerCount:          min(runtime.NumCPU(), 8),
+		WorkerQueueSize:      0,
+		RedisWorkers:         min(max(1, runtime.NumCPU()/2), 4),
+		RedisQueueSize:       4096,
+		RetryQueueSize:       0,
 		FlushInterval:        200 * time.Millisecond,
 		LogInterval:          5 * time.Second,
 		PrintHTTP:            true,
@@ -93,17 +130,10 @@ func DefaultConfig() Config {
 		DebugKernel:          false,
 		ResponseStallTimeout: 500 * time.Millisecond,
 		TransactionTTL:       10 * time.Minute,
-		MaxMessageBytes:      10 * 1024,
+		MaxMessageBytes:      32 * 1024,
 		RedisKeyPrefix:       "http-trace",
 		RedisTTL:             24 * time.Hour,
 	}
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 // PerfBufferBytes 把 perf buffer 页数转换成字节数。
@@ -112,6 +142,265 @@ func (c Config) PerfBufferBytes() int {
 		return 64 * os.Getpagesize()
 	}
 	return c.PerfPages * os.Getpagesize()
+}
+
+func (c Config) normalizedForHost() (Config, runtimeResourcePlan) {
+	memAvailable, known := readMemAvailableBytes()
+	return normalizeRuntimeConfig(c, runtime.NumCPU(), memAvailable, known)
+}
+
+func normalizeRuntimeConfig(c Config, cpuCount int, memAvailable uint64, memKnown bool) (Config, runtimeResourcePlan) {
+	if cpuCount <= 0 {
+		cpuCount = 1
+	}
+	if c.CaptureBytes <= 0 {
+		c.CaptureBytes = 32 * 1024
+	}
+	if c.BatchSize <= 0 {
+		c.BatchSize = 100
+	}
+	if c.MaxMessageBytes <= 0 {
+		c.MaxMessageBytes = c.CaptureBytes
+	}
+	if c.ResponseStallTimeout <= 0 {
+		c.ResponseStallTimeout = 500 * time.Millisecond
+	}
+	if c.TransactionTTL <= 0 {
+		c.TransactionTTL = 10 * time.Minute
+	}
+
+	tier := pickResourceTier(memAvailable, memKnown)
+
+	workerCount := c.WorkerCount
+	if workerCount <= 0 {
+		workerCount = min(cpuCount, 8)
+	}
+	workerCount = clampInt(workerCount, 1, min(cpuCount, tier.maxWorkers))
+	c.WorkerCount = workerCount
+
+	perfPages := c.PerfPages
+	if perfPages <= 0 {
+		perfPages = tier.defaultPerfPages
+	}
+	maxPerfPages := maxPerfPagesForBudget(cpuCount, os.Getpagesize(), tier.perfBudgetBytes, tier.minPerfPages)
+	perfPages = clampInt(perfPages, tier.minPerfPages, maxPerfPages)
+	c.PerfPages = perfPages
+
+	queueFloor := max(c.BatchSize*2, 128)
+	if tier.maxWorkerQueueSize > 0 && queueFloor > tier.maxWorkerQueueSize {
+		queueFloor = tier.maxWorkerQueueSize
+	}
+	queueDefault := max(c.BatchSize*8, queueFloor)
+	if tier.maxWorkerQueueSize > 0 && queueDefault > tier.maxWorkerQueueSize {
+		queueDefault = tier.maxWorkerQueueSize
+	}
+	workerQueueSize := c.WorkerQueueSize
+	if workerQueueSize <= 0 {
+		workerQueueSize = queueDefault
+	}
+	eventBytes := int(unsafe.Sizeof(httptrace.Event{}))
+	maxWorkerQueue := maxWorkerQueueSizeForBudget(workerCount, eventBytes, tier.workerQueueBudget, queueFloor, tier.maxWorkerQueueSize)
+	workerQueueSize = clampInt(workerQueueSize, queueFloor, maxWorkerQueue)
+	c.WorkerQueueSize = workerQueueSize
+
+	redisWorkers := c.RedisWorkers
+	if redisWorkers <= 0 {
+		redisWorkers = min(max(1, cpuCount/2), 4)
+	}
+	redisWorkers = clampInt(redisWorkers, 1, tier.maxRedisWorkers)
+	c.RedisWorkers = redisWorkers
+
+	redisQueueSize := c.RedisQueueSize
+	if redisQueueSize <= 0 {
+		redisQueueSize = tier.defaultRedisQueue
+	}
+	redisQueueSize = clampInt(redisQueueSize, 256, tier.maxRedisQueue)
+	c.RedisQueueSize = redisQueueSize
+
+	retryQueueSize := c.RetryQueueSize
+	if retryQueueSize <= 0 {
+		retryQueueSize = tier.defaultRetryQueue
+	}
+	retryQueueSize = clampInt(retryQueueSize, 128, tier.maxRetryQueue)
+	c.RetryQueueSize = retryQueueSize
+
+	plan := runtimeResourcePlan{
+		CPUCount:          cpuCount,
+		MemAvailableBytes: memAvailable,
+		MemAvailableKnown: memKnown,
+		EventBytes:        uintptr(eventBytes),
+		PerfPages:         c.PerfPages,
+		PerfBufferBytes:   c.PerfBufferBytes(),
+		PerfTotalBytes:    uint64(c.PerfBufferBytes()) * uint64(cpuCount),
+		WorkerCount:       c.WorkerCount,
+		WorkerQueueSize:   c.WorkerQueueSize,
+		WorkerQueueBytes:  uint64(c.WorkerCount) * uint64(c.WorkerQueueSize) * uint64(eventBytes),
+		RedisWorkers:      c.RedisWorkers,
+		RedisQueueSize:    c.RedisQueueSize,
+		RetryQueueSize:    c.RetryQueueSize,
+	}
+	return c, plan
+}
+
+func pickResourceTier(memAvailable uint64, known bool) resourceTier {
+	switch {
+	case known && memAvailable <= 512<<20:
+		return resourceTier{
+			maxWorkers:         2,
+			maxRedisWorkers:    1,
+			defaultPerfPages:   16,
+			minPerfPages:       8,
+			perfBudgetBytes:    8 << 20,
+			workerQueueBudget:  4 << 20,
+			maxWorkerQueueSize: 256,
+			defaultRedisQueue:  512,
+			maxRedisQueue:      2048,
+			defaultRetryQueue:  256,
+			maxRetryQueue:      1024,
+		}
+	case known && memAvailable <= 1<<30:
+		return resourceTier{
+			maxWorkers:         4,
+			maxRedisWorkers:    2,
+			defaultPerfPages:   32,
+			minPerfPages:       8,
+			perfBudgetBytes:    16 << 20,
+			workerQueueBudget:  8 << 20,
+			maxWorkerQueueSize: 512,
+			defaultRedisQueue:  1024,
+			maxRedisQueue:      4096,
+			defaultRetryQueue:  512,
+			maxRetryQueue:      2048,
+		}
+	case known && memAvailable <= 2<<30:
+		return resourceTier{
+			maxWorkers:         6,
+			maxRedisWorkers:    3,
+			defaultPerfPages:   64,
+			minPerfPages:       16,
+			perfBudgetBytes:    32 << 20,
+			workerQueueBudget:  16 << 20,
+			maxWorkerQueueSize: 768,
+			defaultRedisQueue:  2048,
+			maxRedisQueue:      8192,
+			defaultRetryQueue:  1024,
+			maxRetryQueue:      4096,
+		}
+	default:
+		return resourceTier{
+			maxWorkers:         8,
+			maxRedisWorkers:    4,
+			defaultPerfPages:   64,
+			minPerfPages:       16,
+			perfBudgetBytes:    64 << 20,
+			workerQueueBudget:  32 << 20,
+			maxWorkerQueueSize: 1024,
+			defaultRedisQueue:  4096,
+			maxRedisQueue:      8192,
+			defaultRetryQueue:  2048,
+			maxRetryQueue:      8192,
+		}
+	}
+}
+
+func maxPerfPagesForBudget(cpuCount, pageSize int, budget uint64, floor int) int {
+	if cpuCount <= 0 || pageSize <= 0 || budget == 0 {
+		return max(floor, 16)
+	}
+	perCPUBytes := uint64(cpuCount) * uint64(pageSize)
+	pages := int(budget / perCPUBytes)
+	if pages < floor {
+		return floor
+	}
+	return pages
+}
+
+func maxWorkerQueueSizeForBudget(workerCount, eventBytes int, budget uint64, floor, hardCap int) int {
+	if workerCount <= 0 || eventBytes <= 0 || budget == 0 {
+		return max(floor, hardCap)
+	}
+	size := int(budget / uint64(workerCount) / uint64(eventBytes))
+	if size < floor {
+		size = floor
+	}
+	if hardCap > 0 && size > hardCap {
+		size = hardCap
+	}
+	return size
+}
+
+func clampInt(v, low, high int) int {
+	if low > high {
+		low, high = high, low
+	}
+	if v < low {
+		return low
+	}
+	if v > high {
+		return high
+	}
+	return v
+}
+
+func readMemAvailableBytes() (uint64, bool) {
+	file, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return 0, false
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "MemAvailable:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0, false
+		}
+		value, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return value * 1024, true
+	}
+	return 0, false
+}
+
+func (p runtimeResourcePlan) Summary() string {
+	mem := "unknown"
+	if p.MemAvailableKnown {
+		mem = formatBytesIEC(p.MemAvailableBytes)
+	}
+	return fmt.Sprintf(
+		"cpus=%d mem_available=%s perf_pages=%d perf_per_cpu=%s perf_total=%s workers=%d worker_queue=%d worker_queue_mem=%s redis_workers=%d redis_queue=%d retry_queue=%d event_size=%d",
+		p.CPUCount,
+		mem,
+		p.PerfPages,
+		formatBytesIEC(uint64(p.PerfBufferBytes)),
+		formatBytesIEC(p.PerfTotalBytes),
+		p.WorkerCount,
+		p.WorkerQueueSize,
+		formatBytesIEC(p.WorkerQueueBytes),
+		p.RedisWorkers,
+		p.RedisQueueSize,
+		p.RetryQueueSize,
+		p.EventBytes,
+	)
+}
+
+func formatBytesIEC(v uint64) string {
+	const unit = 1024
+	if v < unit {
+		return fmt.Sprintf("%dB", v)
+	}
+	div, exp := uint64(unit), 0
+	for n := v / unit; n >= unit && exp < 5; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%ciB", float64(v)/float64(div), "KMGTPE"[exp])
 }
 
 // 配置内核态过滤
@@ -149,7 +438,8 @@ func (c Config) BuildFilter() (bpfgen.HttpTraceFilterConfig, error) {
 		filter.DstPort = uint16(c.DstPort)
 	}
 	if c.CaptureBytes > 0 {
-		filter.CaptureBytes = uint32(c.CaptureBytes)
+		filter.RequestCaptureBytes = uint32(c.CaptureBytes)
+		filter.ResponseCaptureBytes = uint32(c.CaptureBytes)
 	}
 
 	return filter, nil

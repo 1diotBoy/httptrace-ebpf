@@ -44,14 +44,16 @@ type ParsedMessage struct {
 	Headers      map[string]string   `json:"headers"`
 	HeaderValues map[string][]string `json:"header_values,omitempty"`
 	// RawHeader          string              `json:"raw_header"`
-	Body string `json:"body"`
 	// RawPayload         string `json:"raw_payload"`
-	ContentLength      int64  `json:"content_length,omitempty"`
-	TransferEncoding   string `json:"transfer_encoding,omitempty"`
-	Chunked            bool   `json:"chunked"`
-	BodyPartial        bool   `json:"body_partial,omitempty"`
-	ConnectionCloseEOF bool   `json:"connection_close_eof"`
-	ConsumedBytes      int    `json:"consumed_bytes"`
+	Body                 string `json:"body"`
+	BodySizeBytes        int    `json:"body_size_bytes,omitempty"` // 单位 字节
+	ObservedMessageBytes uint64 `json:"observed_message_bytes,omitempty"`
+	ContentLength        int64  `json:"content_length,omitempty"`
+	TransferEncoding     string `json:"transfer_encoding,omitempty"`
+	Chunked              bool   `json:"chunked"`
+	BodyPartial          bool   `json:"body_partial,omitempty"`
+	ConnectionCloseEOF   bool   `json:"connection_close_eof"`
+	ConsumedBytes        int    `json:"consumed_bytes"`
 }
 
 // TryParseMessage 负责把聚合后的 HTTP 明文切成起始行、头和 body，
@@ -154,6 +156,10 @@ func FindMessageStart(direction uint8, data []byte) int {
 // 构造一条最小可用的响应对象，避免整条异常响应（404/500/认证失败页）完全丢失。
 // 这条路径只用于兜底，不影响正常能解析出 HTTP 头的响应。
 func BuildSyntheticResponse(data []byte) (*ParsedMessage, bool) {
+	if msg, ok := buildFallbackHTTPResponse(data); ok {
+		return msg, true
+	}
+
 	body := strings.TrimSpace(string(data))
 	if body == "" {
 		return nil, false
@@ -171,6 +177,59 @@ func BuildSyntheticResponse(data []byte) (*ParsedMessage, bool) {
 		// RawPayload:    string(data),
 		BodyPartial:   true,
 		ConsumedBytes: len(data),
+	}
+	return msg, true
+}
+
+func buildFallbackHTTPResponse(data []byte) (*ParsedMessage, bool) {
+	start := FindMessageStart(DirectionResponse, data)
+	if start < 0 || start >= len(data) {
+		return nil, false
+	}
+	data = data[start:]
+
+	headerEnd := bytes.Index(data, headerSeparator)
+	if headerEnd < 0 {
+		return nil, false
+	}
+
+	head := string(data[:headerEnd])
+	lines := strings.Split(head, "\r\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return nil, false
+	}
+
+	headers := make(map[string]string, len(lines))
+	for _, line := range lines[1:] {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(parts[0]))
+		headers[key] = strings.TrimSpace(parts[1])
+	}
+
+	msg := &ParsedMessage{
+		Direction:        DirectionResponse,
+		StartLine:        lines[0],
+		Headers:          headers,
+		HeaderValues:     map[string][]string{},
+		ContentLength:    -1,
+		TransferEncoding: headers["Transfer-Encoding"],
+		Chunked:          strings.Contains(strings.ToLower(headers["Transfer-Encoding"]), "chunked"),
+		Body:             string(data[headerEnd+len(headerSeparator):]),
+		BodyPartial:      true,
+		ConsumedBytes:    len(data),
+	}
+	if err := parseStatusLine(lines[0], msg); err != nil {
+		status, reason := inferStatusFromBody(msg.Body)
+		msg.StatusCode = status
+		msg.Reason = reason
+	}
+	if raw := headers["Content-Length"]; raw != "" {
+		if v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); err == nil {
+			msg.ContentLength = v
+		}
 	}
 	return msg, true
 }
@@ -274,7 +333,7 @@ func parseMessageHead(direction uint8, data []byte) (*ParsedMessage, textproto.M
 		}
 		parts := strings.SplitN(line, ":", 2)
 		if len(parts) != 2 {
-			return nil, nil, 0, false, fmt.Errorf("malformed header line %q", line)
+			continue
 		}
 		key := textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(parts[0]))
 		value := strings.TrimSpace(parts[1])

@@ -12,7 +12,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 	"unsafe"
 
@@ -28,18 +27,23 @@ import (
 
 const (
 	flagStart        = 1 << 0
+	flagEnd          = 1 << 1
 	flagCaptureTrunc = 1 << 2
 	flagControl      = 1 << 4
 	flagClose        = 1 << 5
+	flagSizeOnly     = 1 << 6
 )
 
 type Service struct {
-	cfg       Config
-	filter    ResolvedFilter
-	assembler *httptrace.Assembler
-	store     *storage.RedisStore
-	resolver  *socketResolver
-	stats     *stats
+	cfg                      Config
+	filter                   ResolvedFilter
+	assembler                *httptrace.Assembler
+	store                    *storage.RedisStore
+	resolver                 *socketResolver
+	stats                    *stats
+	resourcePlan             runtimeResourcePlan
+	lastRequestCaptureLimit  uint32
+	lastResponseCaptureLimit uint32
 }
 
 type stats struct {
@@ -100,6 +104,7 @@ var resolveRetryBackoffs = [...]time.Duration{
 }
 
 func NewService(cfg Config) (*Service, error) {
+	cfg, plan := cfg.normalizedForHost()
 	filter, err := cfg.ResolveFilter()
 	if err != nil {
 		return nil, err
@@ -118,13 +123,15 @@ func NewService(cfg Config) (*Service, error) {
 	} else {
 		log.Printf("redis 地址为空， 不存储到redis ...")
 	}
+	log.Printf("runtime resource plan: %s", plan.Summary())
 	return &Service{
-		cfg:       cfg,
-		filter:    filter,
-		assembler: httptrace.NewAssembler(cfg.MaxMessageBytes, cfg.TransactionTTL, cfg.ResponseStallTimeout),
-		store:     store,
-		resolver:  newSocketResolver(15 * time.Second),
-		stats:     &stats{},
+		cfg:          cfg,
+		filter:       filter,
+		assembler:    httptrace.NewAssembler(cfg.MaxMessageBytes, cfg.TransactionTTL, cfg.ResponseStallTimeout),
+		store:        store,
+		resolver:     newSocketResolver(15 * time.Second),
+		stats:        &stats{},
+		resourcePlan: plan,
 	}, nil
 }
 
@@ -146,10 +153,13 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("load bpf objects: %w", err)
 	}
 	defer objs.Close()
-	log.Printf("bpf objects loaded (variant=%s)", objs.Variant)
+	log.Printf("bpf objects loaded (variant=%s hook_strategy=%s)", objs.Variant, objs.HookStrategy)
 
 	if err := s.installFilter(objs); err != nil {
 		return err
+	}
+	if err := s.syncCaptureLimitsToKernel(objs.FilterMap); err != nil {
+		log.Printf("initial kernel capture limit sync error: %v", err)
 	}
 	log.Printf("resolved filter: %s", s.filter.Summary())
 	if s.cfg.DisableUserTuple {
@@ -174,7 +184,7 @@ func (s *Service) Run(ctx context.Context) error {
 	writeCh, writersDone := s.startRedisWriters()
 	workers, workersDone := s.startWorkers(writeCh)
 
-	retrySem := make(chan struct{}, 32768)
+	retrySem := make(chan struct{}, s.cfg.RetryQueueSize)
 	var retryWG sync.WaitGroup
 
 	var wg sync.WaitGroup
@@ -243,18 +253,21 @@ func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 		kernelFilter.SrcPort = 0
 		kernelFilter.DstPort = 0
 		if s.cfg.CaptureBytes > 0 {
-			kernelFilter.CaptureBytes = uint32(s.cfg.CaptureBytes)
+			kernelFilter.RequestCaptureBytes = uint32(s.cfg.CaptureBytes)
+			kernelFilter.ResponseCaptureBytes = uint32(s.cfg.CaptureBytes)
 		}
 		if err := objs.FilterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update filter map: %w", err)
 		}
+		s.lastRequestCaptureLimit = kernelFilter.RequestCaptureBytes
+		s.lastResponseCaptureLimit = kernelFilter.ResponseCaptureBytes
 		return nil
 	}
 	if kernelFilter.Ifindex != 0 {
 		log.Printf("ifname filter is not enforced in kernel tuple-cache mode: socket-layer ifindex is not reliable enough")
 	}
 	kernelFilter.Ifindex = 0
-	if usesLegacySockABI() {
+	if objs.HookStrategy == bpfgen.HookStrategyLegacySock {
 		// 4.x 上 sock 结构布局在不同发行版/回移内核间差异更大，
 		// 改成用 inet_sock_set_state 维护 tuple cache，send/recv 路径优先查 cache 做端口/IP 过滤。
 		// 这样 4.x 不再依赖收发现场直接读 sock_common 来做强过滤。
@@ -263,6 +276,46 @@ func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 	if err := objs.FilterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update filter map: %w", err)
 	}
+	s.lastRequestCaptureLimit = kernelFilter.RequestCaptureBytes
+	s.lastResponseCaptureLimit = kernelFilter.ResponseCaptureBytes
+	return nil
+}
+
+func (s *Service) syncCaptureLimitsToKernel(filterMap *ebpf.Map) error {
+	if s == nil || s.store == nil || filterMap == nil {
+		return nil
+	}
+
+	requestLimit := uint32(s.store.RequestCaptureLimitBytes())
+	responseLimit := uint32(s.store.ResponseCaptureLimitBytes())
+	if requestLimit == 0 {
+		requestLimit = uint32(s.cfg.CaptureBytes)
+	}
+	if responseLimit == 0 {
+		responseLimit = uint32(s.cfg.CaptureBytes)
+	}
+	if requestLimit == s.lastRequestCaptureLimit && responseLimit == s.lastResponseCaptureLimit {
+		return nil
+	}
+
+	key := uint32(0)
+	kernelFilter := s.filter.Kernel
+	if s.cfg.DisableKernelFilter {
+		kernelFilter.Ifindex = 0
+		kernelFilter.SrcIp = 0
+		kernelFilter.DstIp = 0
+		kernelFilter.SrcPort = 0
+		kernelFilter.DstPort = 0
+	}
+	kernelFilter.RequestCaptureBytes = requestLimit
+	kernelFilter.ResponseCaptureBytes = responseLimit
+	if err := filterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update dynamic capture limits: %w", err)
+	}
+
+	s.lastRequestCaptureLimit = requestLimit
+	s.lastResponseCaptureLimit = responseLimit
+	log.Printf("updated kernel capture limits request=%d response=%d", requestLimit, responseLimit)
 	return nil
 }
 
@@ -278,7 +331,7 @@ func (s *Service) startRedisWriters() (chan httptrace.Update, *sync.WaitGroup) {
 	}
 	queueSize := s.cfg.RedisQueueSize
 	if queueSize <= 0 {
-		queueSize = 8192
+		queueSize = max(256, s.resourcePlan.RedisQueueSize)
 	}
 	ch := make(chan httptrace.Update, queueSize)
 	for i := 0; i < workerCount; i++ {
@@ -306,15 +359,19 @@ func (s *Service) startRedisWriters() (chan httptrace.Update, *sync.WaitGroup) {
 func (s *Service) startWorkers(writeCh chan<- httptrace.Update) ([]chan httptrace.Event, *sync.WaitGroup) {
 	workerCount := s.cfg.WorkerCount
 	if workerCount <= 0 {
-		workerCount = runtime.NumCPU()
+		workerCount = max(1, s.resourcePlan.WorkerCount)
+	}
+	queueSize := s.cfg.WorkerQueueSize
+	if queueSize <= 0 {
+		queueSize = max(s.cfg.BatchSize*2, s.resourcePlan.WorkerQueueSize)
 	}
 
 	var wg sync.WaitGroup
 	workers := make([]chan httptrace.Event, workerCount)
 	for i := 0; i < workerCount; i++ {
-		// 解析 worker 的通道适当放大，优先吸收高并发下的瞬时突刺，
-		// 避免 readLoop 因为下游短暂抖动被阻塞，进而放大 perf lost。
-		workers[i] = make(chan httptrace.Event, s.cfg.BatchSize*64)
+		// 启动期如果按 CPU 数创建超深队列，在多核老机器上会一次性吃掉大量内存。
+		// 这里改成按可用内存自动收敛后的队列深度，优先保证进程稳定启动。
+		workers[i] = make(chan httptrace.Event, queueSize)
 		wg.Add(1)
 		go s.workerLoop(i, workers[i], writeCh, &wg)
 	}
@@ -421,6 +478,9 @@ func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace
 		s.stats.stallFlushes.Add(1)
 	}
 	s.recordUpdatePath(tag, update.Kind)
+	if s.cfg.DebugKernel {
+		s.logAssemblyDiagnostic(tag, update)
+	}
 	if s.cfg.PrintSummary {
 		log.Printf("[%s] %s", tag, update.Trace.SummaryLine())
 	}
@@ -433,6 +493,54 @@ func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace
 			return
 		case writeCh <- update:
 		}
+	}
+}
+
+func (s *Service) logAssemblyDiagnostic(tag string, update httptrace.Update) {
+	switch update.Kind {
+	case "request":
+		if update.Trace.Request == nil || !update.Trace.RequestTruncated {
+			return
+		}
+		log.Printf(
+			"[%s] request diag chain=%d source=%s truncated=%t body_bytes=%d observed=%d consumed=%d content_length=%d chunked=%t body_partial=%t",
+			tag,
+			update.Trace.ChainID,
+			update.Trace.CaptureSource,
+			update.Trace.RequestTruncated,
+			messageBodySize(update.Trace.Request),
+			update.Trace.Request.ObservedMessageBytes,
+			update.Trace.Request.ConsumedBytes,
+			update.Trace.Request.ContentLength,
+			update.Trace.Request.Chunked,
+			update.Trace.Request.BodyPartial,
+		)
+	case "response":
+		if update.Trace.Response == nil {
+			return
+		}
+		if !(update.Trace.ResponseTruncated || update.Trace.Response.BodyPartial || tag == "stalled") {
+			return
+		}
+		reason := "assembled_partial"
+		if tag == "stalled" {
+			reason = "stalled_flush"
+		}
+		log.Printf(
+			"[%s] response diag chain=%d reason=%s source=%s truncated=%t status=%d chunked=%t body_partial=%t body_bytes=%d observed=%d consumed=%d content_length=%d",
+			tag,
+			update.Trace.ChainID,
+			reason,
+			update.Trace.CaptureSource,
+			update.Trace.ResponseTruncated,
+			update.Trace.Response.StatusCode,
+			update.Trace.Response.Chunked,
+			update.Trace.Response.BodyPartial,
+			messageBodySize(update.Trace.Response),
+			update.Trace.Response.ObservedMessageBytes,
+			update.Trace.Response.ConsumedBytes,
+			update.Trace.Response.ContentLength,
+		)
 	}
 }
 
@@ -525,18 +633,20 @@ func (s *Service) recordUpdatePath(tag, kind string) {
 }
 
 type consoleParsedMessage struct {
-	StartLine        string            `json:"start_line"`
-	Version          string            `json:"version,omitempty"`
-	Method           string            `json:"method,omitempty"`
-	URL              string            `json:"url,omitempty"`
-	StatusCode       int               `json:"status_code,omitempty"`
-	Reason           string            `json:"reason,omitempty"`
-	Headers          map[string]string `json:"headers,omitempty"`
-	Body             string            `json:"body,omitempty"`
-	ContentLength    int64             `json:"content_length,omitempty"`
-	TransferEncoding string            `json:"transfer_encoding,omitempty"`
-	Chunked          bool              `json:"chunked,omitempty"`
-	BodyPartial      bool              `json:"body_partial,omitempty"`
+	StartLine            string            `json:"start_line"`
+	Version              string            `json:"version,omitempty"`
+	Method               string            `json:"method,omitempty"`
+	URL                  string            `json:"url,omitempty"`
+	StatusCode           int               `json:"status_code,omitempty"`
+	Reason               string            `json:"reason,omitempty"`
+	Headers              map[string]string `json:"headers,omitempty"`
+	Body                 string            `json:"body,omitempty"`
+	BodySizeBytes        int               `json:"body_size_bytes,omitempty"`
+	ObservedMessageBytes uint64            `json:"observed_message_bytes,omitempty"`
+	ContentLength        int64             `json:"content_length,omitempty"`
+	TransferEncoding     string            `json:"transfer_encoding,omitempty"`
+	Chunked              bool              `json:"chunked,omitempty"`
+	BodyPartial          bool              `json:"body_partial,omitempty"`
 }
 
 func newConsoleParsedMessage(msg *httptrace.ParsedMessage) *consoleParsedMessage {
@@ -544,19 +654,31 @@ func newConsoleParsedMessage(msg *httptrace.ParsedMessage) *consoleParsedMessage
 		return nil
 	}
 	return &consoleParsedMessage{
-		StartLine:        msg.StartLine,
-		Version:          msg.Version,
-		Method:           msg.Method,
-		URL:              msg.URL,
-		StatusCode:       msg.StatusCode,
-		Reason:           msg.Reason,
-		Headers:          msg.Headers,
-		Body:             msg.Body,
-		ContentLength:    msg.ContentLength,
-		TransferEncoding: msg.TransferEncoding,
-		Chunked:          msg.Chunked,
-		BodyPartial:      msg.BodyPartial,
+		StartLine:            msg.StartLine,
+		Version:              msg.Version,
+		Method:               msg.Method,
+		URL:                  msg.URL,
+		StatusCode:           msg.StatusCode,
+		Reason:               msg.Reason,
+		Headers:              msg.Headers,
+		Body:                 msg.Body,
+		BodySizeBytes:        messageBodySize(msg),
+		ObservedMessageBytes: msg.ObservedMessageBytes,
+		ContentLength:        msg.ContentLength,
+		TransferEncoding:     msg.TransferEncoding,
+		Chunked:              msg.Chunked,
+		BodyPartial:          msg.BodyPartial,
 	}
+}
+
+func messageBodySize(msg *httptrace.ParsedMessage) int {
+	if msg == nil {
+		return 0
+	}
+	if msg.BodySizeBytes > 0 {
+		return msg.BodySizeBytes
+	}
+	return len(msg.Body)
 }
 
 // 解析五元组
@@ -702,12 +824,15 @@ func (s *Service) dispatchEvent(ctx context.Context, event httptrace.Event, work
 }
 
 func (s *Service) shouldPassThroughFilteredEvent(event httptrace.Event, reason FilterReason) bool {
-	if reason != FilterReasonPort || event.Direction == httptrace.DirectionUnknown {
+	_ = reason
+	if event.Direction == httptrace.DirectionUnknown {
 		return false
 	}
 	if event.Flags&flagControl != 0 {
 		return false
 	}
+	// 五元组暂时没补全时先默认放行，等 /proc 反查或后续 fragment 补全后再收敛。
+	// 这样重新打开端口/网卡/IP 过滤时，不会因为瞬时缺字段把真实请求直接误杀掉。
 	if missingTuple(event) {
 		s.stats.tuplePassThrough.Add(1)
 		return true
@@ -780,6 +905,9 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 		}
 
 		event := normalizeEvent(raw)
+		if s.cfg.DebugKernel {
+			s.logKernelFragment(record.CPU, raw, event)
+		}
 		startResolve := time.Time{}
 		if s.cfg.DebugKernel {
 			startResolve = time.Now()
@@ -810,6 +938,63 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 	}
 }
 
+func (s *Service) logKernelFragment(cpu int, raw bpfgen.HttpTraceHttpEvent, event httptrace.Event) {
+	if event.Flags&flagControl != 0 {
+		log.Printf(
+			"kernel control cpu=%d chain=%d source=%s flags=%s fd=%d seq=%d",
+			cpu,
+			event.ChainID,
+			event.Source,
+			formatEventFlags(event.Flags),
+			event.FD,
+			event.SeqHint,
+		)
+		return
+	}
+	if event.Direction != httptrace.DirectionResponse {
+		if event.Flags&flagSizeOnly != 0 {
+			log.Printf(
+				"kernel size-only cpu=%d chain=%d dir=%d source=%s observed=%d flags=%s fd=%d seq=%d",
+				cpu,
+				event.ChainID,
+				event.Direction,
+				event.Source,
+				event.ObservedMessageBytes,
+				formatEventFlags(event.Flags),
+				event.FD,
+				event.SeqHint,
+			)
+		}
+		return
+	}
+	if event.Flags&flagSizeOnly != 0 {
+		log.Printf(
+			"kernel response size-only cpu=%d chain=%d source=%s observed=%d flags=%s fd=%d seq=%d",
+			cpu,
+			event.ChainID,
+			event.Source,
+			event.ObservedMessageBytes,
+			formatEventFlags(event.Flags),
+			event.FD,
+			event.SeqHint,
+		)
+		return
+	}
+	log.Printf(
+		"kernel response fragment cpu=%d chain=%d source=%s frag=%d payload=%d total=%d observed=%d flags=%s fd=%d seq=%d",
+		cpu,
+		event.ChainID,
+		event.Source,
+		event.FragIdx,
+		raw.PayloadLen,
+		raw.TotalLen,
+		event.ObservedMessageBytes,
+		formatEventFlags(event.Flags),
+		event.FD,
+		event.SeqHint,
+	)
+}
+
 // logLoop 周期性打印内核采集统计和用户态解析统计。
 // 这里的 request_fragments/response_fragments 是按 HTTP 语义分类后的 fragment 数，
 // 不是完整请求/响应条数；真正成功解析出来的条数看 user(requests/responses)。
@@ -817,6 +1002,8 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 func (s *Service) logLoop(ctx context.Context, objs *bpfgen.LoadedObjects, writeCh chan<- httptrace.Update) error {
 	statsTicker := time.NewTicker(s.cfg.LogInterval)
 	defer statsTicker.Stop()
+	captureTicker := time.NewTicker(5 * time.Second)
+	defer captureTicker.Stop()
 	stallInterval := s.cfg.ResponseStallTimeout / 2
 	if stallInterval <= 0 || stallInterval > 250*time.Millisecond {
 		stallInterval = 250 * time.Millisecond
@@ -828,6 +1015,10 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.LoadedObjects, write
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-captureTicker.C:
+			if err := s.syncCaptureLimitsToKernel(objs.FilterMap); err != nil {
+				log.Printf("sync kernel capture limits error: %v", err)
+			}
 		case <-flushTicker.C:
 			updates := s.assembler.FlushStalled(time.Now())
 			for _, update := range updates {
@@ -930,7 +1121,7 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 			s.stats.workerQueuePeak.Load(),
 		)
 		log.Printf(
-			"%s kernel debug(sock_send_hits=%d tcp_send_hits=%d sock_recv_hits=%d tcp_recv_hits=%d recv_store_ok=%d recv_store_no_iter=%d recv_store_meta_fail=%d recv_ret_no_meta=%d recv_dir_request=%d recv_dir_response=%d recv_dir_unknown=%d recv_fallback_local=%d recv_fallback_keepalive=%d send_no_req_chain=%d send_resp_start=%d send_resp_continue=%d send_resp_reqactive=%d send_iter_empty=%d tuple_ipv4_ok=%d tuple_ipv6_portonly=%d tuple_extract_fail=%d prefix_second_iov=%d prefix_trimmed=%d)",
+			"%s kernel debug(sock_send_hits=%d tcp_send_hits=%d sock_recv_hits=%d tcp_recv_hits=%d recv_store_ok=%d recv_store_no_iter=%d recv_store_meta_fail=%d recv_ret_no_meta=%d recv_dir_request=%d recv_dir_response=%d recv_dir_unknown=%d recv_fallback_local=%d recv_fallback_keepalive=%d send_no_req_chain=%d send_resp_start=%d send_resp_continue=%d send_resp_reqactive=%d send_iter_empty=%d tuple_ipv4_ok=%d tuple_ipv6_portonly=%d tuple_extract_fail=%d prefix_second_iov=%d prefix_trimmed=%d iter_ubuf=%d iter_iovec=%d iter_kvec=%d iter_bvec=%d iter_unsupported=%d iter_load_fail=%d)",
 			label,
 			kstats.SockSendHits,
 			kstats.TcpSendHits,
@@ -955,6 +1146,12 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 			kstats.TupleExtractFail,
 			kstats.PrefixSecondIov,
 			kstats.PrefixTrimmed,
+			kstats.IterUbuf,
+			kstats.IterIovec,
+			kstats.IterKvec,
+			kstats.IterBvec,
+			kstats.IterUnsupported,
+			kstats.IterLoadFail,
 		)
 		log.Printf(
 			"%s kernel tuple-cache(updates=%d deletes=%d hits=%d misses=%d)",
@@ -969,12 +1166,11 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 
 // attachAll 统一挂载 kprobe/kretprobe/tracepoint，并打印挂载成功信息。
 // 当前策略是：
-// - 请求固定走 sock_recvmsg/kretprobe(sock_recvmsg)，保持“应用层收到明文后再读”的语义。
-// - 响应以 sock_sendmsg 为主，tcp_sendmsg 只做补充，专门覆盖 Nginx 等 TCP 发送路径。
-// - 4.x 继续避开 ABI 更容易漂移的 __sock_*，但不退化到只剩 tcp_*。
+// - 4.x 继续走 sock_sendmsg + sock_recvmsg/kretprobe(sock_recvmsg)，兼容老 ABI。
+// - 5.15+/6.x 改成 tcp_sendmsg + tcp_recvmsg/kretprobe(tcp_recvmsg)，避开 6.x 上更敏感的 sock_* verifier 路径。
+// - 所有 variant 都复用同一个 perf event 结构，用户态聚合/解析逻辑不需要分叉。
 func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 	var attached []link.Link
-	legacySockABI := usesLegacySockABI()
 
 	required := make([]struct {
 		symbols []string
@@ -982,7 +1178,7 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 		prog    *ebpf.Program
 	}, 0, 3)
 
-	if legacySockABI {
+	if objs.HookStrategy == bpfgen.HookStrategyLegacySock {
 		log.Printf("using legacy socket hook strategy: prefer sock_sendmsg/sock_recvmsg on 4.x and avoid __sock_* ABI drift")
 		required = append(required,
 			struct {
@@ -1002,22 +1198,23 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 			}{symbols: []string{"sock_recvmsg"}, ret: true, prog: objs.KretprobeSockRecvmsg},
 		)
 	} else {
+		log.Printf("using tcp-only hook strategy: request/response both rely on tcp_recvmsg/tcp_sendmsg on 5.15+/6.x")
 		required = append(required,
 			struct {
 				symbols []string
 				ret     bool
 				prog    *ebpf.Program
-			}{symbols: []string{"__sock_sendmsg", "sock_sendmsg"}, prog: objs.KprobeSockSendmsg},
+			}{symbols: []string{"tcp_sendmsg"}, prog: objs.KprobeTcpSendmsg},
 			struct {
 				symbols []string
 				ret     bool
 				prog    *ebpf.Program
-			}{symbols: []string{"sock_recvmsg", "__sock_recvmsg"}, prog: objs.KprobeSockRecvmsg},
+			}{symbols: []string{"tcp_recvmsg"}, prog: objs.KprobeTcpRecvmsg},
 			struct {
 				symbols []string
 				ret     bool
 				prog    *ebpf.Program
-			}{symbols: []string{"sock_recvmsg", "__sock_recvmsg"}, ret: true, prog: objs.KretprobeSockRecvmsg},
+			}{symbols: []string{"tcp_recvmsg"}, ret: true, prog: objs.KretprobeTcpRecvmsg},
 		)
 	}
 
@@ -1036,11 +1233,17 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 		prog    *ebpf.Program
 	}{
 		{symbols: []string{"tcp_close"}, prog: objs.KprobeTcpClose},
-		// response 默认仍以 sock_sendmsg 为主，这里把 tcp_sendmsg 当补充路径，
-		// 用来覆盖 Nginx/部分 TCP 发送栈里 sock_sendmsg 看不全的响应场景。
-		{symbols: []string{"tcp_sendmsg"}, prog: objs.KprobeTcpSendmsg},
 	}
-	if legacySockABI {
+	if objs.HookStrategy == bpfgen.HookStrategyLegacySock {
+		optionalKprobes = append(optionalKprobes,
+			// response 默认仍以 sock_sendmsg 为主，这里把 tcp_sendmsg 当补充路径，
+			// 用来覆盖 Nginx/部分 TCP 发送栈里 sock_sendmsg 看不全的响应场景。
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_sendmsg"}, prog: objs.KprobeTcpSendmsg},
+		)
 		optionalKprobes = append(optionalKprobes,
 			struct {
 				symbols []string
@@ -1070,8 +1273,8 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 		)
 		log.Printf("legacy tuple-cache fallback enabled: use tcp_v4/tcp_v6_connect and inet_csk_accept instead of inet_sock_set_state")
 	}
-	if !legacySockABI {
-		log.Printf("tcp_sendmsg supplement enabled by default: sock_sendmsg stays primary, tcp_sendmsg supplements nginx/TCP send path, and per-send dedupe guard is active")
+	if objs.HookStrategy == bpfgen.HookStrategyTCPOnly {
+		log.Printf("tcp-only capture enabled by default: skip sock_* probes and keep the same perf event/user-space parser contract")
 	}
 	for _, item := range optionalKprobes {
 		l, err := attachOne(item.symbols, item.ret, item.prog)
@@ -1096,7 +1299,7 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 		{group: "syscalls", name: "sys_enter_read", prog: objs.TracepointSysEnterRead},
 		{group: "syscalls", name: "sys_enter_readv", prog: objs.TracepointSysEnterReadv},
 	}
-	if !legacySockABI {
+	if objs.HookStrategy != bpfgen.HookStrategyLegacySock {
 		tracepoints = append([]struct {
 			group string
 			name  string
@@ -1119,6 +1322,9 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 }
 
 func attachOne(symbols []string, ret bool, prog *ebpf.Program) (link.Link, error) {
+	if prog == nil {
+		return nil, fmt.Errorf("program handle is nil for symbols %v", symbols)
+	}
 	var errs []string
 	for _, symbol := range symbols {
 		var (
@@ -1147,19 +1353,6 @@ func closeAll(items []link.Link) {
 	for _, item := range items {
 		item.Close()
 	}
-}
-
-// usesLegacySockABI 检测 4.x 风格的 socket API。
-// 这类内核上真正容易漂移的是 __sock_sendmsg/__sock_recvmsg 的 ABI，
-// 但 sock_sendmsg/sock_recvmsg 这一层依然更接近应用层 send/recv 语义。
-// 因此 4.x 只需要避开 __sock_*，不需要退化成把 tcp_* 当主采集路径。
-func usesLegacySockABI() bool {
-	var uts syscall.Utsname
-	if err := syscall.Uname(&uts); err != nil {
-		return false
-	}
-	release := strings.TrimSpace(cStringInt8(uts.Release[:]))
-	return strings.HasPrefix(release, "4.")
 }
 
 func cStringInt8(raw []int8) string {
@@ -1226,25 +1419,26 @@ func normalizeEvent(raw bpfgen.HttpTraceHttpEvent) httptrace.Event {
 		payloadLen = len(raw.Payload)
 	}
 	return httptrace.Event{
-		Timestamp: ts,
-		TsNS:      raw.TsNs,
-		ChainID:   raw.ChainId,
-		SockID:    raw.SockId,
-		SeqHint:   raw.SeqHint,
-		PID:       raw.Pid,
-		TID:       raw.Tid,
-		FD:        raw.Fd,
-		IfIndex:   raw.Ifindex,
-		SrcIP:     formatIPv4(raw.SrcIp),
-		DstIP:     formatIPv4(raw.DstIp),
-		SrcPort:   raw.SrcPort,
-		DstPort:   raw.DstPort,
-		FragIdx:   raw.FragIdx,
-		Direction: raw.Direction,
-		Flags:     raw.Flags,
-		Source:    captureSourceName(raw.Source),
-		Comm:      cString(raw.Comm[:]),
-		Payload:   append([]byte(nil), raw.Payload[:payloadLen]...),
+		Timestamp:            ts,
+		TsNS:                 raw.TsNs,
+		ChainID:              raw.ChainId,
+		SockID:               raw.SockId,
+		SeqHint:              raw.SeqHint,
+		ObservedMessageBytes: raw.ObservedMessageBytes,
+		PID:                  raw.Pid,
+		TID:                  raw.Tid,
+		FD:                   raw.Fd,
+		IfIndex:              raw.Ifindex,
+		SrcIP:                formatIPv4(raw.SrcIp),
+		DstIP:                formatIPv4(raw.DstIp),
+		SrcPort:              raw.SrcPort,
+		DstPort:              raw.DstPort,
+		FragIdx:              raw.FragIdx,
+		Direction:            raw.Direction,
+		Flags:                raw.Flags,
+		Source:               captureSourceName(raw.Source),
+		Comm:                 cString(raw.Comm[:]),
+		Payload:              append([]byte(nil), raw.Payload[:payloadLen]...),
 	}
 }
 
@@ -1263,6 +1457,32 @@ func captureSourceName(raw uint8) string {
 	default:
 		return "unknown"
 	}
+}
+
+func formatEventFlags(flags uint8) string {
+	parts := make([]string, 0, 5)
+	if flags&flagStart != 0 {
+		parts = append(parts, "start")
+	}
+	if flags&flagEnd != 0 {
+		parts = append(parts, "end")
+	}
+	if flags&flagCaptureTrunc != 0 {
+		parts = append(parts, "capture_trunc")
+	}
+	if flags&flagControl != 0 {
+		parts = append(parts, "control")
+	}
+	if flags&flagClose != 0 {
+		parts = append(parts, "close")
+	}
+	if flags&flagSizeOnly != 0 {
+		parts = append(parts, "size_only")
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, "|")
 }
 
 func formatIPv4(raw uint32) string {

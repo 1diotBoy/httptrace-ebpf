@@ -1,0 +1,12 @@
+Source: power-httptrace
+Section: utils
+Priority: optional
+Maintainer: POWER <admin@local>
+Build-Depends: debhelper (>=10), dh-sequence-systemd
+Standards-Version: 4.5.0
+
+Package: power-httptrace
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, bash, systemd, logrotate
+Description: HTTP full-chain collector based on eBPF
+ power-httptrace is an eBPF-based HTTP request/response collector.

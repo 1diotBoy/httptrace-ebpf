@@ -1,37 +1,39 @@
 package bpfgen
 
 type HttpTraceFilterConfig struct {
-	Ifindex      uint32
-	SrcIp        uint32
-	DstIp        uint32
-	SrcPort      uint16
-	DstPort      uint16
-	CaptureBytes uint32
+	Ifindex              uint32
+	SrcIp                uint32
+	DstIp                uint32
+	SrcPort              uint16
+	DstPort              uint16
+	RequestCaptureBytes  uint32
+	ResponseCaptureBytes uint32
 }
 
 type HttpTraceHttpEvent struct {
-	TsNs       uint64
-	ChainId    uint64
-	SockId     uint64
-	SeqHint    uint64
-	Pid        uint32
-	Tid        uint32
-	Fd         int32
-	Ifindex    uint32
-	SrcIp      uint32
-	DstIp      uint32
-	SrcPort    uint16
-	DstPort    uint16
-	PayloadLen uint16
-	TotalLen   uint16
-	FragIdx    uint16
-	Direction  uint8
-	Flags      uint8
-	Source     uint8
-	Pad0       uint8
-	Family     uint16
-	Comm       [16]int8
-	Payload    [1024]uint8
+	TsNs                 uint64
+	ChainId              uint64
+	SockId               uint64
+	SeqHint              uint64
+	ObservedMessageBytes uint64
+	Pid                  uint32
+	Tid                  uint32
+	Fd                   int32
+	Ifindex              uint32
+	SrcIp                uint32
+	DstIp                uint32
+	SrcPort              uint16
+	DstPort              uint16
+	PayloadLen           uint16
+	TotalLen             uint16
+	FragIdx              uint16
+	Direction            uint8
+	Flags                uint8
+	Source               uint8
+	Pad0                 uint8
+	Family               uint16
+	Comm                 [16]int8
+	Payload              [4096]uint8
 }
 
 type HttpTraceKernelStats struct {
@@ -70,4 +72,10 @@ type HttpTraceKernelStats struct {
 	TupleCacheMisses      uint64
 	PrefixSecondIov       uint64
 	PrefixTrimmed         uint64
+	IterUbuf              uint64
+	IterIovec             uint64
+	IterKvec              uint64
+	IterBvec              uint64
+	IterUnsupported       uint64
+	IterLoadFail          uint64
 }

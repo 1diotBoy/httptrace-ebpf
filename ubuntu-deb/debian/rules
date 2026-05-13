@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+%:
+	dh $@ --with systemd
+
+override_dh_strip:
+	# 不strip，避免eBPF二进制损坏
+	true
+
+override_dh_fixperms:
+	dh_fixperms
+	chmod 0755 debian/power-httptrace/app/soft/power-httptrace/bin/httptrace
+	chmod 0644 debian/power-httptrace/lib/systemd/system/power-httptrace.service
+	chmod 0644 debian/power-httptrace/etc/sysconfig/power-httptrace.sysconfig
+	chmod 0644 debian/power-httptrace/etc/logrotate.d/power-httptrace.logrotate

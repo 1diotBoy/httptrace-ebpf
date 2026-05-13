@@ -1,0 +1,4 @@
+HTTPTRACE_ARGS="-print-summary=false \
+-print-http=false -debug-kernel=true  -log-interval 10s  \
+-workers 2  -redis-db 6   -redis-addr core.redis.powerredis.core.powercloud.com:16379   -redis-password 9/L16DcUm3zIJgui54F/hayuh/bsXcdLdv3De12EkH4="
+

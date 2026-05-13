@@ -1,0 +1,4 @@
+./httptrace
+./power-httptrace.service
+./power-httptrace.sysconfig
+./power-httptrace.logrotate

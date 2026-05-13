@@ -34,16 +34,23 @@
 #define TCP_CLOSE 7
 #endif
 
-#define DEFAULT_MESSAGE_LIMIT (10 * 1024)
+#define DEFAULT_MESSAGE_LIMIT (32 * 1024)
+#define SIZE_PROGRESS_STEP (64 * 1024)
 /*
- * 为了兼容 4.19 上更严格的 verifier，这里把单次展开的分支数控制在可加载范围内。
- * 当前策略优先保证“单 iov 场景下最多采到 10KB”，这是大多数普通 HTTP 请求/响应的常见路径。
+ * 为了兼容 4.19 上更严格的 verifier，这里优先减少“每次 send/recv 需要展开的 helper 次数”，
+ * 否则在发送路径上很容易因为程序状态爆炸而被 verifier 拒绝加载。
+ *
+ * 当前策略：
+ * 1. 单个 perf event 的 payload 放大到 4KB 级别；
+ * 2. 第一批最多覆盖 2 个 iov，在可加载性和 chunked 小响应之间取一个更稳的平衡；
+ * 3. 单 iov 最多展开 8 个 chunk；
+ * 4. request/response 的总采集上限保持 32KB。
  */
-#define EVENT_PAYLOAD_SIZE 1024
-#define MAX_PAYLOAD_SIZE 1023
-#define MAX_PAYLOAD_MASK 1023
+#define EVENT_PAYLOAD_SIZE 4096
+#define MAX_PAYLOAD_SIZE 4095
+#define MAX_PAYLOAD_MASK 4095
 #define MAX_IOVECS 2
-#define MAX_CHUNKS_PER_IOV 5
+#define MAX_CHUNKS_PER_IOV 8
 #define MAX_FRAGMENTS (MAX_IOVECS * MAX_CHUNKS_PER_IOV)
 #define MAX_CAPTURE_BYTES_PER_CALL (MAX_PAYLOAD_SIZE * MAX_FRAGMENTS)
 /* 4.19 verifier 对带循环/变量索引的队列实现非常敏感。
@@ -74,6 +81,7 @@ enum http_event_flags {
 	EVT_FLAG_HTTP_HINT = 1 << 3,
 	EVT_FLAG_CONTROL = 1 << 4,
 	EVT_FLAG_CLOSE = 1 << 5,
+	EVT_FLAG_SIZE_ONLY = 1 << 6,
 };
 
 struct iovec_compat {
@@ -81,6 +89,47 @@ struct iovec_compat {
 	__u64 iov_len;
 };
 
+#ifdef IOV_ITER_LAYOUT_V6
+enum iter_type_compat {
+	ITER_UBUF_COMPAT = 0,
+	ITER_IOVEC_COMPAT = 1,
+	ITER_BVEC_COMPAT = 2,
+	ITER_KVEC_COMPAT = 3,
+	ITER_FOLIOQ_COMPAT = 4,
+	ITER_XARRAY_COMPAT = 5,
+	ITER_DISCARD_COMPAT = 6,
+};
+
+struct iov_iter_compat {
+	__u8 iter_type;
+	__u8 nofault;
+	__u8 data_source;
+	__u8 pad0[5];
+	__u64 iov_offset;
+	union {
+		struct iovec_compat __ubuf_iovec;
+		struct {
+			union {
+				const struct iovec_compat *iov;
+				const struct iovec_compat *kvec;
+				const void *bvec;
+				const void *folioq;
+				const void *xarray;
+				void *ubuf;
+			};
+			__u64 count;
+		};
+	};
+	union {
+		unsigned long nr_segs;
+		struct {
+			unsigned int folioq_slot;
+			unsigned int pad1;
+		};
+		__u64 xarray_start;
+	};
+};
+#else
 struct iov_iter_compat {
 	int type;
 	__u64 iov_offset;
@@ -99,6 +148,7 @@ struct iov_iter_compat {
 		};
 	};
 };
+#endif
 
 struct msghdr_compat {
 	void *msg_name;
@@ -153,7 +203,8 @@ struct filter_config {
 	__u32 dst_ip;
 	__u16 src_port;
 	__u16 dst_port;
-	__u32 capture_bytes;
+	__u32 request_capture_bytes;
+	__u32 response_capture_bytes;
 };
 
 struct tuple_cache_entry {
@@ -175,6 +226,10 @@ struct flow_state {
 	__u64 pending_req_chain1;
 	__u64 pending_req_chain2;
 	__u64 pending_req_chain3;
+	__u64 req_observed_bytes;
+	__u64 resp_observed_bytes;
+	__u64 req_reported_bytes;
+	__u64 resp_reported_bytes;
 	__u32 req_seq;
 	__u32 req_capture_bytes;
 	__u32 resp_capture_bytes;
@@ -212,6 +267,7 @@ struct capture_call {
 	const struct recv_args *meta;
 	__u64 chain_id;
 	__u64 seq_hint;
+	__u64 observed_message_bytes;
 	__u32 *frag_cursor;
 	__u32 *message_captured;
 	__u8 *capture_stopped;
@@ -237,6 +293,7 @@ struct http_event {
 	__u64 chain_id;
 	__u64 sock_id;
 	__u64 seq_hint;
+	__u64 observed_message_bytes;
 	__u32 pid;
 	__u32 tid;
 	__s32 fd;
@@ -293,6 +350,12 @@ struct kernel_stats {
 	__u64 tuple_cache_misses;
 	__u64 prefix_second_iov;
 	__u64 prefix_trimmed;
+	__u64 iter_ubuf;
+	__u64 iter_iovec;
+	__u64 iter_kvec;
+	__u64 iter_bvec;
+	__u64 iter_unsupported;
+	__u64 iter_load_fail;
 };
 
 struct trace_event_raw_sys_enter_compat {

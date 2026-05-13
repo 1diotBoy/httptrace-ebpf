@@ -1,6 +1,9 @@
 package httptrace
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestTryParseRequest(t *testing.T) {
 	raw := []byte("POST /api/v1/items HTTP/1.1\r\nHost: example.com\r\nContent-Length: 11\r\n\r\nhello world")
@@ -106,5 +109,25 @@ func TestBuildSyntheticResponseFromHTMLBody(t *testing.T) {
 	}
 	if got, want := msg.Reason, "Not Found"; got != want {
 		t.Fatalf("reason mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestBuildSyntheticResponseStripsHTTPHeadersFromBody(t *testing.T) {
+	raw := []byte("HTTP/1.1 200 \r\nServer: POWERLBS\r\nTransfer-Encoding: chunked\r\n\r\nc4e\r\n{\"errCode\":\"0\"")
+	msg, ok := BuildSyntheticResponse(raw)
+	if !ok {
+		t.Fatalf("expected synthetic response")
+	}
+	if got, want := msg.StartLine, "HTTP/1.1 200 "; got != want {
+		t.Fatalf("start line mismatch: got %q want %q", got, want)
+	}
+	if strings.HasPrefix(msg.Body, "HTTP/1.1") {
+		t.Fatalf("body should not include response head: %q", msg.Body)
+	}
+	if got, want := msg.Body, "c4e\r\n{\"errCode\":\"0\""; got != want {
+		t.Fatalf("body mismatch: got %q want %q", got, want)
+	}
+	if !msg.BodyPartial {
+		t.Fatalf("synthetic response should still be marked partial")
 	}
 }

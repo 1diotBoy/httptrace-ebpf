@@ -7,26 +7,37 @@ import (
 	"time"
 )
 
+const minChunkedResponseStallTimeout = 5 * time.Second
+
+const (
+	eventFlagEnd          = 1 << 1
+	eventFlagCaptureTrunc = 1 << 2
+	eventFlagControl      = 1 << 4
+	eventFlagClose        = 1 << 5
+	eventFlagSizeOnly     = 1 << 6
+)
+
 type Event struct {
-	Timestamp time.Time
-	TsNS      uint64
-	ChainID   uint64
-	SockID    uint64
-	SeqHint   uint64
-	PID       uint32
-	TID       uint32
-	FD        int32
-	IfIndex   uint32
-	SrcIP     string
-	DstIP     string
-	SrcPort   uint16
-	DstPort   uint16
-	FragIdx   uint16
-	Direction uint8
-	Flags     uint8
-	Comm      string
-	Source    string
-	Payload   []byte
+	Timestamp            time.Time
+	TsNS                 uint64
+	ChainID              uint64
+	SockID               uint64
+	SeqHint              uint64
+	ObservedMessageBytes uint64
+	PID                  uint32
+	TID                  uint32
+	FD                   int32
+	IfIndex              uint32
+	SrcIP                string
+	DstIP                string
+	SrcPort              uint16
+	DstPort              uint16
+	FragIdx              uint16
+	Direction            uint8
+	Flags                uint8
+	Comm                 string
+	Source               string
+	Payload              []byte
 }
 
 type TraceDocument struct {
@@ -50,7 +61,6 @@ type TraceDocument struct {
 	Response          *ParsedMessage `json:"response,omitempty"`
 	RequestTruncated  bool           `json:"request_truncated"`
 	ResponseTruncated bool           `json:"response_truncated"`
-	// TraceID           string         `json:trace_id`
 }
 
 type Update struct {
@@ -88,11 +98,13 @@ type traceState struct {
 }
 
 type fragmentStream struct {
-	received  map[uint16][]byte
-	nextFrag  uint16
-	buffer    []byte
-	truncated bool
-	firstTS   *time.Time
+	received      map[uint16][]byte
+	nextFrag      uint16
+	buffer        []byte
+	observedBytes uint64
+	truncated     bool
+	finalReady    bool
+	firstTS       *time.Time
 }
 
 type pendingRequest struct {
@@ -116,7 +128,7 @@ type Snapshot struct {
 }
 
 // NewAssembler 创建请求/响应聚合器。
-// 它按 chain_id 把多次 perf 事件重组成一条 HTTP 请求/响应，再交给 parser。
+// 按 chain_id 把多次 perf 事件重组成一条 HTTP 请求/响应，再交给 parser解析。
 func NewAssembler(maxMessageBytes int, maxIdle, responseStall time.Duration) *Assembler {
 	shards := make([]stateShard, 64)
 	for i := range shards {
@@ -148,7 +160,7 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 	defer shard.mu.Unlock()
 
 	state := shard.traces[event.ChainID]
-	if event.Flags&(1<<4) != 0 && event.Flags&(1<<5) != 0 {
+	if event.Flags&eventFlagControl != 0 && event.Flags&eventFlagClose != 0 {
 		if state == nil {
 			return nil, nil
 		}
@@ -207,6 +219,16 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 		ts := event.Timestamp
 		stream.firstTS = &ts
 	}
+	if event.ObservedMessageBytes > stream.observedBytes {
+		stream.observedBytes = event.ObservedMessageBytes
+	}
+	if event.Flags&eventFlagSizeOnly != 0 {
+		if event.Flags&eventFlagEnd != 0 {
+			stream.finalReady = true
+			return a.tryEmitUpdates(state, shard, event.ChainID, false)
+		}
+		return nil, nil
+	}
 	if len(event.Payload) > 0 {
 		if !stream.truncated {
 			if _, exists := stream.received[event.FragIdx]; !exists {
@@ -214,7 +236,7 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 			}
 		}
 	}
-	if event.Flags&(1<<2) != 0 {
+	if event.Flags&eventFlagCaptureTrunc != 0 {
 		stream.truncated = true
 	}
 	if !stream.truncated {
@@ -411,6 +433,7 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 			return updates, nil
 		}
 		if complete {
+			annotateParsedMessage(msg, &state.requestStream)
 			updates = append(updates, state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, false))
 			state.requestStream.consume(msg.ConsumedBytes)
 			continue
@@ -420,7 +443,7 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 			continue
 		}
 
-		if !(state.requestStream.truncated || eof) {
+		if !(state.requestStream.finalReady || eof) {
 			return updates, nil
 		}
 
@@ -437,6 +460,7 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 			}
 			return updates, nil
 		}
+		annotateParsedMessage(msg, &state.requestStream)
 		updates = append(updates, state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, state.requestStream.truncated || msg.BodyPartial))
 		state.requestStream.consumeAll()
 		return updates, nil
@@ -486,6 +510,7 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 			if len(state.pendingRequests) == 0 {
 				a.orphanResponses.Add(1)
 			}
+			annotateParsedMessage(msg, &state.responseStream)
 			updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, false))
 			state.responseStream.consume(msg.ConsumedBytes)
 			continue
@@ -494,10 +519,11 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 		// 对 4xx/5xx 这类异常响应，优先保证“有记录、有 body”，而不是一直等到完整 body。
 		// 这些异常页/错误 JSON 在不同框架/容器/Nginx 路径里，body 很容易被拆到后续 send 中，
 		// 如果这里仍按 200 的策略等待完整响应，经常会在高并发下积压成 pending_resp。
-		if head, ok, err := TryParseMessageHead(DirectionResponse, state.responseStream.buffer, opts); err == nil && ok && shouldEagerFlushErrorResponse(head) {
+		if head, ok, err := TryParseMessageHead(DirectionResponse, state.responseStream.buffer, opts); err == nil && ok && !state.responseStream.truncated && shouldEagerFlushErrorResponse(head) {
 			if len(state.pendingRequests) == 0 {
 				a.orphanResponses.Add(1)
 			}
+			annotateParsedMessage(head, &state.responseStream)
 			updates = append(updates, state.buildResponseUpdate(head, state.responseStream.firstTS, true))
 			state.responseStream.consumeAll()
 			continue
@@ -520,13 +546,14 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 				if len(state.pendingRequests) == 0 {
 					a.orphanResponses.Add(1)
 				}
+				annotateParsedMessage(msg, &state.responseStream)
 				updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, true))
 				state.responseStream.consume(consumed)
 				continue
 			}
 		}
 
-		if !(state.responseStream.truncated || eof) {
+		if !(state.responseStream.finalReady || eof) {
 			return updates, nil
 		}
 
@@ -539,6 +566,7 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 				if len(state.pendingRequests) == 0 {
 					a.orphanResponses.Add(1)
 				}
+				annotateParsedMessage(synthetic, &state.responseStream)
 				updates = append(updates, state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true))
 				state.responseStream.consumeAll()
 			}
@@ -552,6 +580,7 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 				if len(state.pendingRequests) == 0 {
 					a.orphanResponses.Add(1)
 				}
+				annotateParsedMessage(synthetic, &state.responseStream)
 				updates = append(updates, state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true))
 				state.responseStream.consumeAll()
 			}
@@ -560,6 +589,7 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 		if len(state.pendingRequests) == 0 {
 			a.orphanResponses.Add(1)
 		}
+		annotateParsedMessage(msg, &state.responseStream)
 		updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, state.responseStream.truncated || msg.BodyPartial))
 		state.responseStream.consumeAll()
 		return updates, nil
@@ -576,6 +606,7 @@ func (a *Assembler) promoteRequestForResponse(state *traceState) ([]Update, erro
 	msg, complete, err := TryParseMessage(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: false})
 	if err == nil && complete {
 		a.promotedRequests.Add(1)
+		annotateParsedMessage(msg, &state.requestStream)
 		update := state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, false)
 		state.requestStream.consume(msg.ConsumedBytes)
 		return []Update{update}, nil
@@ -587,6 +618,7 @@ func (a *Assembler) promoteRequestForResponse(state *traceState) ([]Update, erro
 	}
 
 	a.promotedRequests.Add(1)
+	annotateParsedMessage(msg, &state.requestStream)
 	update := state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, state.requestStream.truncated || msg.BodyPartial)
 	state.requestStream.consumeAll()
 	return []Update{update}, nil
@@ -632,6 +664,7 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 		if len(state.pendingRequests) == 0 {
 			a.orphanResponses.Add(1)
 		}
+		annotateParsedMessage(msg, &state.responseStream)
 		update := state.buildResponseUpdate(msg, state.responseStream.firstTS, false)
 		state.responseStream.consume(msg.ConsumedBytes)
 		return []Update{update}
@@ -647,6 +680,7 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 			if len(state.pendingRequests) == 0 {
 				a.orphanResponses.Add(1)
 			}
+			annotateParsedMessage(synthetic, &state.responseStream)
 			update := state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true)
 			state.responseStream.consumeAll()
 			return []Update{update}
@@ -656,6 +690,7 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 	if len(state.pendingRequests) == 0 {
 		a.orphanResponses.Add(1)
 	}
+	annotateParsedMessage(msg, &state.responseStream)
 	update := state.buildResponseUpdate(msg, state.responseStream.firstTS, true)
 	state.responseStream.consumeAll()
 	return []Update{update}
@@ -737,10 +772,45 @@ func (t *traceState) shouldFlushStalledResponse(now time.Time, stall time.Durati
 	if len(t.pendingRequests) == 0 || len(t.responseStream.buffer) == 0 {
 		return false
 	}
+	if t.responseStream.truncated {
+		return false
+	}
 	if t.responseUpdated.IsZero() {
 		return false
 	}
-	return now.Sub(t.responseUpdated) >= stall
+	timeout := stall
+	if timeout < minChunkedResponseStallTimeout && responseLooksChunked(t.responseStream.buffer) {
+		timeout = minChunkedResponseStallTimeout
+	}
+	return now.Sub(t.responseUpdated) >= timeout
+}
+
+func responseLooksChunked(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	msg, _, _, ok, err := parseMessageHead(DirectionResponse, data)
+	if err != nil || !ok || msg == nil {
+		return false
+	}
+	return msg.Chunked
+}
+
+func annotateParsedMessage(msg *ParsedMessage, stream *fragmentStream) {
+	if msg == nil {
+		return
+	}
+	if msg.BodySizeBytes == 0 {
+		msg.BodySizeBytes = len(msg.Body)
+	}
+	if stream == nil {
+		return
+	}
+	if stream.observedBytes > 0 {
+		msg.ObservedMessageBytes = stream.observedBytes
+		return
+	}
+	msg.ObservedMessageBytes = uint64(msg.ConsumedBytes)
 }
 
 func cloneTimePtr(ts *time.Time) *time.Time {
@@ -799,12 +869,20 @@ func (s *fragmentStream) consume(n int) {
 		return
 	}
 	s.buffer = append([]byte(nil), s.buffer[n:]...)
+	if s.observedBytes > uint64(n) {
+		s.observedBytes -= uint64(n)
+	} else {
+		s.observedBytes = 0
+	}
+	s.finalReady = false
 }
 
 func (s *fragmentStream) consumeAll() {
 	s.buffer = nil
 	s.firstTS = nil
+	s.observedBytes = 0
 	s.truncated = false
+	s.finalReady = false
 }
 
 func (d TraceDocument) SummaryLine() string {

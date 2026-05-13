@@ -1,0 +1,10 @@
+Package: power-httptrace
+Version: 1.0.0-1
+Architecture: amd64
+Maintainer: POWER <admin@local>
+Installed-Size: 6821
+Depends: bash, systemd, logrotate
+Section: utils
+Priority: optional
+Description: HTTP full-chain collector based on eBPF
+ power-httptrace is an eBPF-based HTTP request/response collector.

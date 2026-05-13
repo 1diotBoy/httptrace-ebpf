@@ -32,12 +32,13 @@ func main() {
 	flag.BoolVar(&cfg.DisableUserTuple, "disable-user-tuple", cfg.DisableUserTuple, "disable /proc tuple resolve and user-space tuple filter; keep kernel tuple in output when available")
 
 	// 采集规则配置
-	flag.IntVar(&cfg.CaptureBytes, "capture-bytes", cfg.CaptureBytes, "maximum payload bytes captured per request/response, values above 10KB are truncated")
+	flag.IntVar(&cfg.CaptureBytes, "capture-bytes", cfg.CaptureBytes, "maximum payload bytes captured per request/response in kernel, values above 32KB are truncated")
 	flag.IntVar(&cfg.PerfPages, "perf-pages", cfg.PerfPages, "perf buffer pages per CPU")
 	flag.IntVar(&cfg.BatchSize, "batch-size", cfg.BatchSize, "events parsed per worker batch")
 	flag.IntVar(&cfg.WorkerCount, "workers", cfg.WorkerCount, "number of parser workers")
+	flag.IntVar(&cfg.WorkerQueueSize, "worker-queue-size", cfg.WorkerQueueSize, "buffered parser events per worker, 0 auto-tunes for available memory")
 	flag.DurationVar(&cfg.TransactionTTL, "txn-ttl", cfg.TransactionTTL, "idle transaction eviction TTL")
-	flag.IntVar(&cfg.MaxMessageBytes, "max-message-bytes", cfg.MaxMessageBytes, "maximum reassembled bytes kept per request/response before truncation")
+	flag.IntVar(&cfg.MaxMessageBytes, "max-message-bytes", cfg.MaxMessageBytes, "maximum reassembled bytes kept per request/response; should stay aligned with kernel capture limit")
 
 	// 用户态日志配置
 	flag.DurationVar(&cfg.FlushInterval, "flush-interval", cfg.FlushInterval, "batch flush interval")
@@ -52,6 +53,7 @@ func main() {
 	// redis 相关配置
 	flag.IntVar(&cfg.RedisWorkers, "redis-workers", cfg.RedisWorkers, "number of async redis writer workers")
 	flag.IntVar(&cfg.RedisQueueSize, "redis-queue-size", cfg.RedisQueueSize, "buffered redis write queue size")
+	flag.IntVar(&cfg.RetryQueueSize, "retry-queue-size", cfg.RetryQueueSize, "buffered tuple retry queue size, 0 auto-tunes for available memory")
 	flag.StringVar(&cfg.RedisAddr, "redis-addr", cfg.RedisAddr, "redis address, empty disables redis write")
 	flag.StringVar(&cfg.RedisPassword, "redis-password", cfg.RedisPassword, "redis password")
 	flag.IntVar(&cfg.RedisDB, "redis-db", cfg.RedisDB, "redis DB index")

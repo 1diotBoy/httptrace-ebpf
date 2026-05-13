@@ -64,3 +64,70 @@ func TestRedisPasswordSM4Decrypt(t *testing.T) {
 	decryptStr, _ := SM4Decrypt(encryptStr)
 	fmt.Println(decryptStr)
 }
+
+func TestNormalizeRuntimeConfigClampsAggressiveDefaults(t *testing.T) {
+	cfg := Config{
+		CaptureBytes:    32 * 1024,
+		PerfPages:       1024,
+		BatchSize:       100,
+		WorkerCount:     64,
+		WorkerQueueSize: 6400,
+		RedisWorkers:    32,
+		RedisQueueSize:  32768,
+		RetryQueueSize:  32768,
+	}
+
+	got, plan := normalizeRuntimeConfig(cfg, 64, 512<<20, true)
+
+	if got.PerfPages != 32 {
+		t.Fatalf("perf pages not clamped: got %d want %d", got.PerfPages, 32)
+	}
+	if got.WorkerCount != 2 {
+		t.Fatalf("worker count not clamped: got %d want %d", got.WorkerCount, 2)
+	}
+	if got.WorkerQueueSize != 256 {
+		t.Fatalf("worker queue size not clamped: got %d want %d", got.WorkerQueueSize, 256)
+	}
+	if got.RedisWorkers != 1 {
+		t.Fatalf("redis workers not clamped: got %d want %d", got.RedisWorkers, 1)
+	}
+	if got.RedisQueueSize != 2048 {
+		t.Fatalf("redis queue size not clamped: got %d want %d", got.RedisQueueSize, 2048)
+	}
+	if got.RetryQueueSize != 1024 {
+		t.Fatalf("retry queue size not clamped: got %d want %d", got.RetryQueueSize, 1024)
+	}
+	if plan.PerfTotalBytes == 0 || plan.WorkerQueueBytes == 0 {
+		t.Fatalf("resource plan should include memory estimates: %#v", plan)
+	}
+}
+
+func TestNormalizeRuntimeConfigFillsAutoSizes(t *testing.T) {
+	cfg := Config{
+		CaptureBytes:    32 * 1024,
+		BatchSize:       64,
+		WorkerCount:     0,
+		WorkerQueueSize: 0,
+		RedisWorkers:    0,
+		RedisQueueSize:  0,
+		RetryQueueSize:  0,
+	}
+
+	got, _ := normalizeRuntimeConfig(cfg, 16, 3<<30, true)
+
+	if got.WorkerCount != 8 {
+		t.Fatalf("auto worker count mismatch: got %d want %d", got.WorkerCount, 8)
+	}
+	if got.WorkerQueueSize != 512 {
+		t.Fatalf("auto worker queue mismatch: got %d want %d", got.WorkerQueueSize, 512)
+	}
+	if got.RedisWorkers != 4 {
+		t.Fatalf("auto redis worker mismatch: got %d want %d", got.RedisWorkers, 4)
+	}
+	if got.RedisQueueSize != 4096 {
+		t.Fatalf("auto redis queue mismatch: got %d want %d", got.RedisQueueSize, 4096)
+	}
+	if got.RetryQueueSize != 2048 {
+		t.Fatalf("auto retry queue mismatch: got %d want %d", got.RetryQueueSize, 2048)
+	}
+}

@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+
+# systemd 服务生效
+if [ "$1" = "configure" ]; then
+    systemctl daemon-reload
+    systemctl enable power-httptrace.service
+fi
+
+# 创建日志目录
+mkdir -p /app/log/power-httptrace
+chmod 0755 /app/log/power-httptrace
+
+# 创建配置目录
+mkdir -p /etc/sysconfig/
+chmod 0644 /app/log/power-httptrace
+
+mv /etc/sysconfig/power-httptrace.sysconfig /etc/sysconfig/power-httptrace
+mv /etc/logrotate.d/power-httptrace.logrotate /etc/logrotate.d/power-httptrace
+
+
+
+
+exit 0

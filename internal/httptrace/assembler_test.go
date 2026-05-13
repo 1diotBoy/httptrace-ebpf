@@ -175,6 +175,7 @@ func TestAssemblerResyncsRequestAfterLeadingJunk(t *testing.T) {
 	}
 }
 
+// 测试下一个请求到达时，flush 部分响应, 并重新组装请求和响应, 确保响应和请求的完整性
 func TestAssemblerFlushesPartialResponseWhenNextRequestArrives(t *testing.T) {
 	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
 	now := time.Unix(1711717000, 0)
@@ -236,6 +237,7 @@ func TestAssemblerFlushesPartialResponseWhenNextRequestArrives(t *testing.T) {
 	for _, update := range updates {
 		if update.Kind == "response" {
 			sawResponse = true
+			// 部分响应应该被标记为截断
 			if !update.Trace.ResponseTruncated {
 				t.Fatalf("partial response should be marked truncated")
 			}
@@ -299,6 +301,158 @@ func TestAssemblerFlushesStalledPartialResponse(t *testing.T) {
 	}
 	if !flushed[0].Trace.ResponseTruncated || !flushed[0].Trace.Response.BodyPartial {
 		t.Fatalf("stalled flush should mark response partial/truncated")
+	}
+}
+
+func TestAssemblerWaitsLongerForChunkedResponse(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
+	now := time.Unix(1711717050, 0)
+
+	reqUpdates, err := asm.Process(Event{
+		Timestamp: now,
+		ChainID:   5002,
+		PID:       100,
+		FD:        13,
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+		SrcPort:   54000,
+		DstPort:   80,
+		FragIdx:   0,
+		Direction: DirectionRequest,
+		Payload:   []byte("GET /chunked HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+	})
+	if err != nil || len(reqUpdates) != 1 {
+		t.Fatalf("request emit failed: updates=%d err=%v", len(reqUpdates), err)
+	}
+
+	respUpdates, err := asm.Process(Event{
+		Timestamp: now.Add(10 * time.Millisecond),
+		ChainID:   5002,
+		PID:       100,
+		FD:        13,
+		SrcIP:     "10.0.0.2",
+		DstIP:     "10.0.0.1",
+		SrcPort:   80,
+		DstPort:   54000,
+		FragIdx:   0,
+		Direction: DirectionResponse,
+		Payload:   []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n"),
+	})
+	if err != nil {
+		t.Fatalf("response process failed: %v", err)
+	}
+	if len(respUpdates) != 0 {
+		t.Fatalf("partial chunked response should wait for more body, got %#v", respUpdates)
+	}
+
+	flushed := asm.FlushStalled(time.Now().Add(700 * time.Millisecond))
+	if len(flushed) != 0 {
+		t.Fatalf("chunked response should not be stalled-flushed too early, got %#v", flushed)
+	}
+
+	respUpdates, err = asm.Process(Event{
+		Timestamp: now.Add(800 * time.Millisecond),
+		ChainID:   5002,
+		PID:       100,
+		FD:        13,
+		SrcIP:     "10.0.0.2",
+		DstIP:     "10.0.0.1",
+		SrcPort:   80,
+		DstPort:   54000,
+		FragIdx:   1,
+		Direction: DirectionResponse,
+		Payload:   []byte("5\r\npedia\r\n0\r\n\r\n"),
+	})
+	if err != nil {
+		t.Fatalf("response completion failed: %v", err)
+	}
+	if len(respUpdates) != 1 || respUpdates[0].Kind != "response" {
+		t.Fatalf("expected one completed response update, got %#v", respUpdates)
+	}
+	if respUpdates[0].Trace.Response == nil {
+		t.Fatalf("expected parsed response")
+	}
+	if respUpdates[0].Trace.ResponseTruncated || respUpdates[0].Trace.Response.BodyPartial {
+		t.Fatalf("completed chunked response should not be marked partial/truncated")
+	}
+	if got, want := respUpdates[0].Trace.Response.Body, "Wikipedia"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+
+func TestAssemblerEmitsTruncatedResponseOnFinalSizeOnlyEvent(t *testing.T) {
+	asm := NewAssembler(32*1024, time.Minute, 500*time.Millisecond)
+	now := time.Unix(1711717060, 0)
+
+	reqUpdates, err := asm.Process(Event{
+		Timestamp: now,
+		ChainID:   5100,
+		PID:       100,
+		FD:        13,
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+		SrcPort:   54000,
+		DstPort:   80,
+		FragIdx:   0,
+		Direction: DirectionRequest,
+		Payload:   []byte("GET /large HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+	})
+	if err != nil || len(reqUpdates) != 1 {
+		t.Fatalf("request emit failed: updates=%d err=%v", len(reqUpdates), err)
+	}
+
+	respUpdates, err := asm.Process(Event{
+		Timestamp:            now.Add(10 * time.Millisecond),
+		ChainID:              5100,
+		PID:                  100,
+		FD:                   13,
+		SrcIP:                "10.0.0.2",
+		DstIP:                "10.0.0.1",
+		SrcPort:              80,
+		DstPort:              54000,
+		FragIdx:              0,
+		Direction:            DirectionResponse,
+		Flags:                eventFlagCaptureTrunc,
+		ObservedMessageBytes: 32 * 1024,
+		Payload:              []byte("HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nContent-Type: text/plain\r\n\r\nhello"),
+	})
+	if err != nil {
+		t.Fatalf("response process failed: %v", err)
+	}
+	if len(respUpdates) != 0 {
+		t.Fatalf("truncated response should wait for final size event, got %#v", respUpdates)
+	}
+
+	respUpdates, err = asm.Process(Event{
+		Timestamp:            now.Add(20 * time.Millisecond),
+		ChainID:              5100,
+		PID:                  100,
+		FD:                   13,
+		SrcIP:                "10.0.0.2",
+		DstIP:                "10.0.0.1",
+		SrcPort:              80,
+		DstPort:              54000,
+		Direction:            DirectionResponse,
+		Flags:                eventFlagSizeOnly | eventFlagEnd,
+		ObservedMessageBytes: 128 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("final size-only process failed: %v", err)
+	}
+	if len(respUpdates) != 1 || respUpdates[0].Kind != "response" {
+		t.Fatalf("expected one response update, got %#v", respUpdates)
+	}
+	if respUpdates[0].Trace.Response == nil {
+		t.Fatalf("expected response payload")
+	}
+	if !respUpdates[0].Trace.ResponseTruncated || !respUpdates[0].Trace.Response.BodyPartial {
+		t.Fatalf("response should be marked partial/truncated")
+	}
+	if got, want := respUpdates[0].Trace.Response.ObservedMessageBytes, uint64(128*1024); got != want {
+		t.Fatalf("observed bytes = %d, want %d", got, want)
+	}
+	if got, want := respUpdates[0].Trace.Response.Body, "hello"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
 	}
 }
 

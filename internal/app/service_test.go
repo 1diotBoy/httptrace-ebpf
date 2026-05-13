@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"power-ebpf/internal/bpfgen"
 	"power-ebpf/internal/httptrace"
 )
 
@@ -100,6 +101,38 @@ func TestDispatchEventPassesThroughMissingTupleRequest(t *testing.T) {
 	}
 }
 
+func TestDispatchEventPassesThroughMissingTupleWithIPFilter(t *testing.T) {
+	svc := &Service{
+		cfg:    DefaultConfig(),
+		filter: ResolvedFilter{DstIP: "192.168.4.161"},
+		stats:  &stats{},
+	}
+	ch := make(chan httptrace.Event, 1)
+	event := httptrace.Event{
+		ChainID:   2,
+		FD:        10,
+		Direction: httptrace.DirectionRequest,
+		SrcIP:     "0.0.0.0",
+		DstIP:     "0.0.0.0",
+		SrcPort:   0,
+		DstPort:   0,
+	}
+
+	if err := svc.dispatchEvent(context.Background(), event, ch); err != nil {
+		t.Fatalf("dispatchEvent returned error: %v", err)
+	}
+
+	select {
+	case <-ch:
+	default:
+		t.Fatalf("expected unresolved request to be passed through even with IP filter")
+	}
+
+	if svc.stats.userFiltered.Load() != 0 {
+		t.Fatalf("event should not be counted as filtered")
+	}
+}
+
 func TestDispatchEventPassesThroughLegacyExistingChainFragment(t *testing.T) {
 	svc := &Service{
 		cfg:       DefaultConfig(),
@@ -164,6 +197,27 @@ func TestResolveEventBypassesUserTuplePipeline(t *testing.T) {
 	}
 }
 
+func TestStartWorkersUsesResourceSizedQueue(t *testing.T) {
+	svc := &Service{
+		cfg:          Config{BatchSize: 100, WorkerCount: 2, WorkerQueueSize: 256, FlushInterval: time.Second},
+		assembler:    httptrace.NewAssembler(1<<20, time.Minute, 500*time.Millisecond),
+		stats:        &stats{},
+		resourcePlan: runtimeResourcePlan{WorkerCount: 2, WorkerQueueSize: 256},
+	}
+
+	workers, wg := svc.startWorkers(nil)
+	if len(workers) != 2 {
+		t.Fatalf("worker count mismatch: got %d want %d", len(workers), 2)
+	}
+	for _, ch := range workers {
+		if cap(ch) != 256 {
+			t.Fatalf("worker queue cap mismatch: got %d want %d", cap(ch), 256)
+		}
+		close(ch)
+	}
+	wg.Wait()
+}
+
 func TestSanitizeTraceForOutputKeepsKernelTuple(t *testing.T) {
 	svc := &Service{cfg: Config{DisableUserTuple: true}}
 	trace := httptrace.TraceDocument{
@@ -177,5 +231,23 @@ func TestSanitizeTraceForOutputKeepsKernelTuple(t *testing.T) {
 	got := svc.sanitizeTraceForOutput(trace)
 	if got.SrcIP != trace.SrcIP || got.DstIP != trace.DstIP || got.SrcPort != trace.SrcPort || got.DstPort != trace.DstPort {
 		t.Fatalf("kernel tuple fields should be preserved, got %#v want %#v", got, trace)
+	}
+}
+
+func TestNormalizeEventKeeps4096BytePayload(t *testing.T) {
+	var raw bpfgen.HttpTraceHttpEvent
+	raw.PayloadLen = uint16(len(raw.Payload))
+	raw.TotalLen = raw.PayloadLen
+	raw.Direction = httptrace.DirectionResponse
+	for i := range raw.Payload {
+		raw.Payload[i] = byte(i)
+	}
+
+	event := normalizeEvent(raw)
+	if got, want := len(event.Payload), len(raw.Payload); got != want {
+		t.Fatalf("payload length mismatch: got %d want %d", got, want)
+	}
+	if event.Payload[0] != raw.Payload[0] || event.Payload[len(event.Payload)-1] != raw.Payload[len(raw.Payload)-1] {
+		t.Fatalf("payload bytes were not preserved")
 	}
 }

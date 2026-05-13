@@ -413,6 +413,8 @@ static __always_inline void start_request_capture(struct flow_state *state, __u6
 	state->last_req_chain_id = chain_id;
 	state->req_frag_idx = 0;
 	state->req_capture_bytes = 0;
+	state->req_observed_bytes = 0;
+	state->req_reported_bytes = 0;
 	state->req_capture_stopped = 0;
 	state->req_active = 1;
 	push_pending_request(state, chain_id);
@@ -426,6 +428,8 @@ static __always_inline void start_response_capture(struct flow_state *state, __u
 	state->resp_chain_id = chain_id;
 	state->resp_frag_idx = 0;
 	state->resp_capture_bytes = 0;
+	state->resp_observed_bytes = 0;
+	state->resp_reported_bytes = 0;
 	state->resp_capture_stopped = 0;
 	state->resp_active = 1;
 	state->req_active = 0;
@@ -436,6 +440,104 @@ static __always_inline int read_msg_iter(struct msghdr_compat *msg, struct iov_i
 	if (!msg)
 		return -1;
 	return bpf_probe_read(iter, sizeof(*iter), &msg->msg_iter);
+}
+
+/* 6.x 起 iov_iter 布局和 4.x/5.15 有明显差异，尤其是 ITER_UBUF 把指针/count
+ * 放进了新的 overlay 里。这里统一把“当前 segment 的 base + 有效长度”规整出来，
+ * 让后面的 HTTP 前缀识别和 payload 切片逻辑尽量不感知具体内核版本。
+ */
+static __always_inline int load_iter_segment(const struct iov_iter_compat *iter, __u32 index,
+					     const char **base, __u64 *seg_len)
+{
+	struct iovec_compat iov = {};
+	struct kernel_stats *stats = stats_lookup();
+	__u64 skip = 0;
+
+	if (!iter || !base || !seg_len)
+		return -1;
+
+#ifdef IOV_ITER_LAYOUT_V6
+	if (iter->iter_type == ITER_UBUF_COMPAT) {
+		__u64 addr = 0;
+
+		if (stats)
+			stats->iter_ubuf += 1;
+		if (index != 0 || !iter->ubuf || !iter->count) {
+			if (stats)
+				stats->iter_load_fail += 1;
+			return -1;
+		}
+		addr = (__u64)iter->ubuf + iter->iov_offset;
+		*base = (const char *)addr;
+		*seg_len = iter->count;
+		return 0;
+	}
+
+	if (iter->iter_type == ITER_BVEC_COMPAT) {
+		if (stats)
+			stats->iter_bvec += 1;
+		return -1;
+	}
+	if (iter->iter_type != ITER_IOVEC_COMPAT && iter->iter_type != ITER_KVEC_COMPAT) {
+		if (stats)
+			stats->iter_unsupported += 1;
+		return -1;
+	}
+	if ((__u64)index >= iter->nr_segs) {
+		if (stats)
+			stats->iter_load_fail += 1;
+		return -1;
+	}
+	if (iter->iter_type == ITER_IOVEC_COMPAT) {
+		if (stats)
+			stats->iter_iovec += 1;
+		if (!iter->iov) {
+			if (stats)
+				stats->iter_load_fail += 1;
+			return -1;
+		}
+		if (bpf_probe_read(&iov, sizeof(iov), &iter->iov[index]) < 0) {
+			if (stats)
+				stats->iter_load_fail += 1;
+			return -1;
+		}
+	} else {
+		if (stats)
+			stats->iter_kvec += 1;
+		if (!iter->kvec) {
+			if (stats)
+				stats->iter_load_fail += 1;
+			return -1;
+		}
+		if (bpf_probe_read(&iov, sizeof(iov), &iter->kvec[index]) < 0) {
+			if (stats)
+				stats->iter_load_fail += 1;
+			return -1;
+		}
+	}
+#else
+	if (!iter->iov || (__u64)index >= iter->nr_segs) {
+		if (stats)
+			stats->iter_load_fail += 1;
+		return -1;
+	}
+	if (bpf_probe_read(&iov, sizeof(iov), &iter->iov[index]) < 0) {
+		if (stats)
+			stats->iter_load_fail += 1;
+		return -1;
+	}
+#endif
+
+	skip = index == 0 ? iter->iov_offset : 0;
+	if (skip > iov.iov_len) {
+		if (stats)
+			stats->iter_load_fail += 1;
+		return -1;
+	}
+
+	*base = (const char *)iov.iov_base + skip;
+	*seg_len = iov.iov_len - skip;
+	return 0;
 }
 
 static __always_inline int is_http_prefix_padding(char c)
@@ -467,7 +569,7 @@ static __always_inline __u32 trim_http_prefix_padding(const char *buf, __u32 len
 	return off;
 }
 
-#ifdef LEGACY_VERIFIER
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
 static __always_inline __u32 read_prefix_legacy_bytes(const char *base, __u64 skip, __u64 available, char *buf, __u32 buf_len)
 {
 	__u32 copied = 0;
@@ -513,63 +615,46 @@ static __always_inline __u32 read_prefix_legacy_bytes(const char *base, __u64 sk
 
 static __always_inline int read_prefix_from_iter(const struct iov_iter_compat *iter, char *buf, __u32 buf_len)
 {
-	struct iovec_compat iov0 = {};
-	struct iovec_compat iov1 = {};
 	struct kernel_stats *stats = stats_lookup();
-	__u64 skip = 0;
-	__u64 second_skip = 0;
+	const char *base0 = NULL;
+	const char *base1 = NULL;
+	__u64 seg_len0 = 0;
+	__u64 seg_len1 = 0;
 	__u64 available = 0;
 	__u32 copied = 0;
 
-	if (!iter || !iter->iov || !iter->nr_segs)
-		return 0;
-	if (bpf_probe_read(&iov0, sizeof(iov0), &iter->iov[0]) < 0)
+	if (load_iter_segment(iter, 0, &base0, &seg_len0) < 0 || !base0 || !seg_len0)
 		return 0;
 
-#ifdef LEGACY_VERIFIER
-	skip = iter->iov_offset;
-	if (skip < iov0.iov_len) {
-		available = iov0.iov_len - skip;
-		return read_prefix_legacy_bytes((const char *)iov0.iov_base, skip, available, buf, buf_len);
-	}
-	if (iter->nr_segs < 2)
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
+	available = seg_len0;
+	if (available)
+		return read_prefix_legacy_bytes(base0, 0, available, buf, buf_len);
+	if (load_iter_segment(iter, 1, &base1, &seg_len1) < 0 || !base1 || !seg_len1)
 		return 0;
-	if (bpf_probe_read(&iov1, sizeof(iov1), &iter->iov[1]) < 0)
-		return 0;
-	second_skip = skip - iov0.iov_len;
-	if (second_skip >= iov1.iov_len)
-		return 0;
-	available = iov1.iov_len - second_skip;
-	copied = read_prefix_legacy_bytes((const char *)iov1.iov_base, second_skip, available, buf, buf_len);
+	available = seg_len1;
+	copied = read_prefix_legacy_bytes(base1, 0, available, buf, buf_len);
 	if (copied > 0 && stats)
 		stats->prefix_second_iov += 1;
 	return copied;
 #else
-	skip = iter->iov_offset;
-	if (skip < iov0.iov_len) {
-		available = iov0.iov_len - skip;
-		if (available > buf_len)
-			available = buf_len;
-		if (available && bpf_probe_read(buf, available, (const char *)iov0.iov_base + skip) == 0)
-			copied = available;
-		second_skip = 0;
-	} else {
-		second_skip = skip - iov0.iov_len;
-	}
+	available = seg_len0;
+	if (available > buf_len)
+		available = buf_len;
+	if (available && bpf_probe_read(buf, available, base0) == 0)
+		copied = available;
 
-	if (copied >= buf_len || iter->nr_segs < 2)
+	if (copied >= buf_len)
 		return copied;
-	if (bpf_probe_read(&iov1, sizeof(iov1), &iter->iov[1]) < 0)
-		return copied;
-	if (second_skip >= iov1.iov_len)
+	if (load_iter_segment(iter, 1, &base1, &seg_len1) < 0 || !base1 || !seg_len1)
 		return copied;
 
-	available = iov1.iov_len - second_skip;
+	available = seg_len1;
 	if (available > buf_len - copied)
 		available = buf_len - copied;
 	if (!available)
 		return copied;
-	if (bpf_probe_read(buf + copied, available, (const char *)iov1.iov_base + second_skip) < 0)
+	if (bpf_probe_read(buf + copied, available, base1) < 0)
 		return copied;
 	if (stats)
 		stats->prefix_second_iov += 1;
@@ -758,7 +843,7 @@ static __attribute__((noinline)) int starts_with_http_response(const struct iov_
 	if (!iter)
 		return 0;
 	prefix_len = read_prefix_from_iter(iter, prefix, sizeof(prefix));
-#ifdef LEGACY_VERIFIER
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
 	return looks_like_http_response(prefix, prefix_len);
 #else
 	struct kernel_stats *stats = stats_lookup();
@@ -778,17 +863,29 @@ static __always_inline __u8 detect_http_direction(const char *buf, __u32 len)
 	return DIR_UNKNOWN;
 }
 
-static __always_inline __u32 pick_capture_limit(void)
+static __always_inline __u32 clamp_capture_limit(__u32 limit)
+{
+	if (!limit)
+		limit = DEFAULT_MESSAGE_LIMIT;
+	if (limit > DEFAULT_MESSAGE_LIMIT)
+		limit = DEFAULT_MESSAGE_LIMIT;
+	if (limit > MAX_CAPTURE_BYTES_PER_CALL)
+		return MAX_CAPTURE_BYTES_PER_CALL;
+	return limit;
+}
+
+static __always_inline __u32 pick_capture_limit(__u8 direction)
 {
 	struct filter_config cfg = {};
+	__u32 limit = DEFAULT_MESSAGE_LIMIT;
 
-	if (read_filter(&cfg) < 0 || !cfg.capture_bytes)
+	if (read_filter(&cfg) < 0)
 		return DEFAULT_MESSAGE_LIMIT;
-	if (cfg.capture_bytes > DEFAULT_MESSAGE_LIMIT)
-		cfg.capture_bytes = DEFAULT_MESSAGE_LIMIT;
-	if (cfg.capture_bytes > MAX_CAPTURE_BYTES_PER_CALL)
-		return MAX_CAPTURE_BYTES_PER_CALL;
-	return cfg.capture_bytes;
+	if (direction == DIR_RESPONSE)
+		limit = cfg.response_capture_bytes;
+	else
+		limit = cfg.request_capture_bytes;
+	return clamp_capture_limit(limit);
 }
 
 /* emit_control_event 上报 close 之类的控制事件，用户态收到后可以把“靠 EOF 结束”的响应收尾。 */
@@ -807,6 +904,7 @@ static __attribute__((noinline)) __attribute__((unused)) int emit_control_event(
 	event->chain_id = chain_id;
 	event->sock_id = sock_id;
 	event->seq_hint = meta ? meta->seq_hint : 0;
+	event->observed_message_bytes = 0;
 	event->pid = meta ? meta->pid : 0;
 	event->tid = meta ? meta->tid : 0;
 	event->fd = meta ? meta->fd : -1;
@@ -856,7 +954,7 @@ static __attribute__((noinline)) int emit_data_event(void *ctx, const struct cap
 	if (!event)
 		return -1;
 	/* 4.19 verifier 对 helper 的变长 size 参数非常敏感。
-	 * 这里直接用 “var &= const” 把长度硬限制到 0..1023，
+	 * 这里直接用 “var &= const” 把长度硬限制到 0..4095，
 	 * 避免 verifier 报 "R2 unbounded memory access"。
 	 */
 
@@ -864,6 +962,7 @@ static __attribute__((noinline)) int emit_data_event(void *ctx, const struct cap
 	event->chain_id = call->chain_id;
 	event->sock_id = call->meta->sock_id;
 	event->seq_hint = call->seq_hint;
+	event->observed_message_bytes = call->observed_message_bytes;
 	event->pid = call->meta->pid;
 	event->tid = call->meta->tid;
 	event->fd = call->meta->fd;
@@ -901,6 +1000,70 @@ static __attribute__((noinline)) int emit_data_event(void *ctx, const struct cap
 	return 0;
 }
 
+#ifndef LEGACY_VERIFIER
+static __attribute__((noinline)) int emit_size_final_event(void *ctx, const struct recv_args *meta,
+							   __u64 chain_id, __u8 direction,
+							   __u64 observed_bytes)
+{
+	struct http_event *event = NULL;
+	struct kernel_stats *stats = stats_lookup();
+	__u32 key = 0;
+
+	if (!meta || !chain_id)
+		return 0;
+
+	event = bpf_map_lookup_elem(&scratch_heap, &key);
+	if (!event)
+		return -1;
+
+	event->ts_ns = bpf_ktime_get_ns();
+	event->chain_id = chain_id;
+	event->sock_id = meta->sock_id;
+	event->seq_hint = meta->seq_hint;
+	event->observed_message_bytes = observed_bytes;
+	event->pid = meta->pid;
+	event->tid = meta->tid;
+	event->fd = meta->fd;
+	event->ifindex = meta->ifindex;
+	event->src_ip = meta->src_ip;
+	event->dst_ip = meta->dst_ip;
+	event->src_port = meta->src_port;
+	event->dst_port = meta->dst_port;
+	event->payload_len = 0;
+	event->total_len = 0;
+	event->frag_idx = 0;
+	event->direction = direction;
+	event->flags = EVT_FLAG_SIZE_ONLY + EVT_FLAG_END;
+	event->source = meta->source;
+	event->family = meta->family;
+	__builtin_memcpy(event->comm, meta->comm, sizeof(event->comm));
+
+	if (bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, event, sizeof(*event)) < 0) {
+		if (stats)
+			stats->perf_errors += 1;
+		return -1;
+	}
+
+	return 0;
+}
+
+static __always_inline int emit_final_size_if_needed(void *ctx, const struct recv_args *meta,
+						     __u64 chain_id, __u8 direction,
+						     __u64 observed_bytes,
+						     __u64 *reported_bytes, __u8 capture_stopped)
+{
+	if (!capture_stopped || !meta || !chain_id)
+		return 0;
+	if (reported_bytes && *reported_bytes == observed_bytes)
+		return 0;
+	if (emit_size_final_event(ctx, meta, chain_id, direction, observed_bytes) < 0)
+		return -1;
+	if (reported_bytes)
+		*reported_bytes = observed_bytes;
+	return 0;
+}
+#endif
+
 /* capture_message 负责把一个 sendmsg/recvmsg 调用切成多个 fragment 事件。
  * 每个 fragment 都带相同的 chain_id，用户态按 frag_idx 重组即可。
  */
@@ -919,9 +1082,9 @@ static __always_inline int emit_chunk_once(void *ctx, const struct capture_call 
 
 	chunk = *seg_len > MAX_PAYLOAD_SIZE ? MAX_PAYLOAD_SIZE : (__u32)*seg_len;
 	if (*frag_idx == *call->frag_cursor)
-		flags |= EVT_FLAG_START;
+		flags += EVT_FLAG_START;
 	if (*captured + chunk >= call->total_len || *total_captured + chunk >= capture_limit)
-		flags |= EVT_FLAG_END;
+		flags += EVT_FLAG_END;
 	frag_meta = ((__u32)flags << 16) | *frag_idx;
 	if (emit_data_event(ctx, call, *base, chunk, frag_meta) < 0)
 		return -1;
@@ -934,7 +1097,16 @@ static __always_inline int emit_chunk_once(void *ctx, const struct capture_call 
 	return 0;
 }
 
-#ifdef LEGACY_VERIFIER
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
+#define EMIT_CHUNK_LEGACY_ONCE()                      \
+	do {                                          \
+		if (emit_chunk_once_legacy(ctx, call, state) < 0) \
+			return -1;                        \
+	} while (0)
+#define EMIT_CHUNK_LEGACY_8() \
+	EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE(); \
+	EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE()
+
 struct legacy_capture_state {
 	const char *base;
 	__u64 seg_len;
@@ -957,71 +1129,42 @@ static __attribute__((noinline)) int emit_chunk_once_legacy(void *ctx,
 static __attribute__((noinline)) int capture_iov_slot0_legacy(void *ctx, struct capture_call *call,
 							      struct legacy_capture_state *state)
 {
-	struct iovec_compat iov = {};
-	__u64 seg_skip = 0;
-
-	if (!call->iter || !call->iter->iov || call->iter->nr_segs == 0)
+	if (!call->iter)
 		return 0;
 	if (state->captured >= call->total_len || state->total_captured >= state->capture_limit)
 		return 0;
-	if (bpf_probe_read(&iov, sizeof(iov), &call->iter->iov[0]) < 0)
+	if (load_iter_segment(call->iter, 0, &state->base, &state->seg_len) < 0)
+		return 0;
+	if (!state->base || state->seg_len == 0)
 		return 0;
 
-	seg_skip = call->iter->iov_offset;
-	if (seg_skip >= iov.iov_len)
-		return 0;
-
-	state->seg_len = iov.iov_len - seg_skip;
 	if (state->seg_len > call->total_len - state->captured)
 		state->seg_len = call->total_len - state->captured;
 	if (state->seg_len > state->capture_limit - state->total_captured)
 		state->seg_len = state->capture_limit - state->total_captured;
-	state->base = (const char *)iov.iov_base + seg_skip;
 
-	if (emit_chunk_once_legacy(ctx, call, state) < 0)
-		return -1;
-	if (emit_chunk_once_legacy(ctx, call, state) < 0)
-		return -1;
-	if (emit_chunk_once_legacy(ctx, call, state) < 0)
-		return -1;
-	if (emit_chunk_once_legacy(ctx, call, state) < 0)
-		return -1;
-	if (emit_chunk_once_legacy(ctx, call, state) < 0)
-		return -1;
+	EMIT_CHUNK_LEGACY_8();
 	return 0;
 }
 
 static __attribute__((noinline)) int capture_iov_slot1_legacy(void *ctx, struct capture_call *call,
 							      struct legacy_capture_state *state)
 {
-	struct iovec_compat iov = {};
-
-	if (!call->iter || !call->iter->iov || call->iter->nr_segs <= 1)
+	if (!call->iter)
 		return 0;
 	if (state->captured >= call->total_len || state->total_captured >= state->capture_limit)
 		return 0;
-	if (bpf_probe_read(&iov, sizeof(iov), &call->iter->iov[1]) < 0)
+	if (load_iter_segment(call->iter, 1, &state->base, &state->seg_len) < 0)
 		return 0;
-	if (iov.iov_len == 0)
+	if (!state->base || state->seg_len == 0)
 		return 0;
 
-	state->seg_len = iov.iov_len;
 	if (state->seg_len > call->total_len - state->captured)
 		state->seg_len = call->total_len - state->captured;
 	if (state->seg_len > state->capture_limit - state->total_captured)
 		state->seg_len = state->capture_limit - state->total_captured;
-	state->base = (const char *)iov.iov_base;
 
-	if (emit_chunk_once_legacy(ctx, call, state) < 0)
-		return -1;
-	if (emit_chunk_once_legacy(ctx, call, state) < 0)
-		return -1;
-	if (emit_chunk_once_legacy(ctx, call, state) < 0)
-		return -1;
-	if (emit_chunk_once_legacy(ctx, call, state) < 0)
-		return -1;
-	if (emit_chunk_once_legacy(ctx, call, state) < 0)
-		return -1;
+	EMIT_CHUNK_LEGACY_8();
 	return 0;
 }
 
@@ -1031,13 +1174,13 @@ static __attribute__((noinline)) int capture_iov_slot1_legacy(void *ctx, struct 
 static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct capture_call *call)
 {
 	struct kernel_stats *stats = stats_lookup();
-	__u32 capture_limit = pick_capture_limit();
+	__u32 capture_limit = pick_capture_limit(call->direction);
 	__u32 captured = 0;
 	__u32 total_captured = call->message_captured ? *call->message_captured : 0;
 	__u16 frag_idx = (__u16)*call->frag_cursor;
 	__u16 common_flags = call->base_flags;
 
-	if (!call->iter || !call->iter->iov || !call->iter->nr_segs)
+	if (!call->iter)
 		return 0;
 	if (call->capture_stopped && *call->capture_stopped)
 		return 0;
@@ -1047,7 +1190,7 @@ static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct
 		return 0;
 	}
 	if (total_captured + call->total_len > capture_limit) {
-		common_flags |= EVT_FLAG_CAPTURE_TRUNC;
+		common_flags += EVT_FLAG_CAPTURE_TRUNC;
 		if (stats && (!call->capture_stopped || !*call->capture_stopped))
 			stats->truncations += 1;
 	}
@@ -1080,7 +1223,7 @@ static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct
 static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct capture_call *call)
 {
 	struct kernel_stats *stats = stats_lookup();
-	__u32 capture_limit = pick_capture_limit();
+	__u32 capture_limit = pick_capture_limit(call->direction);
 	__u32 captured = 0;
 	__u32 total_captured = call->message_captured ? *call->message_captured : 0;
 	__u16 frag_idx = (__u16)*call->frag_cursor;
@@ -1096,33 +1239,27 @@ static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct
 		return 0;
 	}
 	if (total_captured + call->total_len > capture_limit) {
-		common_flags |= EVT_FLAG_CAPTURE_TRUNC;
+		common_flags += EVT_FLAG_CAPTURE_TRUNC;
 		if (stats && (!call->capture_stopped || !*call->capture_stopped))
 			stats->truncations += 1;
 	}
 
 #pragma unroll
 	for (int i = 0; i < MAX_IOVECS; i++) {
-		struct iovec_compat iov = {};
 		__u64 seg_len;
-		__u64 seg_skip;
 		const char *base;
 
-		if ((__u64)i >= call->iter->nr_segs || captured >= call->total_len || total_captured >= capture_limit)
+		if (captured >= call->total_len || total_captured >= capture_limit)
 			break;
-		if (bpf_probe_read(&iov, sizeof(iov), &call->iter->iov[i]) < 0)
+		if (load_iter_segment(call->iter, i, &base, &seg_len) < 0)
 			break;
-
-		seg_skip = i == 0 ? call->iter->iov_offset : 0;
-		if (seg_skip >= iov.iov_len)
+		if (!base || seg_len == 0)
 			continue;
 
-		seg_len = iov.iov_len - seg_skip;
 		if (seg_len > call->total_len - captured)
 			seg_len = call->total_len - captured;
 		if (seg_len > capture_limit - total_captured)
 			seg_len = capture_limit - total_captured;
-		base = (const char *)iov.iov_base + seg_skip;
 
 #pragma unroll
 		for (int j = 0; j < MAX_CHUNKS_PER_IOV; j++) {
@@ -1160,6 +1297,7 @@ static __attribute__((noinline)) int capture_response_message(void *ctx,
 	call.meta = meta;
 	call.chain_id = state->resp_chain_id;
 	call.seq_hint = meta->seq_hint;
+	call.observed_message_bytes = state->resp_observed_bytes;
 	call.frag_cursor = &state->resp_frag_idx;
 	call.message_captured = &state->resp_capture_bytes;
 	call.capture_stopped = &state->resp_capture_stopped;
@@ -1295,7 +1433,8 @@ static __attribute__((noinline)) __u64 prepare_send_scratch(struct sock_compat *
 
 // 响应链起点判断，如果请求链路已经存在，并且有 pending 请求，则优先从队首取新的 chain_id。
 static __attribute__((noinline)) __u64 select_response_chain(struct flow_state *state,
-							     const struct iov_iter_compat *iter)
+							     const struct iov_iter_compat *iter,
+							     int *started_new_response)
 {
 	struct kernel_stats *stats = stats_lookup();
 	__u64 chain_id = 0;
@@ -1304,6 +1443,8 @@ static __attribute__((noinline)) __u64 select_response_chain(struct flow_state *
 
 	if (!state)
 		return 0;
+	if (started_new_response)
+		*started_new_response = 0;
 
 	/* keep-alive 连接上，下一条 request 可能已经在 recv 路径里起链了，
 	 * 但对应 response 的第一段 send 不一定总是从 "HTTP/1.1" 开头开始。
@@ -1324,12 +1465,13 @@ static __attribute__((noinline)) __u64 select_response_chain(struct flow_state *
 				stats->send_no_req_chain += 1;
 			return 0;
 		}
-		start_response_capture(state, chain_id);
 		if (stats) {
 			stats->send_resp_start += 1;
 			if (req_active_start)
 				stats->send_resp_reqactive += 1;
 		}
+		if (started_new_response)
+			*started_new_response = 1;
 		return chain_id;
 	}
 
@@ -1377,7 +1519,7 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 	seq_hint = state->rx_cursor;
 
 	prefix_len = read_prefix_from_iter(&meta->saved_iter, prefix, sizeof(prefix));
-#ifdef LEGACY_VERIFIER
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
 	direction = detect_http_direction(prefix, prefix_len);
 	if (direction == DIR_UNKNOWN && looks_like_http_request_prefix(prefix, prefix_len))
 		direction = DIR_REQUEST;
@@ -1395,14 +1537,16 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 			stats->recv_dir_request += 1;
 		chain_id = next_chain_id(state);
 		start_request_capture(state, chain_id);
+		state->req_observed_bytes += ret;
 	} else if (direction == DIR_RESPONSE) {
 		if (stats)
 			stats->recv_dir_response += 1;
 		goto cleanup;
-	} else if (state->req_active && state->last_req_chain_id && !state->req_capture_stopped) {
+	} else if (state->req_active && state->last_req_chain_id) {
 		if (stats)
 			stats->recv_dir_unknown += 1;
 		chain_id = state->last_req_chain_id;
+		state->req_observed_bytes += ret;
 		flags = 0;
 	} else {
 		if (stats)
@@ -1411,13 +1555,14 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 	}
 
 	emit_meta.seq_hint = seq_hint;
-	{
+	if (!state->req_capture_stopped) {
 		struct capture_call call = {};
 
 		call.iter = &meta->saved_iter;
 		call.meta = &emit_meta;
 		call.chain_id = chain_id;
 		call.seq_hint = seq_hint;
+		call.observed_message_bytes = state->req_observed_bytes;
 		call.frag_cursor = &state->req_frag_idx;
 		call.message_captured = &state->req_capture_bytes;
 		call.capture_stopped = &state->req_capture_stopped;
@@ -1427,7 +1572,6 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 		call.source = emit_meta.source;
 		capture_message_from_iter(ctx, &call);
 	}
-
 cleanup:
 	bpf_map_delete_elem(&recv_args_map, &pid_tgid);
 	return 0;
@@ -1443,6 +1587,7 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 	__u32 key = 0;
 	__u64 sock_id = 0;
 	__u64 chain_id = 0;
+	int started_new_response = 0;
 
 	if (stats)
 		stats->send_calls += 1;
@@ -1460,15 +1605,19 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 
 	state->tx_cursor += scratch->iter.count;
 	scratch->meta.seq_hint = state->tx_cursor;
-	chain_id = select_response_chain(state, &scratch->iter);
+	chain_id = select_response_chain(state, &scratch->iter, &started_new_response);
 	if (!chain_id)
 		return 0;
 	if (!claim_send_guard(bpf_get_current_pid_tgid(), msg, source))
 		return 0;
 
+	if (started_new_response)
+		start_response_capture(state, chain_id);
+
+	state->resp_observed_bytes += scratch->iter.count;
+
 	if (capture_response_message(ctx, &scratch->iter, &scratch->meta, state, source) < 0)
 		return 0;
-
 	return 0;
 }
 
@@ -1679,15 +1828,21 @@ int BPF_KRETPROBE(kretprobe_inet_csk_accept)
 SEC("kprobe/sock_sendmsg")
 int BPF_KPROBE(kprobe_sock_sendmsg, void *sock_ptr, struct msghdr_compat *msg)
 {
+	struct kernel_stats *stats = stats_lookup();
+
+	if (stats)
+		stats->sock_send_hits += 1;
+#ifdef LEGACY_VERIFIER
 	struct sock_compat *sk = NULL;
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = consume_fd(pid_tgid, &send_fd_map);
-	struct kernel_stats *stats = stats_lookup();
-	if (stats)
-		stats->sock_send_hits += 1;
 	if (extract_sk(sock_ptr, &sk) < 0)
 		return 0;
 	return handle_send_entry(ctx, sk, msg, fd, SRC_SOCK_SENDMSG);
+#else
+	/* modern 对象上这条 hook 在部分内核 verifier 非常不稳定，发送采集统一走 tcp_sendmsg。 */
+	return 0;
+#endif
 }
 
 SEC("kprobe/tcp_sendmsg")
@@ -1697,13 +1852,16 @@ SEC("kprobe/tcp_sendmsg")
  */
 int BPF_KPROBE(kprobe_tcp_sendmsg, struct sock_compat *sk, struct msghdr_compat *msg)
 {
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	__s32 fd = consume_fd(pid_tgid, &send_fd_map);
 	struct kernel_stats *stats = stats_lookup();
 	if (stats)
 		stats->tcp_send_hits += 1;
-
+#ifdef LEGACY_VERIFIER
+	return 0;
+#else
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__s32 fd = consume_fd(pid_tgid, &send_fd_map);
 	return handle_send_entry(ctx, sk, msg, fd, SRC_TCP_SENDMSG);
+#endif
 }
 
 SEC("kprobe/sock_recvmsg")
@@ -1742,19 +1900,26 @@ int BPF_KPROBE(kprobe_tcp_recvmsg, struct sock_compat *sk, struct msghdr_compat 
 SEC("kretprobe/sock_recvmsg")
 int BPF_KRETPROBE(kretprobe_sock_recvmsg)
 {
+#ifdef LEGACY_VERIFIER
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s64 ret = PT_REGS_RC(ctx);
-
 	return handle_recv_return(ctx, pid_tgid, ret);
+#else
+	/* modern 对象上优先依赖 tcp_recvmsg 这条更稳定的 hook 完成实际读取。 */
+	return 0;
+#endif
 }
 
 SEC("kretprobe/tcp_recvmsg")
 int BPF_KRETPROBE(kretprobe_tcp_recvmsg)
 {
+#ifdef LEGACY_VERIFIER
+	return 0;
+#else
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s64 ret = PT_REGS_RC(ctx);
-
 	return handle_recv_return(ctx, pid_tgid, ret);
+#endif
 }
 
 /* tcp_close 上报 close 控制事件，帮助用户态在 keep-alive/connection: close 场景下做最终收尾。 */
@@ -1784,6 +1949,17 @@ int BPF_KPROBE(kprobe_tcp_close, struct sock_compat *sk)
 		bpf_map_delete_elem(&tuple_cache, &sock_id);
 		return 0;
 	}
+
+	if (emit_final_size_if_needed(ctx, &meta, state->last_req_chain_id, DIR_REQUEST,
+				     state->req_observed_bytes,
+				     &state->req_reported_bytes,
+				     state->req_capture_stopped) < 0)
+		return 0;
+	if (emit_final_size_if_needed(ctx, &meta, state->resp_chain_id, DIR_RESPONSE,
+				     state->resp_observed_bytes,
+				     &state->resp_reported_bytes,
+				     state->resp_capture_stopped) < 0)
+		return 0;
 
 	chain_id = state->last_req_chain_id;
 	emit_control_event(ctx, &meta, chain_id, sock_id, EVT_FLAG_CLOSE);

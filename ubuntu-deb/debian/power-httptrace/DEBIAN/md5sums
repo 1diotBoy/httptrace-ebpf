@@ -1,0 +1,3 @@
+3d22b95bada424854da7e8e531be2f43  app/soft/power-httptrace/bin/httptrace
+9ab6bcf9cf7797bba0d43cc5d60a2f1c  lib/systemd/system/power-httptrace.service
+4e82d39d4ff552809118d7c2ca649ab5  usr/share/doc/power-httptrace/changelog.Debian.gz
