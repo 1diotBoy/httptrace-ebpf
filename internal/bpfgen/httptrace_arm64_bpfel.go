@@ -81,18 +81,19 @@ type HttpTraceProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type HttpTraceMapSpecs struct {
-	ConnectArgsMap *ebpf.MapSpec `ebpf:"connect_args_map"`
-	Events         *ebpf.MapSpec `ebpf:"events"`
-	FilterMap      *ebpf.MapSpec `ebpf:"filter_map"`
-	FlowMap        *ebpf.MapSpec `ebpf:"flow_map"`
-	KernelStatsMap *ebpf.MapSpec `ebpf:"kernel_stats_map"`
-	RecvArgsMap    *ebpf.MapSpec `ebpf:"recv_args_map"`
-	RecvFdMap      *ebpf.MapSpec `ebpf:"recv_fd_map"`
-	ScratchHeap    *ebpf.MapSpec `ebpf:"scratch_heap"`
-	SendFdMap      *ebpf.MapSpec `ebpf:"send_fd_map"`
-	SendGuardMap   *ebpf.MapSpec `ebpf:"send_guard_map"`
-	SendScratchMap *ebpf.MapSpec `ebpf:"send_scratch_map"`
-	TupleCache     *ebpf.MapSpec `ebpf:"tuple_cache"`
+	ConnectArgsMap   *ebpf.MapSpec `ebpf:"connect_args_map"`
+	DebugSnapshotMap *ebpf.MapSpec `ebpf:"debug_snapshot_map"`
+	Events           *ebpf.MapSpec `ebpf:"events"`
+	FilterMap        *ebpf.MapSpec `ebpf:"filter_map"`
+	FlowMap          *ebpf.MapSpec `ebpf:"flow_map"`
+	KernelStatsMap   *ebpf.MapSpec `ebpf:"kernel_stats_map"`
+	RecvArgsMap      *ebpf.MapSpec `ebpf:"recv_args_map"`
+	RecvFdMap        *ebpf.MapSpec `ebpf:"recv_fd_map"`
+	ScratchHeap      *ebpf.MapSpec `ebpf:"scratch_heap"`
+	SendFdMap        *ebpf.MapSpec `ebpf:"send_fd_map"`
+	SendGuardMap     *ebpf.MapSpec `ebpf:"send_guard_map"`
+	SendScratchMap   *ebpf.MapSpec `ebpf:"send_scratch_map"`
+	TupleCache       *ebpf.MapSpec `ebpf:"tuple_cache"`
 }
 
 // HttpTraceVariableSpecs contains global variables before they are loaded into the kernel.
@@ -121,23 +122,25 @@ func (o *HttpTraceObjects) Close() error {
 //
 // It can be passed to LoadHttpTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type HttpTraceMaps struct {
-	ConnectArgsMap *ebpf.Map `ebpf:"connect_args_map"`
-	Events         *ebpf.Map `ebpf:"events"`
-	FilterMap      *ebpf.Map `ebpf:"filter_map"`
-	FlowMap        *ebpf.Map `ebpf:"flow_map"`
-	KernelStatsMap *ebpf.Map `ebpf:"kernel_stats_map"`
-	RecvArgsMap    *ebpf.Map `ebpf:"recv_args_map"`
-	RecvFdMap      *ebpf.Map `ebpf:"recv_fd_map"`
-	ScratchHeap    *ebpf.Map `ebpf:"scratch_heap"`
-	SendFdMap      *ebpf.Map `ebpf:"send_fd_map"`
-	SendGuardMap   *ebpf.Map `ebpf:"send_guard_map"`
-	SendScratchMap *ebpf.Map `ebpf:"send_scratch_map"`
-	TupleCache     *ebpf.Map `ebpf:"tuple_cache"`
+	ConnectArgsMap   *ebpf.Map `ebpf:"connect_args_map"`
+	DebugSnapshotMap *ebpf.Map `ebpf:"debug_snapshot_map"`
+	Events           *ebpf.Map `ebpf:"events"`
+	FilterMap        *ebpf.Map `ebpf:"filter_map"`
+	FlowMap          *ebpf.Map `ebpf:"flow_map"`
+	KernelStatsMap   *ebpf.Map `ebpf:"kernel_stats_map"`
+	RecvArgsMap      *ebpf.Map `ebpf:"recv_args_map"`
+	RecvFdMap        *ebpf.Map `ebpf:"recv_fd_map"`
+	ScratchHeap      *ebpf.Map `ebpf:"scratch_heap"`
+	SendFdMap        *ebpf.Map `ebpf:"send_fd_map"`
+	SendGuardMap     *ebpf.Map `ebpf:"send_guard_map"`
+	SendScratchMap   *ebpf.Map `ebpf:"send_scratch_map"`
+	TupleCache       *ebpf.Map `ebpf:"tuple_cache"`
 }
 
 func (m *HttpTraceMaps) Close() error {
 	return _HttpTraceClose(
 		m.ConnectArgsMap,
+		m.DebugSnapshotMap,
 		m.Events,
 		m.FilterMap,
 		m.FlowMap,

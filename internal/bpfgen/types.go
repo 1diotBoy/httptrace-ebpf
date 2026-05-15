@@ -8,6 +8,7 @@ type HttpTraceFilterConfig struct {
 	DstPort              uint16
 	RequestCaptureBytes  uint32
 	ResponseCaptureBytes uint32
+	DebugFlags           uint32
 }
 
 type HttpTraceHttpEvent struct {
@@ -78,4 +79,36 @@ type HttpTraceKernelStats struct {
 	IterBvec              uint64
 	IterUnsupported       uint64
 	IterLoadFail          uint64
+}
+
+type HttpTraceDebugSnapshot struct {
+	Seq                uint64
+	TsNs               uint64
+	PidTgid            uint64
+	SockId             uint64
+	MsgPtr             uint64
+	ChainId            uint64
+	IterCount          uint64
+	IterNrSegs         uint64
+	IterIovOffset      uint64
+	IterVecPtr         uint64
+	Seg0Base           uint64
+	Seg0Len            uint64
+	Seg1Base           uint64
+	Seg1Len            uint64
+	Fd                 int32
+	PendingCount       uint32
+	Source             uint8
+	Stage              uint8
+	ReqActive          uint8
+	RespActive         uint8
+	IterType           uint8
+	StartedNewResponse uint8
+	LoadSeg0Rc         uint8
+	LoadSeg1Rc         uint8
+	PrefixLen          uint8
+	Pad0               [3]uint8
+	Prefix             [16]byte
+	MsgRaw             [64]byte
+	IterRaw            [64]byte
 }

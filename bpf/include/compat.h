@@ -53,6 +53,7 @@
 #define MAX_CHUNKS_PER_IOV 8
 #define MAX_FRAGMENTS (MAX_IOVECS * MAX_CHUNKS_PER_IOV)
 #define MAX_CAPTURE_BYTES_PER_CALL (MAX_PAYLOAD_SIZE * MAX_FRAGMENTS)
+#define DEBUG_SNAPSHOT_RAW_BYTES 64
 /* 4.19 verifier 对带循环/变量索引的队列实现非常敏感。
  * 这里把待响应请求队列固定成 4 个槽位，后面用纯分支赋值实现，
  * 避免生成任何 back-edge。
@@ -89,7 +90,48 @@ struct iovec_compat {
 	__u64 iov_len;
 };
 
-#ifdef IOV_ITER_LAYOUT_V6
+// 适配6.6内核
+#if defined(IOV_ITER_LAYOUT_V66)
+enum iter_type_compat {
+	ITER_IOVEC_COMPAT = 0,
+	ITER_KVEC_COMPAT = 1,
+	ITER_BVEC_COMPAT = 2,
+	ITER_XARRAY_COMPAT = 3,
+	ITER_DISCARD_COMPAT = 4,
+	ITER_UBUF_COMPAT = 5,
+};
+
+struct iov_iter_compat {
+	__u8 iter_type;
+	__u8 copy_mc;
+	__u8 nofault;
+	__u8 data_source;
+	__u8 user_backed;
+	__u8 pad0[3];
+	union {
+		__u64 iov_offset;
+		__s32 last_offset;
+	};
+	union {
+		struct iovec_compat __ubuf_iovec;
+		struct {
+			union {
+				const struct iovec_compat *iov;
+				const struct iovec_compat *kvec;
+				const void *bvec;
+				const void *xarray;
+				void *ubuf;
+			};
+			__u64 count;
+		};
+	};
+	union {
+		unsigned long nr_segs;
+		__u64 xarray_start;
+	};
+};
+// 适配6.8内核
+#elif defined(IOV_ITER_LAYOUT_V6)
 enum iter_type_compat {
 	ITER_UBUF_COMPAT = 0,
 	ITER_IOVEC_COMPAT = 1,
@@ -205,6 +247,7 @@ struct filter_config {
 	__u16 dst_port;
 	__u32 request_capture_bytes;
 	__u32 response_capture_bytes;
+	__u32 debug_flags;
 };
 
 struct tuple_cache_entry {
@@ -314,6 +357,39 @@ struct http_event {
 	unsigned char payload[EVENT_PAYLOAD_SIZE];
 };
 
+struct debug_snapshot {
+	__u64 seq;
+	__u64 ts_ns;
+	__u64 pid_tgid;
+	__u64 sock_id;
+	__u64 msg_ptr;
+	__u64 chain_id;
+	__u64 iter_count;
+	__u64 iter_nr_segs;
+	__u64 iter_iov_offset;
+	__u64 iter_vec_ptr;
+	__u64 seg0_base;
+	__u64 seg0_len;
+	__u64 seg1_base;
+	__u64 seg1_len;
+	__s32 fd;
+	__u32 pending_count;
+	__u8 source;
+	__u8 stage;
+	__u8 req_active;
+	__u8 resp_active;
+	__u8 iter_type;
+	__u8 started_new_response;
+	__u8 load_seg0_rc;
+	__u8 load_seg1_rc;
+	__u8 prefix_len;
+	__u8 pad0[3];
+	char prefix[16];
+	unsigned char msg_raw[DEBUG_SNAPSHOT_RAW_BYTES];
+	unsigned char iter_raw[DEBUG_SNAPSHOT_RAW_BYTES];
+};
+
+// 打印内核采集日志
 struct kernel_stats {
 	__u64 send_calls;
 	__u64 recv_calls;

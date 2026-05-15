@@ -29,8 +29,10 @@ func (c collectionCloser) Close() error {
 type HookStrategy string
 
 const (
-	HookStrategyLegacySock HookStrategy = "legacy-sock"
-	HookStrategyTCPOnly    HookStrategy = "tcp-only"
+	HookStrategyLegacySock    HookStrategy = "legacy-sock"
+	HookStrategyLegacyTCPSend HookStrategy = "legacy-tcp-send"
+	HookStrategyLegacyTCPBoth HookStrategy = "legacy-tcp-both"
+	HookStrategyTCPOnly       HookStrategy = "tcp-only"
 )
 
 const objectVariantEnv = "POWER_EBPF_OBJECT_VARIANT"
@@ -53,9 +55,10 @@ type LoadedObjects struct {
 	Variant      string
 	HookStrategy HookStrategy
 
-	Events         *ebpf.Map
-	FilterMap      *ebpf.Map
-	KernelStatsMap *ebpf.Map
+	Events           *ebpf.Map
+	FilterMap        *ebpf.Map
+	KernelStatsMap   *ebpf.Map
+	DebugSnapshotMap *ebpf.Map
 
 	KprobeSockRecvmsg      *ebpf.Program
 	KprobeSockSendmsg      *ebpf.Program
@@ -130,6 +133,7 @@ func loadModernObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
 		Events:                         raw.Events,
 		FilterMap:                      raw.FilterMap,
 		KernelStatsMap:                 raw.KernelStatsMap,
+		DebugSnapshotMap:               raw.DebugSnapshotMap,
 		KprobeSockRecvmsg:              raw.KprobeSockRecvmsg,
 		KprobeSockSendmsg:              raw.KprobeSockSendmsg,
 		KprobeTcpClose:                 raw.KprobeTcpClose,
@@ -167,6 +171,83 @@ func loadLegacyObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
 		Events:                         raw.Events,
 		FilterMap:                      raw.FilterMap,
 		KernelStatsMap:                 raw.KernelStatsMap,
+		DebugSnapshotMap:               raw.DebugSnapshotMap,
+		KprobeSockRecvmsg:              raw.KprobeSockRecvmsg,
+		KprobeSockSendmsg:              raw.KprobeSockSendmsg,
+		KprobeTcpClose:                 raw.KprobeTcpClose,
+		KprobeTcpRecvmsg:               raw.KprobeTcpRecvmsg,
+		KprobeTcpSendmsg:               raw.KprobeTcpSendmsg,
+		KprobeTcpV4Connect:             raw.KprobeTcpV4Connect,
+		KretprobeTcpV4Connect:          raw.KretprobeTcpV4Connect,
+		KprobeTcpV6Connect:             raw.KprobeTcpV6Connect,
+		KretprobeTcpV6Connect:          raw.KretprobeTcpV6Connect,
+		KretprobeInetCskAccept:         raw.KretprobeInetCskAccept,
+		KretprobeSockRecvmsg:           raw.KretprobeSockRecvmsg,
+		KretprobeTcpRecvmsg:            raw.KretprobeTcpRecvmsg,
+		TracepointSockInetSockSetState: raw.TracepointSockInetSockSetState,
+		TracepointSysEnterRead:         raw.TracepointSysEnterRead,
+		TracepointSysEnterReadv:        raw.TracepointSysEnterReadv,
+		TracepointSysEnterRecvfrom:     raw.TracepointSysEnterRecvfrom,
+		TracepointSysEnterRecvmsg:      raw.TracepointSysEnterRecvmsg,
+		TracepointSysEnterSendmsg:      raw.TracepointSysEnterSendmsg,
+		TracepointSysEnterSendto:       raw.TracepointSysEnterSendto,
+		TracepointSysEnterWrite:        raw.TracepointSysEnterWrite,
+		TracepointSysEnterWritev:       raw.TracepointSysEnterWritev,
+		closer:                         &raw,
+	}, nil
+}
+
+func loadLegacyTCPSendObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
+	var raw HttpTraceLegacyObjects
+
+	if err := LoadHttpTraceLegacyObjects(&raw, opts); err != nil {
+		return nil, err
+	}
+	return &LoadedObjects{
+		Variant:                        "legacy-4.x-tcp-send",
+		HookStrategy:                   HookStrategyLegacyTCPSend,
+		Events:                         raw.Events,
+		FilterMap:                      raw.FilterMap,
+		KernelStatsMap:                 raw.KernelStatsMap,
+		DebugSnapshotMap:               raw.DebugSnapshotMap,
+		KprobeSockRecvmsg:              raw.KprobeSockRecvmsg,
+		KprobeSockSendmsg:              raw.KprobeSockSendmsg,
+		KprobeTcpClose:                 raw.KprobeTcpClose,
+		KprobeTcpRecvmsg:               raw.KprobeTcpRecvmsg,
+		KprobeTcpSendmsg:               raw.KprobeTcpSendmsg,
+		KprobeTcpV4Connect:             raw.KprobeTcpV4Connect,
+		KretprobeTcpV4Connect:          raw.KretprobeTcpV4Connect,
+		KprobeTcpV6Connect:             raw.KprobeTcpV6Connect,
+		KretprobeTcpV6Connect:          raw.KretprobeTcpV6Connect,
+		KretprobeInetCskAccept:         raw.KretprobeInetCskAccept,
+		KretprobeSockRecvmsg:           raw.KretprobeSockRecvmsg,
+		KretprobeTcpRecvmsg:            raw.KretprobeTcpRecvmsg,
+		TracepointSockInetSockSetState: raw.TracepointSockInetSockSetState,
+		TracepointSysEnterRead:         raw.TracepointSysEnterRead,
+		TracepointSysEnterReadv:        raw.TracepointSysEnterReadv,
+		TracepointSysEnterRecvfrom:     raw.TracepointSysEnterRecvfrom,
+		TracepointSysEnterRecvmsg:      raw.TracepointSysEnterRecvmsg,
+		TracepointSysEnterSendmsg:      raw.TracepointSysEnterSendmsg,
+		TracepointSysEnterSendto:       raw.TracepointSysEnterSendto,
+		TracepointSysEnterWrite:        raw.TracepointSysEnterWrite,
+		TracepointSysEnterWritev:       raw.TracepointSysEnterWritev,
+		closer:                         &raw,
+	}, nil
+}
+
+func loadLegacyTCPBothObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
+	var raw HttpTraceLegacyObjects
+
+	if err := LoadHttpTraceLegacyObjects(&raw, opts); err != nil {
+		return nil, err
+	}
+	return &LoadedObjects{
+		Variant:                        "legacy-4.x-tcp-both",
+		HookStrategy:                   HookStrategyLegacyTCPBoth,
+		Events:                         raw.Events,
+		FilterMap:                      raw.FilterMap,
+		KernelStatsMap:                 raw.KernelStatsMap,
+		DebugSnapshotMap:               raw.DebugSnapshotMap,
 		KprobeSockRecvmsg:              raw.KprobeSockRecvmsg,
 		KprobeSockSendmsg:              raw.KprobeSockSendmsg,
 		KprobeTcpClose:                 raw.KprobeTcpClose,
@@ -216,12 +297,28 @@ func loadTCPOnlyV6Objects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) 
 	return loadTCPOnlyCollectionSpec(spec, opts, "tcp-6.x")
 }
 
+func loadTCPOnlyV66Objects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
+	spec, err := LoadHttpTraceV66()
+	if err != nil {
+		return nil, err
+	}
+	return loadTCPOnlyCollectionSpec(spec, opts, "tcp-6.6")
+}
+
 func loadTCPOnlyV6CompactObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
 	spec, err := LoadHttpTraceV6Compact()
 	if err != nil {
 		return nil, err
 	}
 	return loadTCPOnlyCollectionSpec(spec, opts, "tcp-6.x-compact")
+}
+
+func loadTCPOnlyV66CompactObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
+	spec, err := LoadHttpTraceV66Compact()
+	if err != nil {
+		return nil, err
+	}
+	return loadTCPOnlyCollectionSpec(spec, opts, "tcp-6.6-compact")
 }
 
 func loadTCPOnlyCollectionSpec(spec *ebpf.CollectionSpec, opts *ebpf.CollectionOptions, variant string) (*LoadedObjects, error) {
@@ -290,12 +387,34 @@ func chooseVariantPlans(version kernelVersion) []variantPlan {
 	}
 
 	if version.Major == 4 {
+		if preferLegacyTCPBoth(version.Release) {
+			return []variantPlan{
+				{Name: "legacy-4.x-tcp-both", HookStrategy: HookStrategyLegacyTCPBoth, Load: loadLegacyTCPBothObjects},
+				{Name: "legacy-4.x-tcp-send", HookStrategy: HookStrategyLegacyTCPSend, Load: loadLegacyTCPSendObjects},
+				{Name: "legacy-4.x", HookStrategy: HookStrategyLegacySock, Load: loadLegacyObjects},
+			}
+		}
+		if preferLegacyTCPSend(version.Release) {
+			return []variantPlan{
+				{Name: "legacy-4.x-tcp-send", HookStrategy: HookStrategyLegacyTCPSend, Load: loadLegacyTCPSendObjects},
+				{Name: "legacy-4.x", HookStrategy: HookStrategyLegacySock, Load: loadLegacyObjects},
+			}
+		}
 		return []variantPlan{
 			{Name: "legacy-4.x", HookStrategy: HookStrategyLegacySock, Load: loadLegacyObjects},
 		}
 	}
 
 	if version.Major >= 6 {
+		if version.Minor == 6 {
+			return []variantPlan{
+				{Name: "tcp-6.6-compact", HookStrategy: HookStrategyTCPOnly, Load: loadTCPOnlyV66CompactObjects},
+				{Name: "tcp-6.6", HookStrategy: HookStrategyTCPOnly, Load: loadTCPOnlyV66Objects},
+				{Name: "tcp-6.x-compact", HookStrategy: HookStrategyTCPOnly, Load: loadTCPOnlyV6CompactObjects},
+				{Name: "tcp-6.x", HookStrategy: HookStrategyTCPOnly, Load: loadTCPOnlyV6Objects},
+				{Name: "tcp-5.15+", HookStrategy: HookStrategyTCPOnly, Load: loadTCPOnlyObjects},
+			}
+		}
 		return []variantPlan{
 			{Name: "tcp-6.x-compact", HookStrategy: HookStrategyTCPOnly, Load: loadTCPOnlyV6CompactObjects},
 			{Name: "tcp-6.x", HookStrategy: HookStrategyTCPOnly, Load: loadTCPOnlyV6Objects},
@@ -320,12 +439,20 @@ func variantPlanByName(name string) (variantPlan, bool) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "legacy", "legacy-4.x", "4.x":
 		return variantPlan{Name: "legacy-4.x", HookStrategy: HookStrategyLegacySock, Load: loadLegacyObjects}, true
+	case "legacy-4.x-tcp-send", "legacy-tcp-send", "4.x-tcp-send", "legacy-hybrid":
+		return variantPlan{Name: "legacy-4.x-tcp-send", HookStrategy: HookStrategyLegacyTCPSend, Load: loadLegacyTCPSendObjects}, true
+	case "legacy-4.x-tcp-both", "legacy-tcp-both", "4.x-tcp-both", "legacy-tcp":
+		return variantPlan{Name: "legacy-4.x-tcp-both", HookStrategy: HookStrategyLegacyTCPBoth, Load: loadLegacyTCPBothObjects}, true
 	case "tcp-5", "tcp-5.15-compact", "compact", "5":
 		return variantPlan{Name: "tcp-5.15-compact", HookStrategy: HookStrategyTCPOnly, Load: loadTCPOnlyCompactObjects}, true
 	case "tcp-6-compact", "tcp-6.x-compact", "v6compact":
 		return variantPlan{Name: "tcp-6.x-compact", HookStrategy: HookStrategyTCPOnly, Load: loadTCPOnlyV6CompactObjects}, true
+	case "tcp-6.6-compact", "tcp-6-6-compact", "v66compact":
+		return variantPlan{Name: "tcp-6.6-compact", HookStrategy: HookStrategyTCPOnly, Load: loadTCPOnlyV66CompactObjects}, true
 	case "tcp-6", "tcp-6.x", "v6", "6":
 		return variantPlan{Name: "tcp-6.x", HookStrategy: HookStrategyTCPOnly, Load: loadTCPOnlyV6Objects}, true
+	case "tcp-6.6", "tcp-6-6", "v66":
+		return variantPlan{Name: "tcp-6.6", HookStrategy: HookStrategyTCPOnly, Load: loadTCPOnlyV66Objects}, true
 	case "tcp", "tcp-only", "tcp-5.15+", "5.x", "6.x":
 		return variantPlan{Name: "tcp-5.15+", HookStrategy: HookStrategyTCPOnly, Load: loadTCPOnlyObjects}, true
 	case "modern", "modern-mixed":
@@ -333,6 +460,22 @@ func variantPlanByName(name string) (variantPlan, bool) {
 	default:
 		return variantPlan{}, false
 	}
+}
+
+func preferLegacyTCPSend(release string) bool {
+	lower := strings.ToLower(strings.TrimSpace(release))
+	if lower == "" {
+		return false
+	}
+	return strings.HasPrefix(lower, "4.19.90-2403.") && strings.Contains(lower, "uel20")
+}
+
+func preferLegacyTCPBoth(release string) bool {
+	lower := strings.ToLower(strings.TrimSpace(release))
+	if lower == "" {
+		return false
+	}
+	return strings.HasPrefix(lower, "4.19.90-24.4.") && strings.Contains(lower, "v2101") && strings.Contains(lower, "ky10")
 }
 
 func detectKernelVersion() kernelVersion {
@@ -454,6 +597,10 @@ func loadedObjectsFromCollection(collection *ebpf.Collection, variant string, ho
 	if err != nil {
 		return nil, err
 	}
+	debugSnapshotMap, err := requiredMap(collection, "debug_snapshot_map")
+	if err != nil {
+		return nil, err
+	}
 	kprobeTcpRecvmsg, err := requiredProgram(collection, "kprobe_tcp_recvmsg")
 	if err != nil {
 		return nil, err
@@ -473,6 +620,7 @@ func loadedObjectsFromCollection(collection *ebpf.Collection, variant string, ho
 		Events:                         events,
 		FilterMap:                      filterMap,
 		KernelStatsMap:                 kernelStatsMap,
+		DebugSnapshotMap:               debugSnapshotMap,
 		KprobeSockRecvmsg:              collection.Programs["kprobe_sock_recvmsg"],
 		KprobeSockSendmsg:              collection.Programs["kprobe_sock_sendmsg"],
 		KprobeTcpClose:                 collection.Programs["kprobe_tcp_close"],

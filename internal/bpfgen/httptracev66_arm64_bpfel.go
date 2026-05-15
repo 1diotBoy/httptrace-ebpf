@@ -12,28 +12,28 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-// LoadHttpTraceCompact returns the embedded CollectionSpec for HttpTraceCompact.
-func LoadHttpTraceCompact() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_HttpTraceCompactBytes)
+// LoadHttpTraceV66 returns the embedded CollectionSpec for HttpTraceV66.
+func LoadHttpTraceV66() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_HttpTraceV66Bytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
-		return nil, fmt.Errorf("can't load HttpTraceCompact: %w", err)
+		return nil, fmt.Errorf("can't load HttpTraceV66: %w", err)
 	}
 
 	return spec, err
 }
 
-// LoadHttpTraceCompactObjects loads HttpTraceCompact and converts it into a struct.
+// LoadHttpTraceV66Objects loads HttpTraceV66 and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
-//	*HttpTraceCompactObjects
-//	*HttpTraceCompactPrograms
-//	*HttpTraceCompactMaps
+//	*HttpTraceV66Objects
+//	*HttpTraceV66Programs
+//	*HttpTraceV66Maps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func LoadHttpTraceCompactObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := LoadHttpTraceCompact()
+func LoadHttpTraceV66Objects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := LoadHttpTraceV66()
 	if err != nil {
 		return err
 	}
@@ -41,19 +41,19 @@ func LoadHttpTraceCompactObjects(obj interface{}, opts *ebpf.CollectionOptions) 
 	return spec.LoadAndAssign(obj, opts)
 }
 
-// HttpTraceCompactSpecs contains maps and programs before they are loaded into the kernel.
+// HttpTraceV66Specs contains maps and programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type HttpTraceCompactSpecs struct {
-	HttpTraceCompactProgramSpecs
-	HttpTraceCompactMapSpecs
-	HttpTraceCompactVariableSpecs
+type HttpTraceV66Specs struct {
+	HttpTraceV66ProgramSpecs
+	HttpTraceV66MapSpecs
+	HttpTraceV66VariableSpecs
 }
 
-// HttpTraceCompactProgramSpecs contains programs before they are loaded into the kernel.
+// HttpTraceV66ProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type HttpTraceCompactProgramSpecs struct {
+type HttpTraceV66ProgramSpecs struct {
 	KprobeSockRecvmsg              *ebpf.ProgramSpec `ebpf:"kprobe_sock_recvmsg"`
 	KprobeSockSendmsg              *ebpf.ProgramSpec `ebpf:"kprobe_sock_sendmsg"`
 	KprobeTcpClose                 *ebpf.ProgramSpec `ebpf:"kprobe_tcp_close"`
@@ -77,10 +77,10 @@ type HttpTraceCompactProgramSpecs struct {
 	TracepointSysEnterWritev       *ebpf.ProgramSpec `ebpf:"tracepoint_sys_enter_writev"`
 }
 
-// HttpTraceCompactMapSpecs contains maps before they are loaded into the kernel.
+// HttpTraceV66MapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type HttpTraceCompactMapSpecs struct {
+type HttpTraceV66MapSpecs struct {
 	ConnectArgsMap   *ebpf.MapSpec `ebpf:"connect_args_map"`
 	DebugSnapshotMap *ebpf.MapSpec `ebpf:"debug_snapshot_map"`
 	Events           *ebpf.MapSpec `ebpf:"events"`
@@ -96,32 +96,32 @@ type HttpTraceCompactMapSpecs struct {
 	TupleCache       *ebpf.MapSpec `ebpf:"tuple_cache"`
 }
 
-// HttpTraceCompactVariableSpecs contains global variables before they are loaded into the kernel.
+// HttpTraceV66VariableSpecs contains global variables before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type HttpTraceCompactVariableSpecs struct {
+type HttpTraceV66VariableSpecs struct {
 }
 
-// HttpTraceCompactObjects contains all objects after they have been loaded into the kernel.
+// HttpTraceV66Objects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to LoadHttpTraceCompactObjects or ebpf.CollectionSpec.LoadAndAssign.
-type HttpTraceCompactObjects struct {
-	HttpTraceCompactPrograms
-	HttpTraceCompactMaps
-	HttpTraceCompactVariables
+// It can be passed to LoadHttpTraceV66Objects or ebpf.CollectionSpec.LoadAndAssign.
+type HttpTraceV66Objects struct {
+	HttpTraceV66Programs
+	HttpTraceV66Maps
+	HttpTraceV66Variables
 }
 
-func (o *HttpTraceCompactObjects) Close() error {
-	return _HttpTraceCompactClose(
-		&o.HttpTraceCompactPrograms,
-		&o.HttpTraceCompactMaps,
+func (o *HttpTraceV66Objects) Close() error {
+	return _HttpTraceV66Close(
+		&o.HttpTraceV66Programs,
+		&o.HttpTraceV66Maps,
 	)
 }
 
-// HttpTraceCompactMaps contains all maps after they have been loaded into the kernel.
+// HttpTraceV66Maps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to LoadHttpTraceCompactObjects or ebpf.CollectionSpec.LoadAndAssign.
-type HttpTraceCompactMaps struct {
+// It can be passed to LoadHttpTraceV66Objects or ebpf.CollectionSpec.LoadAndAssign.
+type HttpTraceV66Maps struct {
 	ConnectArgsMap   *ebpf.Map `ebpf:"connect_args_map"`
 	DebugSnapshotMap *ebpf.Map `ebpf:"debug_snapshot_map"`
 	Events           *ebpf.Map `ebpf:"events"`
@@ -137,8 +137,8 @@ type HttpTraceCompactMaps struct {
 	TupleCache       *ebpf.Map `ebpf:"tuple_cache"`
 }
 
-func (m *HttpTraceCompactMaps) Close() error {
-	return _HttpTraceCompactClose(
+func (m *HttpTraceV66Maps) Close() error {
+	return _HttpTraceV66Close(
 		m.ConnectArgsMap,
 		m.DebugSnapshotMap,
 		m.Events,
@@ -155,16 +155,16 @@ func (m *HttpTraceCompactMaps) Close() error {
 	)
 }
 
-// HttpTraceCompactVariables contains all global variables after they have been loaded into the kernel.
+// HttpTraceV66Variables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to LoadHttpTraceCompactObjects or ebpf.CollectionSpec.LoadAndAssign.
-type HttpTraceCompactVariables struct {
+// It can be passed to LoadHttpTraceV66Objects or ebpf.CollectionSpec.LoadAndAssign.
+type HttpTraceV66Variables struct {
 }
 
-// HttpTraceCompactPrograms contains all programs after they have been loaded into the kernel.
+// HttpTraceV66Programs contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to LoadHttpTraceCompactObjects or ebpf.CollectionSpec.LoadAndAssign.
-type HttpTraceCompactPrograms struct {
+// It can be passed to LoadHttpTraceV66Objects or ebpf.CollectionSpec.LoadAndAssign.
+type HttpTraceV66Programs struct {
 	KprobeSockRecvmsg              *ebpf.Program `ebpf:"kprobe_sock_recvmsg"`
 	KprobeSockSendmsg              *ebpf.Program `ebpf:"kprobe_sock_sendmsg"`
 	KprobeTcpClose                 *ebpf.Program `ebpf:"kprobe_tcp_close"`
@@ -188,8 +188,8 @@ type HttpTraceCompactPrograms struct {
 	TracepointSysEnterWritev       *ebpf.Program `ebpf:"tracepoint_sys_enter_writev"`
 }
 
-func (p *HttpTraceCompactPrograms) Close() error {
-	return _HttpTraceCompactClose(
+func (p *HttpTraceV66Programs) Close() error {
+	return _HttpTraceV66Close(
 		p.KprobeSockRecvmsg,
 		p.KprobeSockSendmsg,
 		p.KprobeTcpClose,
@@ -214,7 +214,7 @@ func (p *HttpTraceCompactPrograms) Close() error {
 	)
 }
 
-func _HttpTraceCompactClose(closers ...io.Closer) error {
+func _HttpTraceV66Close(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -225,5 +225,5 @@ func _HttpTraceCompactClose(closers ...io.Closer) error {
 
 // Do not access this directly.
 //
-//go:embed httptracecompact_arm64_bpfel.o
-var _HttpTraceCompactBytes []byte
+//go:embed httptracev66_arm64_bpfel.o
+var _HttpTraceV66Bytes []byte

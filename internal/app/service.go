@@ -44,6 +44,7 @@ type Service struct {
 	resourcePlan             runtimeResourcePlan
 	lastRequestCaptureLimit  uint32
 	lastResponseCaptureLimit uint32
+	lastDebugSnapshotSeq     uint64
 }
 
 type stats struct {
@@ -256,6 +257,9 @@ func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 			kernelFilter.RequestCaptureBytes = uint32(s.cfg.CaptureBytes)
 			kernelFilter.ResponseCaptureBytes = uint32(s.cfg.CaptureBytes)
 		}
+		if s.cfg.DebugKernel {
+			kernelFilter.DebugFlags = 1
+		}
 		if err := objs.FilterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update filter map: %w", err)
 		}
@@ -267,7 +271,12 @@ func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 		log.Printf("ifname filter is not enforced in kernel tuple-cache mode: socket-layer ifindex is not reliable enough")
 	}
 	kernelFilter.Ifindex = 0
-	if objs.HookStrategy == bpfgen.HookStrategyLegacySock {
+	if s.cfg.DebugKernel {
+		kernelFilter.DebugFlags = 1
+	}
+	if objs.HookStrategy == bpfgen.HookStrategyLegacySock ||
+		objs.HookStrategy == bpfgen.HookStrategyLegacyTCPSend ||
+		objs.HookStrategy == bpfgen.HookStrategyLegacyTCPBoth {
 		// 4.x 上 sock 结构布局在不同发行版/回移内核间差异更大，
 		// 改成用 inet_sock_set_state 维护 tuple cache，send/recv 路径优先查 cache 做端口/IP 过滤。
 		// 这样 4.x 不再依赖收发现场直接读 sock_common 来做强过滤。
@@ -309,6 +318,9 @@ func (s *Service) syncCaptureLimitsToKernel(filterMap *ebpf.Map) error {
 	}
 	kernelFilter.RequestCaptureBytes = requestLimit
 	kernelFilter.ResponseCaptureBytes = responseLimit
+	if s.cfg.DebugKernel {
+		kernelFilter.DebugFlags = 1
+	}
 	if err := filterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update dynamic capture limits: %w", err)
 	}
@@ -1197,6 +1209,44 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 				prog    *ebpf.Program
 			}{symbols: []string{"sock_recvmsg"}, ret: true, prog: objs.KretprobeSockRecvmsg},
 		)
+	} else if objs.HookStrategy == bpfgen.HookStrategyLegacyTCPSend {
+		log.Printf("using legacy hybrid hook strategy: keep sock_recvmsg on 4.x, but switch response primary path to tcp_sendmsg on vendor kernels where sock_sendmsg does not expose stable payload")
+		required = append(required,
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_sendmsg"}, prog: objs.KprobeTcpSendmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"sock_recvmsg"}, prog: objs.KprobeSockRecvmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"sock_recvmsg"}, ret: true, prog: objs.KretprobeSockRecvmsg},
+		)
+	} else if objs.HookStrategy == bpfgen.HookStrategyLegacyTCPBoth {
+		log.Printf("using legacy tcp hook strategy: request/response both rely on tcp_recvmsg/tcp_sendmsg on vendor 4.x kernels where socket-layer sk extraction drifts")
+		required = append(required,
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_sendmsg"}, prog: objs.KprobeTcpSendmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_recvmsg"}, prog: objs.KprobeTcpRecvmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_recvmsg"}, ret: true, prog: objs.KretprobeTcpRecvmsg},
+		)
 	} else {
 		log.Printf("using tcp-only hook strategy: request/response both rely on tcp_recvmsg/tcp_sendmsg on 5.15+/6.x")
 		required = append(required,
@@ -1273,6 +1323,66 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 		)
 		log.Printf("legacy tuple-cache fallback enabled: use tcp_v4/tcp_v6_connect and inet_csk_accept instead of inet_sock_set_state")
 	}
+	if objs.HookStrategy == bpfgen.HookStrategyLegacyTCPSend {
+		optionalKprobes = append(optionalKprobes,
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_v4_connect"}, prog: objs.KprobeTcpV4Connect},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_v4_connect"}, ret: true, prog: objs.KretprobeTcpV4Connect},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_v6_connect"}, prog: objs.KprobeTcpV6Connect},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_v6_connect"}, ret: true, prog: objs.KretprobeTcpV6Connect},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"inet_csk_accept"}, ret: true, prog: objs.KretprobeInetCskAccept},
+		)
+		log.Printf("legacy tuple-cache fallback enabled: use tcp_v4/tcp_v6_connect and inet_csk_accept instead of inet_sock_set_state")
+	}
+	if objs.HookStrategy == bpfgen.HookStrategyLegacyTCPBoth {
+		optionalKprobes = append(optionalKprobes,
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_v4_connect"}, prog: objs.KprobeTcpV4Connect},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_v4_connect"}, ret: true, prog: objs.KretprobeTcpV4Connect},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_v6_connect"}, prog: objs.KprobeTcpV6Connect},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_v6_connect"}, ret: true, prog: objs.KretprobeTcpV6Connect},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"inet_csk_accept"}, ret: true, prog: objs.KretprobeInetCskAccept},
+		)
+		log.Printf("legacy tuple-cache fallback enabled: use tcp_v4/tcp_v6_connect and inet_csk_accept instead of inet_sock_set_state")
+	}
 	if objs.HookStrategy == bpfgen.HookStrategyTCPOnly {
 		log.Printf("tcp-only capture enabled by default: skip sock_* probes and keep the same perf event/user-space parser contract")
 	}
@@ -1299,7 +1409,9 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 		{group: "syscalls", name: "sys_enter_read", prog: objs.TracepointSysEnterRead},
 		{group: "syscalls", name: "sys_enter_readv", prog: objs.TracepointSysEnterReadv},
 	}
-	if objs.HookStrategy != bpfgen.HookStrategyLegacySock {
+	if objs.HookStrategy != bpfgen.HookStrategyLegacySock &&
+		objs.HookStrategy != bpfgen.HookStrategyLegacyTCPSend &&
+		objs.HookStrategy != bpfgen.HookStrategyLegacyTCPBoth {
 		tracepoints = append([]struct {
 			group string
 			name  string

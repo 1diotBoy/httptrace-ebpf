@@ -84,6 +84,22 @@ struct bpf_map_def SEC("maps") kernel_stats_map = {
 	.max_entries = 1,
 };
 
+struct bpf_map_def SEC("maps") debug_snapshot_map = {
+	.type = BPF_MAP_TYPE_ARRAY,
+	.key_size = sizeof(__u32),
+	.value_size = sizeof(struct debug_snapshot),
+	.max_entries = 1,
+};
+
+enum debug_snapshot_stage {
+	DEBUG_STAGE_NONE = 0,
+	DEBUG_STAGE_PREPARE_OK = 1,
+	DEBUG_STAGE_NO_ITER = 2,
+	DEBUG_STAGE_NO_CHAIN = 3,
+	DEBUG_STAGE_GUARD_DUP = 4,
+	DEBUG_STAGE_CAPTURE_OK = 5,
+};
+
 static __always_inline struct kernel_stats *stats_lookup(void)
 {
 	__u32 key = 0;
@@ -101,6 +117,15 @@ static __always_inline int read_filter(struct filter_config *cfg)
 
 	bpf_probe_read(cfg, sizeof(*cfg), value);
 	return 0;
+}
+
+static __always_inline __attribute__((unused)) int debug_snapshot_enabled(void)
+{
+	struct filter_config cfg = {};
+
+	if (read_filter(&cfg) < 0)
+		return 0;
+	return (cfg.debug_flags & 1) != 0;
 }
 
 static __always_inline int extract_sk(void *sock_ptr, struct sock_compat **sk)
@@ -456,7 +481,7 @@ static __always_inline int load_iter_segment(const struct iov_iter_compat *iter,
 	if (!iter || !base || !seg_len)
 		return -1;
 
-#ifdef IOV_ITER_LAYOUT_V6
+#if defined(IOV_ITER_LAYOUT_V66) || defined(IOV_ITER_LAYOUT_V6)
 	if (iter->iter_type == ITER_UBUF_COMPAT) {
 		__u64 addr = 0;
 
@@ -539,6 +564,168 @@ static __always_inline int load_iter_segment(const struct iov_iter_compat *iter,
 	*seg_len = iov.iov_len - skip;
 	return 0;
 }
+
+static __always_inline __attribute__((unused)) int peek_iter_segment_quiet(const struct iov_iter_compat *iter, __u32 index,
+									   __u64 *base_addr, __u64 *seg_len)
+{
+	struct iovec_compat iov = {};
+	__u64 skip = 0;
+
+	if (!iter || !base_addr || !seg_len)
+		return -1;
+
+#if defined(IOV_ITER_LAYOUT_V66) || defined(IOV_ITER_LAYOUT_V6)
+	if (iter->iter_type == ITER_UBUF_COMPAT) {
+		if (index != 0 || !iter->ubuf || !iter->count)
+			return -1;
+		*base_addr = (__u64)iter->ubuf + iter->iov_offset;
+		*seg_len = iter->count;
+		return 0;
+	}
+	if (iter->iter_type == ITER_BVEC_COMPAT)
+		return -1;
+	if (iter->iter_type != ITER_IOVEC_COMPAT && iter->iter_type != ITER_KVEC_COMPAT)
+		return -1;
+	if ((__u64)index >= iter->nr_segs)
+		return -1;
+	if (iter->iter_type == ITER_IOVEC_COMPAT) {
+		if (!iter->iov)
+			return -1;
+		if (bpf_probe_read(&iov, sizeof(iov), &iter->iov[index]) < 0)
+			return -1;
+	} else {
+		if (!iter->kvec)
+			return -1;
+		if (bpf_probe_read(&iov, sizeof(iov), &iter->kvec[index]) < 0)
+			return -1;
+	}
+#else
+	if (!iter->iov || (__u64)index >= iter->nr_segs)
+		return -1;
+	if (bpf_probe_read(&iov, sizeof(iov), &iter->iov[index]) < 0)
+		return -1;
+#endif
+
+	skip = index == 0 ? iter->iov_offset : 0;
+	if (skip > iov.iov_len)
+		return -1;
+
+	*base_addr = (__u64)iov.iov_base + skip;
+	*seg_len = iov.iov_len - skip;
+	return 0;
+}
+
+static __always_inline __attribute__((unused)) __u64 iter_vector_ptr(const struct iov_iter_compat *iter)
+{
+	if (!iter)
+		return 0;
+#if defined(IOV_ITER_LAYOUT_V66) || defined(IOV_ITER_LAYOUT_V6)
+	if (iter->iter_type == ITER_UBUF_COMPAT)
+		return (__u64)iter->ubuf;
+	if (iter->iter_type == ITER_KVEC_COMPAT)
+		return (__u64)iter->kvec;
+	return (__u64)iter->iov;
+#else
+	return (__u64)iter->iov;
+#endif
+}
+
+#ifdef LEGACY_VERIFIER
+static __always_inline void snapshot_send_debug(struct sock_compat *sk,
+						struct msghdr_compat *msg,
+						const struct recv_args *meta,
+						const struct iov_iter_compat *iter,
+						const struct flow_state *state,
+						__u64 chain_id, __u8 source,
+						__u8 stage, __u8 started_new_response)
+{
+	return;
+}
+#else
+static __always_inline void snapshot_send_debug(struct sock_compat *sk,
+						struct msghdr_compat *msg,
+						const struct recv_args *meta,
+						const struct iov_iter_compat *iter,
+						const struct flow_state *state,
+						__u64 chain_id, __u8 source,
+						__u8 stage, __u8 started_new_response)
+{
+	struct debug_snapshot *snap = NULL;
+	__u32 key = 0;
+	__u64 seg0_base = 0, seg0_len = 0;
+	__u64 seg1_base = 0, seg1_len = 0;
+	int seg0_rc = -1, seg1_rc = -1;
+
+	if (!debug_snapshot_enabled())
+		return;
+	snap = bpf_map_lookup_elem(&debug_snapshot_map, &key);
+	if (!snap)
+		return;
+
+	snap->seq += 1;
+	snap->ts_ns = bpf_ktime_get_ns();
+	snap->pid_tgid = bpf_get_current_pid_tgid();
+	snap->sock_id = meta ? meta->sock_id : (__u64)sk;
+	snap->msg_ptr = (__u64)msg;
+	snap->chain_id = chain_id;
+	snap->iter_count = iter ? iter->count : 0;
+	snap->iter_nr_segs = iter ? iter->nr_segs : 0;
+	snap->iter_iov_offset = iter ? iter->iov_offset : 0;
+	snap->iter_vec_ptr = iter ? iter_vector_ptr(iter) : 0;
+	snap->fd = meta ? meta->fd : -1;
+	snap->pending_count = state ? state->pending_count : 0;
+	snap->source = source;
+	snap->stage = stage;
+	snap->req_active = state ? state->req_active : 0;
+	snap->resp_active = state ? state->resp_active : 0;
+#if defined(IOV_ITER_LAYOUT_V66) || defined(IOV_ITER_LAYOUT_V6)
+	snap->iter_type = iter ? iter->iter_type : 0;
+#else
+	snap->iter_type = iter ? (__u8)iter->type : 0;
+#endif
+	snap->started_new_response = started_new_response;
+	snap->load_seg0_rc = 0xff;
+	snap->load_seg1_rc = 0xff;
+	snap->prefix_len = 0;
+	__builtin_memset(snap->prefix, 0, sizeof(snap->prefix));
+	__builtin_memset(snap->msg_raw, 0, sizeof(snap->msg_raw));
+	__builtin_memset(snap->iter_raw, 0, sizeof(snap->iter_raw));
+
+	if (msg) {
+		bpf_probe_read(snap->msg_raw, sizeof(snap->msg_raw), msg);
+		bpf_probe_read(snap->iter_raw, sizeof(snap->iter_raw), &msg->msg_iter);
+	}
+	if (iter) {
+		__u32 copied = 0;
+
+		seg0_rc = peek_iter_segment_quiet(iter, 0, &seg0_base, &seg0_len);
+		seg1_rc = peek_iter_segment_quiet(iter, 1, &seg1_base, &seg1_len);
+		snap->load_seg0_rc = seg0_rc == 0 ? 0 : 1;
+		snap->load_seg1_rc = seg1_rc == 0 ? 0 : 1;
+		snap->seg0_base = seg0_base;
+		snap->seg0_len = seg0_len;
+		snap->seg1_base = seg1_base;
+		snap->seg1_len = seg1_len;
+		if (seg0_rc == 0 && seg0_base && seg0_len) {
+			__u64 available = seg0_len;
+
+			if (available > sizeof(snap->prefix))
+				available = sizeof(snap->prefix);
+			if (bpf_probe_read(snap->prefix, available, (const void *)seg0_base) == 0)
+				copied = available;
+		}
+		if (copied < sizeof(snap->prefix) && seg1_rc == 0 && seg1_base && seg1_len) {
+			__u64 available = seg1_len;
+
+			if (available > sizeof(snap->prefix) - copied)
+				available = sizeof(snap->prefix) - copied;
+			if (available && bpf_probe_read(snap->prefix + copied, available, (const void *)seg1_base) == 0)
+				copied += available;
+		}
+		snap->prefix_len = copied;
+	}
+}
+#endif
 
 static __always_inline int is_http_prefix_padding(char c)
 {
@@ -1425,8 +1612,12 @@ static __attribute__((noinline)) __u64 prepare_send_scratch(struct sock_compat *
 	if (read_msg_iter(msg, &scratch->iter) < 0 || !scratch->iter.count) {
 		if (stats)
 			stats->send_iter_empty += 1;
+		snapshot_send_debug(sk, msg, &scratch->meta, &scratch->iter, NULL, 0, source,
+				    DEBUG_STAGE_NO_ITER, 0);
 		return 0;
 	}
+	snapshot_send_debug(sk, msg, &scratch->meta, &scratch->iter, NULL, 0, source,
+			    DEBUG_STAGE_PREPARE_OK, 0);
 
 	return scratch->meta.sock_id;
 }
@@ -1606,10 +1797,16 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 	state->tx_cursor += scratch->iter.count;
 	scratch->meta.seq_hint = state->tx_cursor;
 	chain_id = select_response_chain(state, &scratch->iter, &started_new_response);
-	if (!chain_id)
+	if (!chain_id) {
+		snapshot_send_debug(sk, msg, &scratch->meta, &scratch->iter, state, 0, source,
+				    DEBUG_STAGE_NO_CHAIN, started_new_response);
 		return 0;
-	if (!claim_send_guard(bpf_get_current_pid_tgid(), msg, source))
+	}
+	if (!claim_send_guard(bpf_get_current_pid_tgid(), msg, source)) {
+		snapshot_send_debug(sk, msg, &scratch->meta, &scratch->iter, state, chain_id, source,
+				    DEBUG_STAGE_GUARD_DUP, started_new_response);
 		return 0;
+	}
 
 	if (started_new_response)
 		start_response_capture(state, chain_id);
@@ -1618,6 +1815,8 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 
 	if (capture_response_message(ctx, &scratch->iter, &scratch->meta, state, source) < 0)
 		return 0;
+	snapshot_send_debug(sk, msg, &scratch->meta, &scratch->iter, state, chain_id, source,
+			    DEBUG_STAGE_CAPTURE_OK, started_new_response);
 	return 0;
 }
 
@@ -1849,19 +2048,18 @@ SEC("kprobe/tcp_sendmsg")
 /* tcp_sendmsg 只作为响应发送的补充路径：
  * - 主路径仍然是 sock_sendmsg，语义更接近应用层明文发送。
  * - 对 Nginx 等场景，如果响应没有完整经过 sock_sendmsg，tcp_sendmsg 可以补到一部分 TCP 发送数据。
+ * - legacy 4.x 也需要保留这条补充路径；有些发行版/中间件的响应发送更容易落在 tcp_sendmsg，
+ *   如果这里只统计命中但不真正采集，就会表现成 requests 正常、responses 一直 pending。
  */
 int BPF_KPROBE(kprobe_tcp_sendmsg, struct sock_compat *sk, struct msghdr_compat *msg)
 {
 	struct kernel_stats *stats = stats_lookup();
-	if (stats)
-		stats->tcp_send_hits += 1;
-#ifdef LEGACY_VERIFIER
-	return 0;
-#else
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = consume_fd(pid_tgid, &send_fd_map);
+
+	if (stats)
+		stats->tcp_send_hits += 1;
 	return handle_send_entry(ctx, sk, msg, fd, SRC_TCP_SENDMSG);
-#endif
 }
 
 SEC("kprobe/sock_recvmsg")
@@ -1913,13 +2111,9 @@ int BPF_KRETPROBE(kretprobe_sock_recvmsg)
 SEC("kretprobe/tcp_recvmsg")
 int BPF_KRETPROBE(kretprobe_tcp_recvmsg)
 {
-#ifdef LEGACY_VERIFIER
-	return 0;
-#else
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s64 ret = PT_REGS_RC(ctx);
 	return handle_recv_return(ctx, pid_tgid, ret);
-#endif
 }
 
 /* tcp_close 上报 close 控制事件，帮助用户态在 keep-alive/connection: close 场景下做最终收尾。 */

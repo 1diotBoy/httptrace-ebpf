@@ -44,9 +44,24 @@ func TestChooseVariantPlans(t *testing.T) {
 			wantNames: []string{"legacy-4.x"},
 		},
 		{
+			name:      "legacy-4x-uel20-tcp-send-primary",
+			version:   kernelVersion{Release: "4.19.90-2403.3.0.0270.84.uel20.x86_64", Major: 4, Minor: 19},
+			wantNames: []string{"legacy-4.x-tcp-send", "legacy-4.x"},
+		},
+		{
+			name:      "legacy-4x-ky10-tcp-both",
+			version:   kernelVersion{Release: "4.19.90-24.4.v2101.ky10.x86_64", Major: 4, Minor: 19},
+			wantNames: []string{"legacy-4.x-tcp-both", "legacy-4.x-tcp-send", "legacy-4.x"},
+		},
+		{
 			name:      "tcp-first-5x",
 			version:   kernelVersion{Release: "5.15.0", Major: 5, Minor: 15},
 			wantNames: []string{"tcp-5.15-compact", "tcp-5.15+"},
+		},
+		{
+			name:      "tcp-first-66",
+			version:   kernelVersion{Release: "6.6.0", Major: 6, Minor: 6},
+			wantNames: []string{"tcp-6.6-compact", "tcp-6.6", "tcp-6.x-compact", "tcp-6.x", "tcp-5.15+"},
 		},
 		{
 			name:      "tcp-first-6x",
@@ -94,7 +109,11 @@ func TestVariantPlanByName(t *testing.T) {
 		ok   bool
 	}{
 		{name: "legacy", want: "legacy-4.x", ok: true},
+		{name: "legacy-tcp-send", want: "legacy-4.x-tcp-send", ok: true},
+		{name: "legacy-tcp", want: "legacy-4.x-tcp-both", ok: true},
 		{name: "tcp-5.15-compact", want: "tcp-5.15-compact", ok: true},
+		{name: "tcp-6.6-compact", want: "tcp-6.6-compact", ok: true},
+		{name: "tcp-6.6", want: "tcp-6.6", ok: true},
 		{name: "tcp-6.x-compact", want: "tcp-6.x-compact", ok: true},
 		{name: "tcp-6.x", want: "tcp-6.x", ok: true},
 		{name: "tcp-only", want: "tcp-5.15+", ok: true},
