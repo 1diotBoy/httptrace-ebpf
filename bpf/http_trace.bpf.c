@@ -143,6 +143,15 @@ static __always_inline int extract_sk(void *sock_ptr, struct sock_compat **sk)
 	return 0;
 }
 
+static __always_inline int read_payload_bytes(void *dst, __u32 len, const void *src)
+{
+#ifdef PAYLOAD_READ_USER
+	return bpf_probe_read_user(dst, len, src);
+#else
+	return bpf_probe_read(dst, len, src);
+#endif
+}
+
 static __always_inline __attribute__((unused)) int extract_tuple(struct sock_compat *sk, struct recv_args *meta)
 {
 	struct sock_common_compat common = {};
@@ -630,7 +639,7 @@ static __always_inline __attribute__((unused)) __u64 iter_vector_ptr(const struc
 #endif
 }
 
-#ifdef LEGACY_VERIFIER
+#if !defined(BPF_DEBUG_SNAPSHOT) || defined(LEGACY_VERIFIER)
 static __always_inline void snapshot_send_debug(struct sock_compat *sk,
 						struct msghdr_compat *msg,
 						const struct recv_args *meta,
@@ -763,37 +772,37 @@ static __always_inline __u32 read_prefix_legacy_bytes(const char *base, __u64 sk
 
 	if (!base || !buf || !buf_len || !available)
 		return 0;
-	if (buf_len > 0 && available > 0 && bpf_probe_read(&buf[0], 1, base + skip + 0) == 0)
+	if (buf_len > 0 && available > 0 && read_payload_bytes(&buf[0], 1, base + skip + 0) == 0)
 		copied = 1;
-	if (buf_len > 1 && available > 1 && bpf_probe_read(&buf[1], 1, base + skip + 1) == 0)
+	if (buf_len > 1 && available > 1 && read_payload_bytes(&buf[1], 1, base + skip + 1) == 0)
 		copied = 2;
-	if (buf_len > 2 && available > 2 && bpf_probe_read(&buf[2], 1, base + skip + 2) == 0)
+	if (buf_len > 2 && available > 2 && read_payload_bytes(&buf[2], 1, base + skip + 2) == 0)
 		copied = 3;
-	if (buf_len > 3 && available > 3 && bpf_probe_read(&buf[3], 1, base + skip + 3) == 0)
+	if (buf_len > 3 && available > 3 && read_payload_bytes(&buf[3], 1, base + skip + 3) == 0)
 		copied = 4;
-	if (buf_len > 4 && available > 4 && bpf_probe_read(&buf[4], 1, base + skip + 4) == 0)
+	if (buf_len > 4 && available > 4 && read_payload_bytes(&buf[4], 1, base + skip + 4) == 0)
 		copied = 5;
-	if (buf_len > 5 && available > 5 && bpf_probe_read(&buf[5], 1, base + skip + 5) == 0)
+	if (buf_len > 5 && available > 5 && read_payload_bytes(&buf[5], 1, base + skip + 5) == 0)
 		copied = 6;
-	if (buf_len > 6 && available > 6 && bpf_probe_read(&buf[6], 1, base + skip + 6) == 0)
+	if (buf_len > 6 && available > 6 && read_payload_bytes(&buf[6], 1, base + skip + 6) == 0)
 		copied = 7;
-	if (buf_len > 7 && available > 7 && bpf_probe_read(&buf[7], 1, base + skip + 7) == 0)
+	if (buf_len > 7 && available > 7 && read_payload_bytes(&buf[7], 1, base + skip + 7) == 0)
 		copied = 8;
-	if (buf_len > 8 && available > 8 && bpf_probe_read(&buf[8], 1, base + skip + 8) == 0)
+	if (buf_len > 8 && available > 8 && read_payload_bytes(&buf[8], 1, base + skip + 8) == 0)
 		copied = 9;
-	if (buf_len > 9 && available > 9 && bpf_probe_read(&buf[9], 1, base + skip + 9) == 0)
+	if (buf_len > 9 && available > 9 && read_payload_bytes(&buf[9], 1, base + skip + 9) == 0)
 		copied = 10;
-	if (buf_len > 10 && available > 10 && bpf_probe_read(&buf[10], 1, base + skip + 10) == 0)
+	if (buf_len > 10 && available > 10 && read_payload_bytes(&buf[10], 1, base + skip + 10) == 0)
 		copied = 11;
-	if (buf_len > 11 && available > 11 && bpf_probe_read(&buf[11], 1, base + skip + 11) == 0)
+	if (buf_len > 11 && available > 11 && read_payload_bytes(&buf[11], 1, base + skip + 11) == 0)
 		copied = 12;
-	if (buf_len > 12 && available > 12 && bpf_probe_read(&buf[12], 1, base + skip + 12) == 0)
+	if (buf_len > 12 && available > 12 && read_payload_bytes(&buf[12], 1, base + skip + 12) == 0)
 		copied = 13;
-	if (buf_len > 13 && available > 13 && bpf_probe_read(&buf[13], 1, base + skip + 13) == 0)
+	if (buf_len > 13 && available > 13 && read_payload_bytes(&buf[13], 1, base + skip + 13) == 0)
 		copied = 14;
-	if (buf_len > 14 && available > 14 && bpf_probe_read(&buf[14], 1, base + skip + 14) == 0)
+	if (buf_len > 14 && available > 14 && read_payload_bytes(&buf[14], 1, base + skip + 14) == 0)
 		copied = 15;
-	if (buf_len > 15 && available > 15 && bpf_probe_read(&buf[15], 1, base + skip + 15) == 0)
+	if (buf_len > 15 && available > 15 && read_payload_bytes(&buf[15], 1, base + skip + 15) == 0)
 		copied = 16;
 
 	return copied;
@@ -828,7 +837,7 @@ static __always_inline int read_prefix_from_iter(const struct iov_iter_compat *i
 	available = seg_len0;
 	if (available > buf_len)
 		available = buf_len;
-	if (available && bpf_probe_read(buf, available, base0) == 0)
+	if (available && read_payload_bytes(buf, available, base0) == 0)
 		copied = available;
 
 	if (copied >= buf_len)
@@ -841,7 +850,7 @@ static __always_inline int read_prefix_from_iter(const struct iov_iter_compat *i
 		available = buf_len - copied;
 	if (!available)
 		return copied;
-	if (bpf_probe_read(buf + copied, available, base1) < 0)
+	if (read_payload_bytes(buf + copied, available, base1) < 0)
 		return copied;
 	if (stats)
 		stats->prefix_second_iov += 1;
@@ -1166,7 +1175,7 @@ static __attribute__((noinline)) int emit_data_event(void *ctx, const struct cap
 	event->source = call->source;
 	event->family = call->meta->family;
 	__builtin_memcpy(event->comm, call->meta->comm, sizeof(event->comm));
-	if (safe_len > 0 && bpf_probe_read(event->payload, safe_len, src) < 0) {
+	if (safe_len > 0 && read_payload_bytes(event->payload, safe_len, src) < 0) {
 		if (stats)
 			stats->perf_errors += 1;
 		return -1;

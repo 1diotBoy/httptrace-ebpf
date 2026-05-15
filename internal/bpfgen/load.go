@@ -43,10 +43,40 @@ type kernelVersion struct {
 	Minor   int
 }
 
+type kernelProfile struct {
+	Name     string
+	Match    func(kernelVersion) bool
+	Variants []string
+}
+
 type variantPlan struct {
 	Name         string
 	HookStrategy HookStrategy
 	Load         func(*ebpf.CollectionOptions) (*LoadedObjects, error)
+}
+
+var knownKernelProfiles = []kernelProfile{
+	{
+		Name: "vendor-4.19.90-52.42-ky10-aarch64",
+		Match: func(version kernelVersion) bool {
+			return preferLegacyUserRead(version.Release)
+		},
+		Variants: []string{"legacy-4.x-userread", "legacy-4.x"},
+	},
+	{
+		Name: "vendor-4.19.90-24.4-ky10",
+		Match: func(version kernelVersion) bool {
+			return preferLegacyTCPBoth(version.Release)
+		},
+		Variants: []string{"legacy-4.x-tcp-both", "legacy-4.x-tcp-send", "legacy-4.x"},
+	},
+	{
+		Name: "vendor-4.19.90-2403-uel20",
+		Match: func(version kernelVersion) bool {
+			return preferLegacyTCPSend(version.Release)
+		},
+		Variants: []string{"legacy-4.x-tcp-send", "legacy-4.x"},
+	},
 }
 
 // LoadedObjects 把 modern/legacy 两套 bpf2go 产物统一成同一组句柄，
@@ -167,6 +197,44 @@ func loadLegacyObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
 	}
 	return &LoadedObjects{
 		Variant:                        "legacy-4.x",
+		HookStrategy:                   HookStrategyLegacySock,
+		Events:                         raw.Events,
+		FilterMap:                      raw.FilterMap,
+		KernelStatsMap:                 raw.KernelStatsMap,
+		DebugSnapshotMap:               raw.DebugSnapshotMap,
+		KprobeSockRecvmsg:              raw.KprobeSockRecvmsg,
+		KprobeSockSendmsg:              raw.KprobeSockSendmsg,
+		KprobeTcpClose:                 raw.KprobeTcpClose,
+		KprobeTcpRecvmsg:               raw.KprobeTcpRecvmsg,
+		KprobeTcpSendmsg:               raw.KprobeTcpSendmsg,
+		KprobeTcpV4Connect:             raw.KprobeTcpV4Connect,
+		KretprobeTcpV4Connect:          raw.KretprobeTcpV4Connect,
+		KprobeTcpV6Connect:             raw.KprobeTcpV6Connect,
+		KretprobeTcpV6Connect:          raw.KretprobeTcpV6Connect,
+		KretprobeInetCskAccept:         raw.KretprobeInetCskAccept,
+		KretprobeSockRecvmsg:           raw.KretprobeSockRecvmsg,
+		KretprobeTcpRecvmsg:            raw.KretprobeTcpRecvmsg,
+		TracepointSockInetSockSetState: raw.TracepointSockInetSockSetState,
+		TracepointSysEnterRead:         raw.TracepointSysEnterRead,
+		TracepointSysEnterReadv:        raw.TracepointSysEnterReadv,
+		TracepointSysEnterRecvfrom:     raw.TracepointSysEnterRecvfrom,
+		TracepointSysEnterRecvmsg:      raw.TracepointSysEnterRecvmsg,
+		TracepointSysEnterSendmsg:      raw.TracepointSysEnterSendmsg,
+		TracepointSysEnterSendto:       raw.TracepointSysEnterSendto,
+		TracepointSysEnterWrite:        raw.TracepointSysEnterWrite,
+		TracepointSysEnterWritev:       raw.TracepointSysEnterWritev,
+		closer:                         &raw,
+	}, nil
+}
+
+func loadLegacyUserReadObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
+	var raw HttpTraceLegacyUserReadObjects
+
+	if err := LoadHttpTraceLegacyUserReadObjects(&raw, opts); err != nil {
+		return nil, err
+	}
+	return &LoadedObjects{
+		Variant:                        "legacy-4.x-userread",
 		HookStrategy:                   HookStrategyLegacySock,
 		Events:                         raw.Events,
 		FilterMap:                      raw.FilterMap,
@@ -386,20 +454,12 @@ func chooseVariantPlans(version kernelVersion) []variantPlan {
 		}
 	}
 
+	if profile, ok := matchKernelProfile(version); ok {
+		log.Printf("matched kernel profile=%s release=%s", profile.Name, version.Release)
+		return plansForVariantNames(profile.Variants)
+	}
+
 	if version.Major == 4 {
-		if preferLegacyTCPBoth(version.Release) {
-			return []variantPlan{
-				{Name: "legacy-4.x-tcp-both", HookStrategy: HookStrategyLegacyTCPBoth, Load: loadLegacyTCPBothObjects},
-				{Name: "legacy-4.x-tcp-send", HookStrategy: HookStrategyLegacyTCPSend, Load: loadLegacyTCPSendObjects},
-				{Name: "legacy-4.x", HookStrategy: HookStrategyLegacySock, Load: loadLegacyObjects},
-			}
-		}
-		if preferLegacyTCPSend(version.Release) {
-			return []variantPlan{
-				{Name: "legacy-4.x-tcp-send", HookStrategy: HookStrategyLegacyTCPSend, Load: loadLegacyTCPSendObjects},
-				{Name: "legacy-4.x", HookStrategy: HookStrategyLegacySock, Load: loadLegacyObjects},
-			}
-		}
 		return []variantPlan{
 			{Name: "legacy-4.x", HookStrategy: HookStrategyLegacySock, Load: loadLegacyObjects},
 		}
@@ -435,10 +495,34 @@ func chooseVariantPlans(version kernelVersion) []variantPlan {
 	}
 }
 
+func matchKernelProfile(version kernelVersion) (kernelProfile, bool) {
+	for _, profile := range knownKernelProfiles {
+		if profile.Match != nil && profile.Match(version) {
+			return profile, true
+		}
+	}
+	return kernelProfile{}, false
+}
+
+func plansForVariantNames(names []string) []variantPlan {
+	plans := make([]variantPlan, 0, len(names))
+	for _, name := range names {
+		plan, ok := variantPlanByName(name)
+		if !ok {
+			log.Printf("ignore unknown variant name %q in kernel profile plan", name)
+			continue
+		}
+		plans = append(plans, plan)
+	}
+	return plans
+}
+
 func variantPlanByName(name string) (variantPlan, bool) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "legacy", "legacy-4.x", "4.x":
 		return variantPlan{Name: "legacy-4.x", HookStrategy: HookStrategyLegacySock, Load: loadLegacyObjects}, true
+	case "legacy-4.x-userread", "legacy-userread", "4.x-userread":
+		return variantPlan{Name: "legacy-4.x-userread", HookStrategy: HookStrategyLegacySock, Load: loadLegacyUserReadObjects}, true
 	case "legacy-4.x-tcp-send", "legacy-tcp-send", "4.x-tcp-send", "legacy-hybrid":
 		return variantPlan{Name: "legacy-4.x-tcp-send", HookStrategy: HookStrategyLegacyTCPSend, Load: loadLegacyTCPSendObjects}, true
 	case "legacy-4.x-tcp-both", "legacy-tcp-both", "4.x-tcp-both", "legacy-tcp":
@@ -468,6 +552,14 @@ func preferLegacyTCPSend(release string) bool {
 		return false
 	}
 	return strings.HasPrefix(lower, "4.19.90-2403.") && strings.Contains(lower, "uel20")
+}
+
+func preferLegacyUserRead(release string) bool {
+	lower := strings.ToLower(strings.TrimSpace(release))
+	if lower == "" {
+		return false
+	}
+	return strings.HasPrefix(lower, "4.19.90-52.42.") && strings.Contains(lower, "v2207") && strings.Contains(lower, "ky10")
 }
 
 func preferLegacyTCPBoth(release string) bool {

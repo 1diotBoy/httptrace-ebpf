@@ -44,6 +44,11 @@ func TestChooseVariantPlans(t *testing.T) {
 			wantNames: []string{"legacy-4.x"},
 		},
 		{
+			name:      "legacy-4x-ky10-arm64-userread",
+			version:   kernelVersion{Release: "4.19.90-52.42.v2207.ky10.aarch64", Major: 4, Minor: 19},
+			wantNames: []string{"legacy-4.x-userread", "legacy-4.x"},
+		},
+		{
 			name:      "legacy-4x-uel20-tcp-send-primary",
 			version:   kernelVersion{Release: "4.19.90-2403.3.0.0270.84.uel20.x86_64", Major: 4, Minor: 19},
 			wantNames: []string{"legacy-4.x-tcp-send", "legacy-4.x"},
@@ -109,6 +114,7 @@ func TestVariantPlanByName(t *testing.T) {
 		ok   bool
 	}{
 		{name: "legacy", want: "legacy-4.x", ok: true},
+		{name: "legacy-userread", want: "legacy-4.x-userread", ok: true},
 		{name: "legacy-tcp-send", want: "legacy-4.x-tcp-send", ok: true},
 		{name: "legacy-tcp", want: "legacy-4.x-tcp-both", ok: true},
 		{name: "tcp-5.15-compact", want: "tcp-5.15-compact", ok: true},

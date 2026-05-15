@@ -48,6 +48,8 @@ generate:
 	rm -f internal/bpfgen/httptracev6compact_arm64_bpfel.go internal/bpfgen/httptracev6compact_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracelegacy_x86_bpfel.go internal/bpfgen/httptracelegacy_x86_bpfel.o
 	rm -f internal/bpfgen/httptracelegacy_arm64_bpfel.go internal/bpfgen/httptracelegacy_arm64_bpfel.o
+	rm -f internal/bpfgen/httptracelegacyuserread_x86_bpfel.go internal/bpfgen/httptracelegacyuserread_x86_bpfel.o
+	rm -f internal/bpfgen/httptracelegacyuserread_arm64_bpfel.go internal/bpfgen/httptracelegacyuserread_arm64_bpfel.o
 	GOCACHE=$(GOCACHE) GOOS=$(HOST_GOOS) GOARCH=$(HOST_GOARCH) GOPROXY=off GOSUMDB=off $(GO) generate ./internal/bpfgen
 
 build: generate
@@ -82,6 +84,8 @@ clean-generated:
 	rm -f internal/bpfgen/httptracev6compact_arm64_bpfel.go internal/bpfgen/httptracev6compact_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracelegacy_x86_bpfel.go internal/bpfgen/httptracelegacy_x86_bpfel.o
 	rm -f internal/bpfgen/httptracelegacy_arm64_bpfel.go internal/bpfgen/httptracelegacy_arm64_bpfel.o
+	rm -f internal/bpfgen/httptracelegacyuserread_x86_bpfel.go internal/bpfgen/httptracelegacyuserread_x86_bpfel.o
+	rm -f internal/bpfgen/httptracelegacyuserread_arm64_bpfel.go internal/bpfgen/httptracelegacyuserread_arm64_bpfel.o
 	rm -f internal/bpfgen/httptrace_bpfel.go internal/bpfgen/httptrace_bpfel.o
 	rm -f internal/bpfgen/httptracecompact_bpfel.go internal/bpfgen/httptracecompact_bpfel.o
 	rm -f internal/bpfgen/httptracev66_bpfel.go internal/bpfgen/httptracev66_bpfel.o
