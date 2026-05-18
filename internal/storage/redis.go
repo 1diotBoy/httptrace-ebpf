@@ -93,7 +93,7 @@ func (s *RedisStore) Save(ctx context.Context, trace httptrace.TraceDocument) er
 	if err := s.client.LPush(ctx, "AAA-diaoge-trace", body).Err(); err != nil {
 		return fmt.Errorf("set redis key diaoge-trace: %w", err)
 	}
-	if err := s.client.Expire(ctx, "diaoge-trace", 24*time.Hour).Err(); err != nil {
+	if err := s.client.Expire(ctx, "AAA-diaoge-trace", 24*time.Hour).Err(); err != nil {
 		return fmt.Errorf("expire redis key diaoge-trace: %w", err)
 	}
 	return nil

@@ -512,6 +512,87 @@ func TestAssemblerEvictExpiredFlushesPartialResponse(t *testing.T) {
 	}
 }
 
+func TestAssemblerFlushStalledTruncatedResponseWithoutFinalSizeEvent(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 100*time.Millisecond)
+	now := time.Now()
+
+	reqUpdates, err := asm.Process(Event{
+		Timestamp: now,
+		ChainID:   6101,
+		PID:       101,
+		FD:        14,
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+		SrcPort:   54001,
+		DstPort:   80,
+		FragIdx:   0,
+		Direction: DirectionRequest,
+		Payload:   []byte("GET /stall HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+	})
+	if err != nil || len(reqUpdates) != 1 {
+		t.Fatalf("request emit failed: updates=%d err=%v", len(reqUpdates), err)
+	}
+
+	respUpdates, err := asm.Process(Event{
+		Timestamp:            now.Add(10 * time.Millisecond),
+		ChainID:              6101,
+		PID:                  101,
+		FD:                   14,
+		SrcIP:                "10.0.0.2",
+		DstIP:                "10.0.0.1",
+		SrcPort:              80,
+		DstPort:              54001,
+		FragIdx:              0,
+		Direction:            DirectionResponse,
+		Flags:                eventFlagCaptureTrunc,
+		ObservedMessageBytes: 32 * 1024,
+		Payload:              []byte("HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\nhello"),
+	})
+	if err != nil {
+		t.Fatalf("response process failed: %v", err)
+	}
+	if len(respUpdates) != 0 {
+		t.Fatalf("truncated response should still wait for stall/final signal, got %#v", respUpdates)
+	}
+
+	respUpdates, err = asm.Process(Event{
+		Timestamp:            now.Add(20 * time.Millisecond),
+		ChainID:              6101,
+		PID:                  101,
+		FD:                   14,
+		SrcIP:                "10.0.0.2",
+		DstIP:                "10.0.0.1",
+		SrcPort:              80,
+		DstPort:              54001,
+		Direction:            DirectionResponse,
+		Flags:                eventFlagSizeOnly,
+		ObservedMessageBytes: 128 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("size-only process failed: %v", err)
+	}
+	if len(respUpdates) != 0 {
+		t.Fatalf("size-only progress should not emit immediately, got %#v", respUpdates)
+	}
+
+	flushed := asm.FlushStalled(now.Add(250 * time.Millisecond))
+	if len(flushed) != 1 {
+		t.Fatalf("expected one stalled truncated response flush, got %d", len(flushed))
+	}
+	if flushed[0].Kind != "response" || flushed[0].Trace.Response == nil {
+		t.Fatalf("expected response update, got %#v", flushed)
+	}
+	if !flushed[0].Trace.ResponseTruncated || !flushed[0].Trace.Response.BodyPartial {
+		t.Fatalf("stalled truncated response should mark partial/truncated")
+	}
+	if got, want := flushed[0].Trace.Response.ObservedMessageBytes, uint64(128*1024); got != want {
+		t.Fatalf("observed bytes = %d, want %d", got, want)
+	}
+	if got, want := flushed[0].Trace.Response.Body, "hello"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+
 func TestAssemblerDefersResponseUntilRequestArrives(t *testing.T) {
 	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
 	now := time.Unix(1711717000, 0)

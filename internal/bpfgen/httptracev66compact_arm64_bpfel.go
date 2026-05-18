@@ -89,6 +89,7 @@ type HttpTraceV66CompactMapSpecs struct {
 	KernelStatsMap   *ebpf.MapSpec `ebpf:"kernel_stats_map"`
 	RecvArgsMap      *ebpf.MapSpec `ebpf:"recv_args_map"`
 	RecvFdMap        *ebpf.MapSpec `ebpf:"recv_fd_map"`
+	RecvGuardMap     *ebpf.MapSpec `ebpf:"recv_guard_map"`
 	ScratchHeap      *ebpf.MapSpec `ebpf:"scratch_heap"`
 	SendFdMap        *ebpf.MapSpec `ebpf:"send_fd_map"`
 	SendGuardMap     *ebpf.MapSpec `ebpf:"send_guard_map"`
@@ -130,6 +131,7 @@ type HttpTraceV66CompactMaps struct {
 	KernelStatsMap   *ebpf.Map `ebpf:"kernel_stats_map"`
 	RecvArgsMap      *ebpf.Map `ebpf:"recv_args_map"`
 	RecvFdMap        *ebpf.Map `ebpf:"recv_fd_map"`
+	RecvGuardMap     *ebpf.Map `ebpf:"recv_guard_map"`
 	ScratchHeap      *ebpf.Map `ebpf:"scratch_heap"`
 	SendFdMap        *ebpf.Map `ebpf:"send_fd_map"`
 	SendGuardMap     *ebpf.Map `ebpf:"send_guard_map"`
@@ -147,6 +149,7 @@ func (m *HttpTraceV66CompactMaps) Close() error {
 		m.KernelStatsMap,
 		m.RecvArgsMap,
 		m.RecvFdMap,
+		m.RecvGuardMap,
 		m.ScratchHeap,
 		m.SendFdMap,
 		m.SendGuardMap,

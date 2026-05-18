@@ -42,7 +42,8 @@
  *
  * 当前策略：
  * 1. 单个 perf event 的 payload 放大到 4KB 级别；
- * 2. 第一批最多覆盖 2 个 iov，在可加载性和 chunked 小响应之间取一个更稳的平衡；
+ * 2. 通用路径默认覆盖前 2 个 iov；legacy 4.19 固定展开时会额外补第 3 个 iov，
+ *    用来减少小 chunked 响应只抓到 framing、抓不到 body 的情况；
  * 3. 单 iov 最多展开 8 个 chunk；
  * 4. request/response 的总采集上限保持 32KB。
  */
@@ -83,6 +84,12 @@ enum http_event_flags {
 	EVT_FLAG_CONTROL = 1 << 4,
 	EVT_FLAG_CLOSE = 1 << 5,
 	EVT_FLAG_SIZE_ONLY = 1 << 6,
+};
+
+enum filter_debug_flags {
+	DEBUG_FLAG_SNAPSHOT = 1 << 0,
+	DEBUG_FLAG_LEGACY_SEND_PRIMARY_TCP = 1 << 8,
+	DEBUG_FLAG_LEGACY_RECV_PRIMARY_TCP = 1 << 9,
 };
 
 struct iovec_compat {
@@ -301,6 +308,8 @@ struct recv_args {
 	__u16 dst_port;
 	__u16 family;
 	__u8 source;
+	__u8 metadata_only;
+	__u8 observed_accounted;
 	__u8 pad0;
 	char comm[16];
 };
@@ -328,7 +337,16 @@ struct send_capture_scratch {
 struct send_guard {
 	__u64 msg_ptr;
 	__u8 source;
-	__u8 pad0[7];
+	__u8 observed_accounted;
+	__u8 metadata_only;
+	__u8 pad0[5];
+};
+
+struct recv_guard {
+	__u64 msg_ptr;
+	__u8 source;
+	__u8 metadata_only;
+	__u8 pad0[6];
 };
 
 struct http_event {
@@ -426,6 +444,12 @@ struct kernel_stats {
 	__u64 tuple_cache_misses;
 	__u64 prefix_second_iov;
 	__u64 prefix_trimmed;
+	__u64 send_size_only_events;
+	__u64 recv_size_only_events;
+	__u64 send_guard_duplicates;
+	__u64 send_guard_upgrades;
+	__u64 recv_guard_duplicates;
+	__u64 recv_guard_upgrades;
 	__u64 iter_ubuf;
 	__u64 iter_iovec;
 	__u64 iter_kvec;

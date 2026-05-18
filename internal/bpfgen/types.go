@@ -73,6 +73,12 @@ type HttpTraceKernelStats struct {
 	TupleCacheMisses      uint64
 	PrefixSecondIov       uint64
 	PrefixTrimmed         uint64
+	SendSizeOnlyEvents    uint64
+	RecvSizeOnlyEvents    uint64
+	SendGuardDuplicates   uint64
+	SendGuardUpgrades     uint64
+	RecvGuardDuplicates   uint64
+	RecvGuardUpgrades     uint64
 	IterUbuf              uint64
 	IterIovec             uint64
 	IterKvec              uint64

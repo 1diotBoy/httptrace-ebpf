@@ -49,6 +49,13 @@ struct bpf_map_def SEC("maps") send_guard_map = {
 	.max_entries = 65535,
 };
 
+struct bpf_map_def SEC("maps") recv_guard_map = {
+	.type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(__u64),
+	.value_size = sizeof(struct recv_guard),
+	.max_entries = 65535,
+};
+
 struct bpf_map_def SEC("maps") recv_fd_map = {
 	.type = BPF_MAP_TYPE_HASH,
 	.key_size = sizeof(__u64),
@@ -125,7 +132,43 @@ static __always_inline __attribute__((unused)) int debug_snapshot_enabled(void)
 
 	if (read_filter(&cfg) < 0)
 		return 0;
-	return (cfg.debug_flags & 1) != 0;
+	return (cfg.debug_flags & DEBUG_FLAG_SNAPSHOT) != 0;
+}
+
+static __always_inline __u32 read_debug_flags(void)
+{
+	struct filter_config cfg = {};
+
+	if (read_filter(&cfg) < 0)
+		return 0;
+	return cfg.debug_flags;
+}
+
+static __always_inline int legacy_send_primary_tcp(void)
+{
+	return (read_debug_flags() & DEBUG_FLAG_LEGACY_SEND_PRIMARY_TCP) != 0;
+}
+
+static __always_inline int legacy_recv_primary_tcp(void)
+{
+	return (read_debug_flags() & DEBUG_FLAG_LEGACY_RECV_PRIMARY_TCP) != 0;
+}
+
+static __always_inline int source_is_tcp(__u8 source)
+{
+	return source == SRC_TCP_SENDMSG || source == SRC_TCP_RECVMSG;
+}
+
+static __always_inline int source_is_send(__u8 source)
+{
+	return source == SRC_SOCK_SENDMSG || source == SRC_TCP_SENDMSG;
+}
+
+static __always_inline int payload_primary_for_source(__u8 source)
+{
+	if (!source_is_send(source))
+		return source_is_tcp(source) ? legacy_recv_primary_tcp() : !legacy_recv_primary_tcp();
+	return source_is_tcp(source) ? legacy_send_primary_tcp() : !legacy_send_primary_tcp();
 }
 
 static __always_inline int extract_sk(void *sock_ptr, struct sock_compat **sk)
@@ -1196,6 +1239,59 @@ static __attribute__((noinline)) int emit_data_event(void *ctx, const struct cap
 	return 0;
 }
 
+static __attribute__((noinline)) int emit_size_progress_event(void *ctx, const struct recv_args *meta,
+							      __u64 chain_id, __u8 direction,
+							      __u64 observed_bytes)
+{
+	struct http_event *event = NULL;
+	struct kernel_stats *stats = stats_lookup();
+	__u32 key = 0;
+
+	if (!meta || !chain_id)
+		return 0;
+
+	event = bpf_map_lookup_elem(&scratch_heap, &key);
+	if (!event)
+		return -1;
+
+	event->ts_ns = bpf_ktime_get_ns();
+	event->chain_id = chain_id;
+	event->sock_id = meta->sock_id;
+	event->seq_hint = meta->seq_hint;
+	event->observed_message_bytes = observed_bytes;
+	event->pid = meta->pid;
+	event->tid = meta->tid;
+	event->fd = meta->fd;
+	event->ifindex = meta->ifindex;
+	event->src_ip = meta->src_ip;
+	event->dst_ip = meta->dst_ip;
+	event->src_port = meta->src_port;
+	event->dst_port = meta->dst_port;
+	event->payload_len = 0;
+	event->total_len = 0;
+	event->frag_idx = 0;
+	event->direction = direction;
+	event->flags = EVT_FLAG_SIZE_ONLY;
+	event->source = meta->source;
+	event->family = meta->family;
+	__builtin_memcpy(event->comm, meta->comm, sizeof(event->comm));
+
+	if (bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, event, sizeof(*event)) < 0) {
+		if (stats)
+			stats->perf_errors += 1;
+		return -1;
+	}
+
+	if (stats) {
+		if (direction == DIR_REQUEST)
+			stats->recv_size_only_events += 1;
+		else if (direction == DIR_RESPONSE)
+			stats->send_size_only_events += 1;
+	}
+
+	return 0;
+}
+
 #ifndef LEGACY_VERIFIER
 static __attribute__((noinline)) int emit_size_final_event(void *ctx, const struct recv_args *meta,
 							   __u64 chain_id, __u8 direction,
@@ -1238,6 +1334,13 @@ static __attribute__((noinline)) int emit_size_final_event(void *ctx, const stru
 		if (stats)
 			stats->perf_errors += 1;
 		return -1;
+	}
+
+	if (stats) {
+		if (direction == DIR_REQUEST)
+			stats->recv_size_only_events += 1;
+		else if (direction == DIR_RESPONSE)
+			stats->send_size_only_events += 1;
 	}
 
 	return 0;
@@ -1364,6 +1467,27 @@ static __attribute__((noinline)) int capture_iov_slot1_legacy(void *ctx, struct 
 	return 0;
 }
 
+static __attribute__((noinline)) int capture_iov_slot2_legacy(void *ctx, struct capture_call *call,
+							      struct legacy_capture_state *state)
+{
+	if (!call->iter)
+		return 0;
+	if (state->captured >= call->total_len || state->total_captured >= state->capture_limit)
+		return 0;
+	if (load_iter_segment(call->iter, 2, &state->base, &state->seg_len) < 0)
+		return 0;
+	if (!state->base || state->seg_len == 0)
+		return 0;
+
+	if (state->seg_len > call->total_len - state->captured)
+		state->seg_len = call->total_len - state->captured;
+	if (state->seg_len > state->capture_limit - state->total_captured)
+		state->seg_len = state->capture_limit - state->total_captured;
+
+	EMIT_CHUNK_LEGACY_8();
+	return 0;
+}
+
 /* 4.19 verifier 不接受 capture_message_from_iter 里编译器残留的回边。
  * legacy 对象把 iov/chunk 展开成固定分支，专门换取“稳定可加载”。
  */
@@ -1398,14 +1522,16 @@ static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct
 		state.total_captured = total_captured;
 		state.frag_idx = frag_idx;
 		state.common_flags = common_flags;
-		state.capture_limit = capture_limit;
-		if (capture_iov_slot0_legacy(ctx, call, &state) < 0)
-			return -1;
-		if (capture_iov_slot1_legacy(ctx, call, &state) < 0)
-			return -1;
-		captured = state.captured;
-		total_captured = state.total_captured;
-		frag_idx = state.frag_idx;
+			state.capture_limit = capture_limit;
+			if (capture_iov_slot0_legacy(ctx, call, &state) < 0)
+				return -1;
+			if (capture_iov_slot1_legacy(ctx, call, &state) < 0)
+				return -1;
+			if (capture_iov_slot2_legacy(ctx, call, &state) < 0)
+				return -1;
+			captured = state.captured;
+			total_captured = state.total_captured;
+			frag_idx = state.frag_idx;
 	}
 
 	*call->frag_cursor = frag_idx;
@@ -1535,6 +1661,23 @@ static __always_inline void clear_send_guard(__u64 pid_tgid)
 	bpf_map_delete_elem(&send_guard_map, &pid_tgid);
 }
 
+static __always_inline void clear_recv_guard(__u64 pid_tgid)
+{
+	bpf_map_delete_elem(&recv_guard_map, &pid_tgid);
+}
+
+enum send_guard_result {
+	SEND_GUARD_SKIP = 0,
+	SEND_GUARD_META_AND_COUNT = 1,
+	SEND_GUARD_PAYLOAD_AND_COUNT = 2,
+	SEND_GUARD_PAYLOAD_ONLY = 3,
+};
+
+enum recv_guard_result {
+	RECV_GUARD_SKIP = 0,
+	RECV_GUARD_STORE = 1,
+};
+
 /* 当同时挂了 sock_sendmsg 和 tcp_sendmsg 时，同一条 send 调用可能先后命中两个 hook。
  * 这里按 pid_tgid + msg 指针做一次轻量去重
  * - msg 指针更接近“这一次具体发送调用”，适合在 sock_sendmsg 与 tcp_sendmsg 之间去重。
@@ -1547,15 +1690,73 @@ static __always_inline int claim_send_guard(__u64 pid_tgid, struct msghdr_compat
 	struct send_guard guard = {};
 	struct send_guard *existing = NULL;
 	__u64 msg_ptr = (__u64)msg;
+	struct kernel_stats *stats = stats_lookup();
+	int payload_primary = payload_primary_for_source(source);
 
 	existing = bpf_map_lookup_elem(&send_guard_map, &pid_tgid);
-	if (existing && existing->msg_ptr == msg_ptr)
-		return 0;
+	if (existing && existing->msg_ptr == msg_ptr) {
+		if (existing->source == source) {
+			if (stats)
+				stats->send_guard_duplicates += 1;
+			return SEND_GUARD_SKIP;
+		}
+		if (payload_primary && existing->metadata_only) {
+			guard.msg_ptr = msg_ptr;
+			guard.source = source;
+			guard.observed_accounted = existing->observed_accounted;
+			guard.metadata_only = 0;
+			bpf_map_update_elem(&send_guard_map, &pid_tgid, &guard, BPF_ANY);
+			if (stats)
+				stats->send_guard_upgrades += 1;
+			return existing->observed_accounted ? SEND_GUARD_PAYLOAD_ONLY : SEND_GUARD_PAYLOAD_AND_COUNT;
+		}
+		if (stats)
+			stats->send_guard_duplicates += 1;
+		return SEND_GUARD_SKIP;
+	}
 
 	guard.msg_ptr = msg_ptr;
 	guard.source = source;
+	guard.metadata_only = payload_primary ? 0 : 1;
+	guard.observed_accounted = payload_primary ? 0 : 1;
 	bpf_map_update_elem(&send_guard_map, &pid_tgid, &guard, BPF_ANY);
-	return 1;
+	return payload_primary ? SEND_GUARD_PAYLOAD_AND_COUNT : SEND_GUARD_META_AND_COUNT;
+}
+
+static __always_inline int claim_recv_guard(__u64 pid_tgid, struct msghdr_compat *msg, __u8 source)
+{
+	struct recv_guard guard = {};
+	struct recv_guard *existing = NULL;
+	__u64 msg_ptr = (__u64)msg;
+	struct kernel_stats *stats = stats_lookup();
+	int payload_primary = payload_primary_for_source(source);
+
+	existing = bpf_map_lookup_elem(&recv_guard_map, &pid_tgid);
+	if (existing && existing->msg_ptr == msg_ptr) {
+		if (existing->source == source) {
+			if (stats)
+				stats->recv_guard_duplicates += 1;
+			return RECV_GUARD_SKIP;
+		}
+		if (payload_primary && existing->metadata_only) {
+			guard.msg_ptr = msg_ptr;
+			guard.source = source;
+			guard.metadata_only = 0;
+			bpf_map_update_elem(&recv_guard_map, &pid_tgid, &guard, BPF_ANY);
+			if (stats)
+				stats->recv_guard_upgrades += 1;
+			return RECV_GUARD_STORE;
+		}
+		if (stats)
+			stats->recv_guard_duplicates += 1;
+		return RECV_GUARD_SKIP;
+	}
+
+	guard.msg_ptr = msg_ptr;
+	guard.source = source;
+	guard.metadata_only = payload_primary ? 0 : 1;
+	bpf_map_update_elem(&recv_guard_map, &pid_tgid, &guard, BPF_ANY);
+	return RECV_GUARD_STORE;
 }
 
 static __always_inline __s32 consume_fd(__u64 pid_tgid, void *map)
@@ -1576,19 +1777,17 @@ static __always_inline int store_recv_args(struct sock_compat *sk, struct msghdr
 	struct iov_iter_compat iter = {};
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	struct kernel_stats *stats = stats_lookup();
-#ifndef LEGACY_VERIFIER
-	struct recv_args *existing = NULL;
 
-	existing = bpf_map_lookup_elem(&recv_args_map, &pid_tgid);
-	if (existing && fd < 0)
+	if (claim_recv_guard(pid_tgid, msg, source) == RECV_GUARD_SKIP)
 		return 0;
-#endif
 
 	fill_common_meta(&meta, sk, fd, source);
 	if (load_best_effort_tuple(sk, &meta) == 0 && !matches_filter(&meta))
 		return 0;
 
 	meta.msg_ptr = (__u64)msg;
+	meta.metadata_only = payload_primary_for_source(source) ? 0 : 1;
+	meta.observed_accounted = 0;
 	if (read_msg_iter(msg, &iter) < 0 || !iter.count) {
 		if (stats)
 			stats->recv_store_no_iter += 1;
@@ -1755,7 +1954,10 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 	}
 
 	emit_meta.seq_hint = seq_hint;
-	if (!state->req_capture_stopped) {
+	if (meta->metadata_only || state->req_capture_stopped) {
+		emit_meta.observed_accounted = 1;
+		emit_size_progress_event(ctx, &emit_meta, chain_id, DIR_REQUEST, state->req_observed_bytes);
+	} else {
 		struct capture_call call = {};
 
 		call.iter = &meta->saved_iter;
@@ -1774,6 +1976,7 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 	}
 cleanup:
 	bpf_map_delete_elem(&recv_args_map, &pid_tgid);
+	clear_recv_guard(pid_tgid);
 	return 0;
 }
 
@@ -1788,6 +1991,7 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 	__u64 sock_id = 0;
 	__u64 chain_id = 0;
 	int started_new_response = 0;
+	int guard_action = SEND_GUARD_SKIP;
 
 	if (stats)
 		stats->send_calls += 1;
@@ -1811,16 +2015,34 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 				    DEBUG_STAGE_NO_CHAIN, started_new_response);
 		return 0;
 	}
-	if (!claim_send_guard(bpf_get_current_pid_tgid(), msg, source)) {
+	guard_action = claim_send_guard(bpf_get_current_pid_tgid(), msg, source);
+	if (guard_action == SEND_GUARD_SKIP) {
 		snapshot_send_debug(sk, msg, &scratch->meta, &scratch->iter, state, chain_id, source,
 				    DEBUG_STAGE_GUARD_DUP, started_new_response);
 		return 0;
 	}
 
-	if (started_new_response)
+	if (guard_action != SEND_GUARD_PAYLOAD_ONLY && started_new_response)
 		start_response_capture(state, chain_id);
 
-	state->resp_observed_bytes += scratch->iter.count;
+	if (guard_action == SEND_GUARD_META_AND_COUNT || guard_action == SEND_GUARD_PAYLOAD_AND_COUNT)
+		state->resp_observed_bytes += scratch->iter.count;
+
+	scratch->meta.seq_hint = state->tx_cursor;
+
+	if (guard_action == SEND_GUARD_META_AND_COUNT) {
+		emit_size_progress_event(ctx, &scratch->meta, chain_id, DIR_RESPONSE, state->resp_observed_bytes);
+		snapshot_send_debug(sk, msg, &scratch->meta, &scratch->iter, state, chain_id, source,
+				    DEBUG_STAGE_CAPTURE_OK, started_new_response);
+		return 0;
+	}
+
+	if (state->resp_capture_stopped) {
+		emit_size_progress_event(ctx, &scratch->meta, chain_id, DIR_RESPONSE, state->resp_observed_bytes);
+		snapshot_send_debug(sk, msg, &scratch->meta, &scratch->iter, state, chain_id, source,
+				    DEBUG_STAGE_CAPTURE_OK, started_new_response);
+		return 0;
+	}
 
 	if (capture_response_message(ctx, &scratch->iter, &scratch->meta, state, source) < 0)
 		return 0;
@@ -1879,6 +2101,7 @@ int tracepoint_sys_enter_recvfrom(struct trace_event_raw_sys_enter_compat *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = (__s32)ctx->args[0];
 
+	clear_recv_guard(pid_tgid);
 	stash_fd(pid_tgid, fd, &recv_fd_map);
 	return 0;
 }
@@ -1889,6 +2112,7 @@ int tracepoint_sys_enter_recvmsg(struct trace_event_raw_sys_enter_compat *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = (__s32)ctx->args[0];
 
+	clear_recv_guard(pid_tgid);
 	stash_fd(pid_tgid, fd, &recv_fd_map);
 	return 0;
 }
@@ -1899,6 +2123,7 @@ int tracepoint_sys_enter_read(struct trace_event_raw_sys_enter_compat *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = (__s32)ctx->args[0];
 
+	clear_recv_guard(pid_tgid);
 	stash_fd(pid_tgid, fd, &recv_fd_map);
 	return 0;
 }
@@ -1909,6 +2134,7 @@ int tracepoint_sys_enter_readv(struct trace_event_raw_sys_enter_compat *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__s32 fd = (__s32)ctx->args[0];
 
+	clear_recv_guard(pid_tgid);
 	stash_fd(pid_tgid, fd, &recv_fd_map);
 	return 0;
 }

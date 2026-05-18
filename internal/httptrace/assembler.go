@@ -772,9 +772,6 @@ func (t *traceState) shouldFlushStalledResponse(now time.Time, stall time.Durati
 	if len(t.pendingRequests) == 0 || len(t.responseStream.buffer) == 0 {
 		return false
 	}
-	if t.responseStream.truncated {
-		return false
-	}
 	if t.responseUpdated.IsZero() {
 		return false
 	}

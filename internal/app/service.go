@@ -32,6 +32,10 @@ const (
 	flagControl      = 1 << 4
 	flagClose        = 1 << 5
 	flagSizeOnly     = 1 << 6
+
+	kernelDebugFlagSnapshot             = 1 << 0
+	kernelDebugFlagLegacySendPrimaryTCP = 1 << 8
+	kernelDebugFlagLegacyRecvPrimaryTCP = 1 << 9
 )
 
 type Service struct {
@@ -42,6 +46,7 @@ type Service struct {
 	resolver                 *socketResolver
 	stats                    *stats
 	resourcePlan             runtimeResourcePlan
+	hookStrategy             bpfgen.HookStrategy
 	lastRequestCaptureLimit  uint32
 	lastResponseCaptureLimit uint32
 	lastDebugSnapshotSeq     uint64
@@ -104,6 +109,21 @@ var resolveRetryBackoffs = [...]time.Duration{
 	100 * time.Millisecond,
 }
 
+func kernelDebugFlags(debug bool, strategy bpfgen.HookStrategy) uint32 {
+	var flags uint32
+	if debug {
+		flags |= kernelDebugFlagSnapshot
+	}
+	switch strategy {
+	case bpfgen.HookStrategyLegacyTCPSend:
+		flags |= kernelDebugFlagLegacySendPrimaryTCP
+	case bpfgen.HookStrategyLegacyTCPBoth, bpfgen.HookStrategyTCPOnly:
+		flags |= kernelDebugFlagLegacySendPrimaryTCP
+		flags |= kernelDebugFlagLegacyRecvPrimaryTCP
+	}
+	return flags
+}
+
 func NewService(cfg Config) (*Service, error) {
 	cfg, plan := cfg.normalizedForHost()
 	filter, err := cfg.ResolveFilter()
@@ -155,6 +175,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	defer objs.Close()
 	log.Printf("bpf objects loaded (variant=%s hook_strategy=%s)", objs.Variant, objs.HookStrategy)
+	s.hookStrategy = objs.HookStrategy
 
 	if err := s.installFilter(objs); err != nil {
 		return err
@@ -257,9 +278,7 @@ func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 			kernelFilter.RequestCaptureBytes = uint32(s.cfg.CaptureBytes)
 			kernelFilter.ResponseCaptureBytes = uint32(s.cfg.CaptureBytes)
 		}
-		if s.cfg.DebugKernel {
-			kernelFilter.DebugFlags = 1
-		}
+		kernelFilter.DebugFlags = kernelDebugFlags(s.cfg.DebugKernel, objs.HookStrategy)
 		if err := objs.FilterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update filter map: %w", err)
 		}
@@ -271,9 +290,7 @@ func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 		log.Printf("ifname filter is not enforced in kernel tuple-cache mode: socket-layer ifindex is not reliable enough")
 	}
 	kernelFilter.Ifindex = 0
-	if s.cfg.DebugKernel {
-		kernelFilter.DebugFlags = 1
-	}
+	kernelFilter.DebugFlags = kernelDebugFlags(s.cfg.DebugKernel, objs.HookStrategy)
 	if objs.HookStrategy == bpfgen.HookStrategyLegacySock ||
 		objs.HookStrategy == bpfgen.HookStrategyLegacyTCPSend ||
 		objs.HookStrategy == bpfgen.HookStrategyLegacyTCPBoth {
@@ -318,9 +335,7 @@ func (s *Service) syncCaptureLimitsToKernel(filterMap *ebpf.Map) error {
 	}
 	kernelFilter.RequestCaptureBytes = requestLimit
 	kernelFilter.ResponseCaptureBytes = responseLimit
-	if s.cfg.DebugKernel {
-		kernelFilter.DebugFlags = 1
-	}
+	kernelFilter.DebugFlags = kernelDebugFlags(s.cfg.DebugKernel, s.hookStrategy)
 	if err := filterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update dynamic capture limits: %w", err)
 	}
@@ -1133,7 +1148,7 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 			s.stats.workerQueuePeak.Load(),
 		)
 		log.Printf(
-			"%s kernel debug(sock_send_hits=%d tcp_send_hits=%d sock_recv_hits=%d tcp_recv_hits=%d recv_store_ok=%d recv_store_no_iter=%d recv_store_meta_fail=%d recv_ret_no_meta=%d recv_dir_request=%d recv_dir_response=%d recv_dir_unknown=%d recv_fallback_local=%d recv_fallback_keepalive=%d send_no_req_chain=%d send_resp_start=%d send_resp_continue=%d send_resp_reqactive=%d send_iter_empty=%d tuple_ipv4_ok=%d tuple_ipv6_portonly=%d tuple_extract_fail=%d prefix_second_iov=%d prefix_trimmed=%d iter_ubuf=%d iter_iovec=%d iter_kvec=%d iter_bvec=%d iter_unsupported=%d iter_load_fail=%d)",
+			"%s kernel debug(sock_send_hits=%d tcp_send_hits=%d sock_recv_hits=%d tcp_recv_hits=%d recv_store_ok=%d recv_store_no_iter=%d recv_store_meta_fail=%d recv_ret_no_meta=%d recv_dir_request=%d recv_dir_response=%d recv_dir_unknown=%d recv_fallback_local=%d recv_fallback_keepalive=%d send_no_req_chain=%d send_resp_start=%d send_resp_continue=%d send_resp_reqactive=%d send_iter_empty=%d tuple_ipv4_ok=%d tuple_ipv6_portonly=%d tuple_extract_fail=%d prefix_second_iov=%d prefix_trimmed=%d send_size_only=%d recv_size_only=%d send_guard_dups=%d send_guard_upgrades=%d recv_guard_dups=%d recv_guard_upgrades=%d iter_ubuf=%d iter_iovec=%d iter_kvec=%d iter_bvec=%d iter_unsupported=%d iter_load_fail=%d)",
 			label,
 			kstats.SockSendHits,
 			kstats.TcpSendHits,
@@ -1158,6 +1173,12 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 			kstats.TupleExtractFail,
 			kstats.PrefixSecondIov,
 			kstats.PrefixTrimmed,
+			kstats.SendSizeOnlyEvents,
+			kstats.RecvSizeOnlyEvents,
+			kstats.SendGuardDuplicates,
+			kstats.SendGuardUpgrades,
+			kstats.RecvGuardDuplicates,
+			kstats.RecvGuardUpgrades,
 			kstats.IterUbuf,
 			kstats.IterIovec,
 			kstats.IterKvec,
@@ -1293,6 +1314,19 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 				ret     bool
 				prog    *ebpf.Program
 			}{symbols: []string{"tcp_sendmsg"}, prog: objs.KprobeTcpSendmsg},
+			// request 默认仍以 sock_recvmsg 为主，这里把 tcp_recvmsg 当补充路径；
+			// 4.19 的某些 Nginx/内核组合会把读路径更多暴露在 tcp_recvmsg 上，
+			// 这里补挂后可以继续统计 observed_message_bytes，但不再重复搬 payload。
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_recvmsg"}, prog: objs.KprobeTcpRecvmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_recvmsg"}, ret: true, prog: objs.KretprobeTcpRecvmsg},
 		)
 		optionalKprobes = append(optionalKprobes,
 			struct {
@@ -1329,6 +1363,21 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 				symbols []string
 				ret     bool
 				prog    *ebpf.Program
+			}{symbols: []string{"sock_sendmsg"}, prog: objs.KprobeSockSendmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_recvmsg"}, prog: objs.KprobeTcpRecvmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"tcp_recvmsg"}, ret: true, prog: objs.KretprobeTcpRecvmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
 			}{symbols: []string{"tcp_v4_connect"}, prog: objs.KprobeTcpV4Connect},
 			struct {
 				symbols []string
@@ -1355,6 +1404,21 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 	}
 	if objs.HookStrategy == bpfgen.HookStrategyLegacyTCPBoth {
 		optionalKprobes = append(optionalKprobes,
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"sock_sendmsg"}, prog: objs.KprobeSockSendmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"sock_recvmsg"}, prog: objs.KprobeSockRecvmsg},
+			struct {
+				symbols []string
+				ret     bool
+				prog    *ebpf.Program
+			}{symbols: []string{"sock_recvmsg"}, ret: true, prog: objs.KretprobeSockRecvmsg},
 			struct {
 				symbols []string
 				ret     bool
@@ -1660,6 +1724,24 @@ func readKernelStats(m *ebpf.Map) (bpfgen.HttpTraceKernelStats, error) {
 		total.TupleIpv4Ok += v.TupleIpv4Ok
 		total.TupleIpv6Portonly += v.TupleIpv6Portonly
 		total.TupleExtractFail += v.TupleExtractFail
+		total.TupleCacheUpdates += v.TupleCacheUpdates
+		total.TupleCacheDeletes += v.TupleCacheDeletes
+		total.TupleCacheHits += v.TupleCacheHits
+		total.TupleCacheMisses += v.TupleCacheMisses
+		total.PrefixSecondIov += v.PrefixSecondIov
+		total.PrefixTrimmed += v.PrefixTrimmed
+		total.SendSizeOnlyEvents += v.SendSizeOnlyEvents
+		total.RecvSizeOnlyEvents += v.RecvSizeOnlyEvents
+		total.SendGuardDuplicates += v.SendGuardDuplicates
+		total.SendGuardUpgrades += v.SendGuardUpgrades
+		total.RecvGuardDuplicates += v.RecvGuardDuplicates
+		total.RecvGuardUpgrades += v.RecvGuardUpgrades
+		total.IterUbuf += v.IterUbuf
+		total.IterIovec += v.IterIovec
+		total.IterKvec += v.IterKvec
+		total.IterBvec += v.IterBvec
+		total.IterUnsupported += v.IterUnsupported
+		total.IterLoadFail += v.IterLoadFail
 	}
 	return total, nil
 }
