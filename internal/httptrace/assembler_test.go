@@ -1015,7 +1015,7 @@ func TestAssemblerKeepsCollectingPayloadAfterTruncationFlag(t *testing.T) {
 	}
 }
 
-func TestAssemblerTLSKeepsNewRequestsQueuedOnKeepAliveConnection(t *testing.T) {
+func TestAssemblerTLSIgnoresSecondRequestOnSameChain(t *testing.T) {
 	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
 	now := time.Now()
 
@@ -1051,21 +1051,17 @@ func TestAssemblerTLSKeepsNewRequestsQueuedOnKeepAliveConnection(t *testing.T) {
 		Source:    "tls_ssl_read",
 		Payload:   []byte("DELETE /delete HTTP/1.1\r\nHost: example.com\r\n\r\n"),
 	})
-	if err != nil || len(req2Updates) != 1 {
-		t.Fatalf("second tls request should queue as a new request: updates=%d err=%v", len(req2Updates), err)
+	if err != nil {
+		t.Fatalf("second tls request process failed: err=%v", err)
 	}
-
-	if req1Updates[0].Trace.Request == nil || req2Updates[0].Trace.Request == nil {
-		t.Fatalf("expected parsed requests, got %#v and %#v", req1Updates[0].Trace.Request, req2Updates[0].Trace.Request)
+	if len(req2Updates) != 0 {
+		t.Fatalf("same tls chain must not emit a second logical request, got %#v", req2Updates)
+	}
+	if req1Updates[0].Trace.Request == nil {
+		t.Fatalf("expected parsed first request")
 	}
 	if got, want := req1Updates[0].Trace.Request.URL, "/query"; got != want {
 		t.Fatalf("first request url = %q, want %q", got, want)
-	}
-	if got, want := req2Updates[0].Trace.Request.URL, "/delete"; got != want {
-		t.Fatalf("second request url = %q, want %q", got, want)
-	}
-	if req1Updates[0].Trace.ChainID == req2Updates[0].Trace.ChainID {
-		t.Fatalf("logical chain ids should differ across queued requests")
 	}
 
 	resp1Updates, err := asm.Process(Event{
@@ -1089,29 +1085,72 @@ func TestAssemblerTLSKeepsNewRequestsQueuedOnKeepAliveConnection(t *testing.T) {
 		t.Fatalf("first response chain = %d, want %d", got, want)
 	}
 
-	resp2Updates, err := asm.Process(Event{
-		Timestamp: now.Add(15 * time.Millisecond),
-		ChainID:   9301,
-		PID:       108,
-		FD:        21,
-		SrcIP:     "10.0.0.2",
-		DstIP:     "10.0.0.1",
-		SrcPort:   443,
-		DstPort:   54008,
-		FragIdx:   1,
-		Direction: DirectionResponse,
-		Source:    "tls_ssl_write",
-		Payload:   []byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"),
-	})
-	if err != nil || len(resp2Updates) != 1 {
-		t.Fatalf("second tls response emit failed: updates=%d err=%v", len(resp2Updates), err)
-	}
-	if got, want := resp2Updates[0].Trace.ChainID, req2Updates[0].Trace.ChainID; got != want {
-		t.Fatalf("second response chain = %d, want %d", got, want)
-	}
-
 	snap := asm.Snapshot()
 	if snap.PendingRequests != 0 {
 		t.Fatalf("pending requests should be drained, got %#v", snap)
+	}
+}
+
+func TestAssemblerTLSEmitsOnlyFirstRequestFromSingleChainBuffer(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
+	now := time.Now()
+
+	updates, err := asm.Process(Event{
+		Timestamp: now,
+		ChainID:   9302,
+		PID:       109,
+		FD:        22,
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+		SrcPort:   54009,
+		DstPort:   443,
+		FragIdx:   0,
+		Direction: DirectionRequest,
+		Source:    "tls_ssl_read",
+		Payload: []byte(
+			"GET /first HTTP/1.1\r\nHost: example.com\r\n\r\n" +
+				"DELETE /second HTTP/1.1\r\nHost: example.com\r\n\r\n",
+		),
+	})
+	if err != nil {
+		t.Fatalf("tls request process failed: %v", err)
+	}
+	if len(updates) != 1 || updates[0].Kind != "request" {
+		t.Fatalf("expected one tls request update, got %#v", updates)
+	}
+	if updates[0].Trace.Request == nil {
+		t.Fatalf("expected parsed request")
+	}
+	if got, want := updates[0].Trace.Request.URL, "/first"; got != want {
+		t.Fatalf("request url = %q, want %q", got, want)
+	}
+
+	respUpdates, err := asm.Process(Event{
+		Timestamp: now.Add(10 * time.Millisecond),
+		ChainID:   9302,
+		PID:       109,
+		FD:        22,
+		SrcIP:     "10.0.0.2",
+		DstIP:     "10.0.0.1",
+		SrcPort:   443,
+		DstPort:   54009,
+		FragIdx:   0,
+		Direction: DirectionResponse,
+		Source:    "tls_ssl_write",
+		Payload:   []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
+	})
+	if err != nil {
+		t.Fatalf("tls response process failed: %v", err)
+	}
+	if len(respUpdates) != 1 || respUpdates[0].Kind != "response" {
+		t.Fatalf("expected one tls response update, got %#v", respUpdates)
+	}
+	if got, want := respUpdates[0].Trace.ChainID, updates[0].Trace.ChainID; got != want {
+		t.Fatalf("response chain = %d, want %d", got, want)
+	}
+
+	snap := asm.Snapshot()
+	if snap.PendingRequests != 0 || snap.PendingNoRespBytes != 0 {
+		t.Fatalf("tls chain leftovers should be drained, got %#v", snap)
 	}
 }

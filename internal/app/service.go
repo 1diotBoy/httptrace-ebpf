@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -97,6 +98,21 @@ type stats struct {
 	dispatchBlocked    atomic.Uint64
 	workerQueuePeak    atomic.Uint64
 	shutdownFlushes    atomic.Uint64
+	sourceMu           sync.Mutex
+	rawBySource        map[string]sourceDirectionCounts
+	updatesBySource    map[string]sourceUpdateCounts
+}
+
+type sourceDirectionCounts struct {
+	Request  uint64
+	Response uint64
+	Unknown  uint64
+}
+
+type sourceUpdateCounts struct {
+	Request  uint64
+	Response uint64
+	Other    uint64
 }
 
 type resolveRetryItem struct {
@@ -590,6 +606,7 @@ func (s *Service) printHTTPTraceTag(tag string, update httptrace.Update) {
 func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace.Update, writeCh chan<- httptrace.Update) {
 	update.Trace = s.enrichTraceTupleForOutput(update.Trace)
 	update.Trace = s.sanitizeTraceForOutput(update.Trace)
+	s.stats.recordUpdateSource(update.Trace.CaptureSource, update.Kind)
 	if update.Kind == "request" {
 		s.stats.requests.Add(1)
 	}
@@ -875,6 +892,7 @@ func (s *Service) enqueueRetry(ctx context.Context, retrySem chan struct{}, retr
 }
 
 func (s *Service) dispatchEvent(ctx context.Context, event httptrace.Event, worker chan<- httptrace.Event) error {
+	s.stats.recordRawSourceEvent(event.Source, event.Direction)
 	if s.shouldSuppressSocketEventForTLS(event) {
 		return nil
 	}
@@ -946,6 +964,98 @@ func (s *Service) dispatchEvent(ctx context.Context, event httptrace.Event, work
 		}
 		return nil
 	}
+}
+
+func (s *stats) recordRawSourceEvent(source string, direction uint8) {
+	if s == nil {
+		return
+	}
+	if source == "" {
+		source = "unknown"
+	}
+	s.sourceMu.Lock()
+	if s.rawBySource == nil {
+		s.rawBySource = make(map[string]sourceDirectionCounts)
+	}
+	counts := s.rawBySource[source]
+	switch direction {
+	case httptrace.DirectionRequest:
+		counts.Request++
+	case httptrace.DirectionResponse:
+		counts.Response++
+	default:
+		counts.Unknown++
+	}
+	s.rawBySource[source] = counts
+	s.sourceMu.Unlock()
+}
+
+func (s *stats) recordUpdateSource(source, kind string) {
+	if s == nil {
+		return
+	}
+	if source == "" {
+		source = "unknown"
+	}
+	s.sourceMu.Lock()
+	if s.updatesBySource == nil {
+		s.updatesBySource = make(map[string]sourceUpdateCounts)
+	}
+	counts := s.updatesBySource[source]
+	switch kind {
+	case "request":
+		counts.Request++
+	case "response":
+		counts.Response++
+	default:
+		counts.Other++
+	}
+	s.updatesBySource[source] = counts
+	s.sourceMu.Unlock()
+}
+
+func (s *stats) rawSourceSummary() string {
+	if s == nil {
+		return "none"
+	}
+	s.sourceMu.Lock()
+	defer s.sourceMu.Unlock()
+	if len(s.rawBySource) == 0 {
+		return "none"
+	}
+	keys := make([]string, 0, len(s.rawBySource))
+	for key := range s.rawBySource {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		counts := s.rawBySource[key]
+		parts = append(parts, fmt.Sprintf("%s(req=%d,resp=%d,unk=%d)", key, counts.Request, counts.Response, counts.Unknown))
+	}
+	return strings.Join(parts, " ")
+}
+
+func (s *stats) updateSourceSummary() string {
+	if s == nil {
+		return "none"
+	}
+	s.sourceMu.Lock()
+	defer s.sourceMu.Unlock()
+	if len(s.updatesBySource) == 0 {
+		return "none"
+	}
+	keys := make([]string, 0, len(s.updatesBySource))
+	for key := range s.updatesBySource {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		counts := s.updatesBySource[key]
+		parts = append(parts, fmt.Sprintf("%s(req=%d,resp=%d,other=%d)", key, counts.Request, counts.Response, counts.Other))
+	}
+	return strings.Join(parts, " ")
 }
 
 func (s *Service) shouldSuppressSocketEventForTLS(event httptrace.Event) bool {
@@ -1245,6 +1355,8 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 		s.stats.updateRespEvicted.Load(),
 		s.stats.shutdownFlushes.Load(),
 	)
+	log.Printf("%s source raw(%s)", label, s.stats.rawSourceSummary())
+	log.Printf("%s source update(%s)", label, s.stats.updateSourceSummary())
 	if s.cfg.DebugKernel {
 		recordsRead := s.stats.recordsRead.Load()
 		resolveProcCount := s.stats.resolverProc.Load()

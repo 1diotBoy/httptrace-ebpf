@@ -94,6 +94,7 @@ type traceState struct {
 	lastUpdated     time.Time
 	responseUpdated time.Time
 	logicalSeq      uint64
+	requestEmitted  bool
 	pendingRequests []pendingRequest
 	requestSource   string
 	responseSource  string
@@ -207,13 +208,19 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 		state.responseUpdated = state.lastUpdated
 	}
 
-	// TLS request bodies often continue across multiple SSL_read calls after we've
-	// already emitted a truncated request head. Ignore those body-only follow-on
-	// chunks, but still admit a brand new request on the same keep-alive
-	// connection; otherwise later requests never enter pendingRequests and
-	// subsequent responses shift onto the wrong logical request.
-	if event.Direction == DirectionRequest && len(state.pendingRequests) > 0 && isTLSSource(event.Source) && !looksLikeTLSRequestStart(event.Payload) {
-		return nil, nil
+	// TLS plaintext is tracked one logical exchange per kernel chain_id. Once a
+	// request has been emitted for this TLS chain, any later SSL_read fragments
+	// on the same chain are stale follow-ons from the same request and must not
+	// produce a second logical request.
+	if event.Direction == DirectionRequest && isTLSSource(event.Source) {
+		if state.requestEmitted {
+			return nil, nil
+		}
+		// Before the first request update is emitted, still ignore obvious body-only
+		// follow-on chunks after a truncated request head so they don't park forever.
+		if len(state.pendingRequests) > 0 && !looksLikeTLSRequestStart(event.Payload) {
+			return nil, nil
+		}
 	}
 
 	var stream *fragmentStream
@@ -445,6 +452,16 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 			annotateParsedMessage(msg, &state.requestStream)
 			updates = append(updates, state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, false))
 			state.requestStream.consume(msg.ConsumedBytes)
+			if isTLSSource(state.requestSource) {
+				// A TLS kernel chain is expected to represent one logical HTTP
+				// exchange. If multiple request messages accumulated in the same
+				// buffer, the kernel-side chain split already failed; do not emit
+				// multiple logical requests from one TLS chain or responses will
+				// be permanently offset. Drop any leftover request bytes and let
+				// the current request own the chain.
+				state.requestStream.consumeAll()
+				return updates, nil
+			}
 			continue
 		}
 
@@ -792,6 +809,7 @@ func (t *traceState) buildRequestUpdate(chainID uint64, msg *ParsedMessage, ts *
 	doc.CaptureSource = t.requestSource
 	doc.RequestTruncated = truncated
 	doc.ResponseTruncated = false
+	t.requestEmitted = true
 
 	t.pendingRequests = append(t.pendingRequests, pendingRequest{
 		chainID:          chainID,

@@ -420,67 +420,6 @@ static __always_inline int looks_like_http_request(const char *buf, __u32 len)
 	return 0;
 }
 
-static __always_inline int looks_like_http_request_prefix(const char *buf, __u32 len)
-{
-	if (!buf || len == 0)
-		return 0;
-	if (len <= 3 &&
-	    buf[0] == 'G' &&
-	    (len < 2 || buf[1] == 'E') &&
-	    (len < 3 || buf[2] == 'T'))
-		return 1;
-	if (len <= 4 &&
-	    buf[0] == 'P' && buf[1] == 'O' &&
-	    (len < 3 || buf[2] == 'S') &&
-	    (len < 4 || buf[3] == 'T'))
-		return 1;
-	if (len <= 3 &&
-	    buf[0] == 'P' && buf[1] == 'U' &&
-	    (len < 3 || buf[2] == 'T'))
-		return 1;
-	if (len <= 5 &&
-	    buf[0] == 'P' && buf[1] == 'A' &&
-	    (len < 3 || buf[2] == 'T') &&
-	    (len < 4 || buf[3] == 'C') &&
-	    (len < 5 || buf[4] == 'H'))
-		return 1;
-	if (len <= 6 &&
-	    buf[0] == 'D' && buf[1] == 'E' &&
-	    (len < 3 || buf[2] == 'L') &&
-	    (len < 4 || buf[3] == 'E') &&
-	    (len < 5 || buf[4] == 'T') &&
-	    (len < 6 || buf[5] == 'E'))
-		return 1;
-	if (len <= 4 &&
-	    buf[0] == 'H' && buf[1] == 'E' &&
-	    (len < 3 || buf[2] == 'A') &&
-	    (len < 4 || buf[3] == 'D'))
-		return 1;
-	if (len <= 7 &&
-	    buf[0] == 'O' && buf[1] == 'P' &&
-	    (len < 3 || buf[2] == 'T') &&
-	    (len < 4 || buf[3] == 'I') &&
-	    (len < 5 || buf[4] == 'O') &&
-	    (len < 6 || buf[5] == 'N') &&
-	    (len < 7 || buf[6] == 'S'))
-		return 1;
-	if (len <= 5 &&
-	    buf[0] == 'T' && buf[1] == 'R' &&
-	    (len < 3 || buf[2] == 'A') &&
-	    (len < 4 || buf[3] == 'C') &&
-	    (len < 5 || buf[4] == 'E'))
-		return 1;
-	if (len <= 7 &&
-	    buf[0] == 'C' && buf[1] == 'O' &&
-	    (len < 3 || buf[2] == 'N') &&
-	    (len < 4 || buf[3] == 'N') &&
-	    (len < 5 || buf[4] == 'E') &&
-	    (len < 6 || buf[5] == 'C') &&
-	    (len < 7 || buf[6] == 'T'))
-		return 1;
-	return 0;
-}
-
 static __always_inline int looks_like_http_response(const char *buf, __u32 len)
 {
 	if (len < 5)
@@ -505,9 +444,14 @@ static __always_inline int tls_starts_with_http_request(const struct tls_rw_args
 	prefix_len = read_tls_prefix(args->buf_ptr, prefix_len, prefix, sizeof(prefix));
 	if (prefix_len == 0)
 		return 0;
-	if (looks_like_http_request(prefix, prefix_len))
-		return 1;
-	return looks_like_http_request_prefix(prefix, prefix_len);
+	/*
+	 * TLS plaintext chunks can begin at arbitrary body offsets. Reusing the very
+	 * permissive "method prefix" heuristic from socket recv (which accepts "P",
+	 * "PO", "D", etc.) causes false positives on request bodies and spuriously
+	 * forks extra chain_ids. For TLS we already read up to 16 bytes from the
+	 * decrypted buffer, so insist on a full HTTP request-line method token here.
+	 */
+	return looks_like_http_request(prefix, prefix_len);
 }
 
 static __always_inline int tls_starts_with_http_response(const struct tls_rw_args *args, __u32 size)
