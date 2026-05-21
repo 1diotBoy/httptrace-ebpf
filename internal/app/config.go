@@ -28,13 +28,16 @@ type Config struct {
 	DstIP                string
 	SrcPort              uint
 	DstPort              uint
-	DisableKernelFilter  bool // 是否禁用内核态过滤 ，默认不禁用
-	DisableUserTuple     bool // 是否禁用用户态过滤 ，默认禁用
-	CaptureBytes         int  // 内核侧每个请求/响应最大采集字节数，默认32KB
-	PerfPages            int  // perf buffer 页数，默认64页
-	BatchSize            int  // 批量大小 ，默认100
-	WorkerCount          int  // 工作线程数 ，默认最多8个
-	WorkerQueueSize      int  // 每个解析 worker 的缓冲队列深度，0 表示自动调优
+	EnableTLS            bool   // 是否启用 TLS 明文采集，默认关闭
+	TLSLibPath           string // 逗号分隔的 libssl 路径覆盖项，空时自动发现
+	TLSComm              string // uprobes 目标进程名，默认 nginx
+	DisableKernelFilter  bool   // 是否禁用内核态过滤 ，默认不禁用
+	DisableUserTuple     bool   // 是否禁用用户态过滤 ，默认禁用
+	CaptureBytes         int    // 内核侧每个请求/响应最大采集字节数，默认32KB
+	PerfPages            int    // perf buffer 页数，默认64页
+	BatchSize            int    // 批量大小 ，默认100
+	WorkerCount          int    // 工作线程数 ，默认最多8个
+	WorkerQueueSize      int    // 每个解析 worker 的缓冲队列深度，0 表示自动调优
 	RedisWorkers         int
 	RedisQueueSize       int           // Redis 队列大小 ，默认4096
 	RetryQueueSize       int           // tuple 重试队列大小，0 表示自动调优
@@ -113,6 +116,8 @@ type resourceTier struct {
 // 默认运行参数。
 func DefaultConfig() Config {
 	return Config{
+		EnableTLS:            false,
+		TLSComm:              "nginx",
 		CaptureBytes:         32 * 1024,
 		DisableKernelFilter:  false,
 		DisableUserTuple:     true,

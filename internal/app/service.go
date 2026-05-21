@@ -23,6 +23,7 @@ import (
 	"power-ebpf/internal/bpfgen"
 	"power-ebpf/internal/httptrace"
 	"power-ebpf/internal/storage"
+	"power-ebpf/internal/tlstrace"
 )
 
 const (
@@ -166,6 +167,12 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("remove memlock: %w", err)
 	}
 
+	var (
+		tlsObjs   *bpfgen.LoadedTLSObjects
+		tlsLinks  []link.Link
+		tlsReader *perf.Reader
+	)
+
 	log.Printf("加载ebpf 对象...")
 	stopLoadWatch := startPhaseWatch(ctx, "bpf object load", 2*time.Second)
 	objs, err := bpfgen.LoadObjects(nil)
@@ -197,6 +204,44 @@ func (s *Service) Run(ctx context.Context) error {
 	defer closeAll(links)
 	log.Printf("probe attach complete")
 
+	if s.cfg.EnableTLS {
+		log.Printf("loading tls uprobes...")
+		stopTLSLoadWatch := startPhaseWatch(ctx, "tls object load", 2*time.Second)
+		tlsObjs, err = bpfgen.LoadTLSObjects(nil)
+		stopTLSLoadWatch()
+		if err != nil {
+			return fmt.Errorf("load tls objects: %w", err)
+		}
+		defer tlsObjs.Close()
+
+		if err := s.installTLSConfig(tlsObjs.TLSConfigMap); err != nil {
+			return err
+		}
+
+		tlsLibPaths, err := tlstrace.ResolveLibraryPaths(tlstrace.DiscoveryOptions{
+			ExplicitPaths: tlstrace.SplitCSVPaths(s.cfg.TLSLibPath),
+			ProcessComm:   s.cfg.TLSComm,
+		})
+		if err != nil {
+			return fmt.Errorf("resolve tls library paths: %w", err)
+		}
+		log.Printf("resolved tls libraries for comm=%q: %s", tlstrace.ResolveTargetComm(s.cfg.TLSComm), strings.Join(tlsLibPaths, ","))
+
+		stopTLSAttachWatch := startPhaseWatch(ctx, "tls uprobe attach", 2*time.Second)
+		tlsLinks, err = tlstrace.AttachAll(tlsObjs, tlsLibPaths)
+		stopTLSAttachWatch()
+		if err != nil {
+			return fmt.Errorf("attach tls uprobes: %w", err)
+		}
+		defer closeAll(tlsLinks)
+
+		tlsReader, err = perf.NewReader(tlsObjs.Events, s.cfg.PerfBufferBytes())
+		if err != nil {
+			return fmt.Errorf("create tls perf reader: %w", err)
+		}
+		defer tlsReader.Close()
+	}
+
 	reader, err := perf.NewReader(objs.Events, s.cfg.PerfBufferBytes())
 	if err != nil {
 		return fmt.Errorf("create perf reader: %w", err)
@@ -210,7 +255,7 @@ func (s *Service) Run(ctx context.Context) error {
 	var retryWG sync.WaitGroup
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 
 	wg.Add(1)
 	go func() {
@@ -220,10 +265,24 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}()
 
+	if tlsReader != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.readLoop(ctx, tlsReader, workers, retrySem, &retryWG); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, perf.ErrClosed) {
+				errCh <- err
+			}
+		}()
+	}
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := s.logLoop(ctx, objs, writeCh); err != nil && !errors.Is(err, context.Canceled) {
+		var tlsConfigMap *ebpf.Map
+		if tlsObjs != nil {
+			tlsConfigMap = tlsObjs.TLSConfigMap
+		}
+		if err := s.logLoop(ctx, objs, tlsConfigMap, writeCh); err != nil && !errors.Is(err, context.Canceled) {
 			errCh <- err
 		}
 	}()
@@ -236,6 +295,9 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	reader.Close()
+	if tlsReader != nil {
+		tlsReader.Close()
+	}
 	wg.Wait()
 	retryWG.Wait()
 	for _, ch := range workers {
@@ -343,6 +405,39 @@ func (s *Service) syncCaptureLimitsToKernel(filterMap *ebpf.Map) error {
 	s.lastRequestCaptureLimit = requestLimit
 	s.lastResponseCaptureLimit = responseLimit
 	log.Printf("updated kernel capture limits request=%d response=%d", requestLimit, responseLimit)
+	return nil
+}
+
+func (s *Service) installTLSConfig(configMap *ebpf.Map) error {
+	if s == nil || configMap == nil {
+		return nil
+	}
+
+	requestLimit := uint32(s.cfg.CaptureBytes)
+	responseLimit := uint32(s.cfg.CaptureBytes)
+	if s.store != nil {
+		if v := s.store.RequestCaptureLimitBytes(); v > 0 {
+			requestLimit = uint32(v)
+		}
+		if v := s.store.ResponseCaptureLimitBytes(); v > 0 {
+			responseLimit = uint32(v)
+		}
+	}
+
+	var cfg bpfgen.TlsTraceConfig
+	cfg.RequestCaptureBytes = requestLimit
+	cfg.ResponseCaptureBytes = responseLimit
+	for i, r := range tlstrace.ResolveTargetComm(s.cfg.TLSComm) {
+		if i >= len(cfg.Comm) {
+			break
+		}
+		cfg.Comm[i] = int8(r)
+	}
+
+	key := uint32(0)
+	if err := configMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update tls config map: %w", err)
+	}
 	return nil
 }
 
@@ -780,6 +875,9 @@ func (s *Service) enqueueRetry(ctx context.Context, retrySem chan struct{}, retr
 }
 
 func (s *Service) dispatchEvent(ctx context.Context, event httptrace.Event, worker chan<- httptrace.Event) error {
+	if s.shouldSuppressSocketEventForTLS(event) {
+		return nil
+	}
 	if !s.cfg.DisableUserTuple {
 		startFilter := time.Time{}
 		if s.cfg.DebugKernel {
@@ -848,6 +946,19 @@ func (s *Service) dispatchEvent(ctx context.Context, event httptrace.Event, work
 		}
 		return nil
 	}
+}
+
+func (s *Service) shouldSuppressSocketEventForTLS(event httptrace.Event) bool {
+	if s == nil || !s.cfg.EnableTLS {
+		return false
+	}
+	if event.Comm == "" {
+		return false
+	}
+	if strings.HasPrefix(event.Source, "tls_") {
+		return false
+	}
+	return event.Comm == tlstrace.ResolveTargetComm(s.cfg.TLSComm)
 }
 
 func (s *Service) shouldPassThroughFilteredEvent(event httptrace.Event, reason FilterReason) bool {
@@ -1026,7 +1137,7 @@ func (s *Service) logKernelFragment(cpu int, raw bpfgen.HttpTraceHttpEvent, even
 // 这里的 request_fragments/response_fragments 是按 HTTP 语义分类后的 fragment 数，
 // 不是完整请求/响应条数；真正成功解析出来的条数看 user(requests/responses)。
 // send_calls/recv_calls 仍然是 kprobe/kretprobe 被触发的 syscall 次数。
-func (s *Service) logLoop(ctx context.Context, objs *bpfgen.LoadedObjects, writeCh chan<- httptrace.Update) error {
+func (s *Service) logLoop(ctx context.Context, objs *bpfgen.LoadedObjects, tlsConfigMap *ebpf.Map, writeCh chan<- httptrace.Update) error {
 	statsTicker := time.NewTicker(s.cfg.LogInterval)
 	defer statsTicker.Stop()
 	captureTicker := time.NewTicker(5 * time.Second)
@@ -1045,6 +1156,11 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.LoadedObjects, write
 		case <-captureTicker.C:
 			if err := s.syncCaptureLimitsToKernel(objs.FilterMap); err != nil {
 				log.Printf("sync kernel capture limits error: %v", err)
+			}
+			if tlsConfigMap != nil {
+				if err := s.installTLSConfig(tlsConfigMap); err != nil {
+					log.Printf("sync tls config error: %v", err)
+				}
 			}
 		case <-flushTicker.C:
 			updates := s.assembler.FlushStalled(time.Now())
@@ -1630,6 +1746,16 @@ func captureSourceName(raw uint8) string {
 		return "tcp_recvmsg"
 	case 5:
 		return "tcp_close"
+	case 6:
+		return "tls_ssl_read"
+	case 7:
+		return "tls_ssl_write"
+	case 8:
+		return "tls_ssl_read_ex"
+	case 9:
+		return "tls_ssl_write_ex"
+	case 10:
+		return "tls_ssl_close"
 	default:
 		return "unknown"
 	}

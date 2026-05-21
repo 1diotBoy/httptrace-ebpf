@@ -11,6 +11,7 @@ type HttpTraceFilterConfig struct {
 	DebugFlags           uint32
 }
 
+// 事件结构
 type HttpTraceHttpEvent struct {
 	TsNs                 uint64
 	ChainId              uint64
@@ -34,7 +35,7 @@ type HttpTraceHttpEvent struct {
 	Pad0                 uint8
 	Family               uint16
 	Comm                 [16]int8
-	Payload              [4096]uint8
+	Payload              [4096]uint8 // 明文
 }
 
 type HttpTraceKernelStats struct {

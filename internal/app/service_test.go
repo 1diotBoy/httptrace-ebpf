@@ -22,12 +22,17 @@ func TestFormatIPv4FromKernelNetworkOrderValue(t *testing.T) {
 
 func TestCaptureSourceName(t *testing.T) {
 	cases := map[uint8]string{
-		0: "unknown",
-		1: "sock_sendmsg",
-		2: "tcp_sendmsg",
-		3: "sock_recvmsg",
-		4: "tcp_recvmsg",
-		5: "tcp_close",
+		0:  "unknown",
+		1:  "sock_sendmsg",
+		2:  "tcp_sendmsg",
+		3:  "sock_recvmsg",
+		4:  "tcp_recvmsg",
+		5:  "tcp_close",
+		6:  "tls_ssl_read",
+		7:  "tls_ssl_write",
+		8:  "tls_ssl_read_ex",
+		9:  "tls_ssl_write_ex",
+		10: "tls_ssl_close",
 	}
 
 	for raw, want := range cases {
@@ -170,6 +175,73 @@ func TestDispatchEventPassesThroughLegacyExistingChainFragment(t *testing.T) {
 	case <-ch:
 	default:
 		t.Fatalf("expected existing-chain fragment to pass through")
+	}
+}
+
+func TestDispatchEventSuppressesLegacySocketEventForTLSComm(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.EnableTLS = true
+	cfg.TLSComm = "nginx"
+
+	svc := &Service{
+		cfg:    cfg,
+		filter: ResolvedFilter{},
+		stats:  &stats{},
+	}
+	ch := make(chan httptrace.Event, 1)
+	event := httptrace.Event{
+		ChainID:   200,
+		FD:        12,
+		Direction: httptrace.DirectionRequest,
+		Source:    "sock_recvmsg",
+		Comm:      "nginx",
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+	}
+
+	if err := svc.dispatchEvent(context.Background(), event, ch); err != nil {
+		t.Fatalf("dispatchEvent returned error: %v", err)
+	}
+
+	select {
+	case got := <-ch:
+		t.Fatalf("legacy socket event should be suppressed when TLS is enabled: %#v", got)
+	default:
+	}
+}
+
+func TestDispatchEventKeepsTLSEventForTLSComm(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.EnableTLS = true
+	cfg.TLSComm = "nginx"
+
+	svc := &Service{
+		cfg:    cfg,
+		filter: ResolvedFilter{},
+		stats:  &stats{},
+	}
+	ch := make(chan httptrace.Event, 1)
+	event := httptrace.Event{
+		ChainID:   201,
+		FD:        12,
+		Direction: httptrace.DirectionRequest,
+		Source:    "tls_ssl_read",
+		Comm:      "nginx",
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+	}
+
+	if err := svc.dispatchEvent(context.Background(), event, ch); err != nil {
+		t.Fatalf("dispatchEvent returned error: %v", err)
+	}
+
+	select {
+	case got := <-ch:
+		if got.ChainID != event.ChainID || got.Source != event.Source {
+			t.Fatalf("unexpected event delivered: %#v", got)
+		}
+	default:
+		t.Fatalf("tls event should not be suppressed")
 	}
 }
 

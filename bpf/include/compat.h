@@ -74,6 +74,11 @@ enum capture_source {
 	SRC_SOCK_RECVMSG = 3,
 	SRC_TCP_RECVMSG = 4,
 	SRC_TCP_CLOSE = 5,
+	SRC_TLS_SSL_READ = 6,
+	SRC_TLS_SSL_WRITE = 7,
+	SRC_TLS_SSL_READ_EX = 8,
+	SRC_TLS_SSL_WRITE_EX = 9,
+	SRC_TLS_SSL_CLOSE = 10,
 };
 
 enum http_event_flags {

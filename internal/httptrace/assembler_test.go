@@ -1,6 +1,7 @@
 package httptrace
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -758,5 +759,359 @@ func TestAssemblerEagerFlushesErrorResponse(t *testing.T) {
 	}
 	if !respUpdates[0].Trace.ResponseTruncated || !respUpdates[0].Trace.Response.BodyPartial {
 		t.Fatalf("error response should be marked partial/truncated")
+	}
+}
+
+func TestAssemblerEmitsTruncatedTLSRequestHeadAndIgnoresFollowOnBody(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
+	now := time.Unix(1711720000, 0)
+
+	reqPayload := []byte("POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\nContent-Length: 32\r\n\r\n{\"partial\":")
+	updates, err := asm.Process(Event{
+		Timestamp:            now,
+		ChainID:              9101,
+		PID:                  105,
+		FD:                   18,
+		SrcIP:                "10.0.0.1",
+		DstIP:                "10.0.0.2",
+		SrcPort:              54005,
+		DstPort:              443,
+		FragIdx:              0,
+		Direction:            DirectionRequest,
+		Flags:                eventFlagCaptureTrunc,
+		ObservedMessageBytes: 512,
+		Source:               "tls_ssl_read",
+		Payload:              reqPayload,
+	})
+	if err != nil {
+		t.Fatalf("truncated tls request process failed: %v", err)
+	}
+	if len(updates) != 1 || updates[0].Kind != "request" {
+		t.Fatalf("expected one request update, got %#v", updates)
+	}
+	if updates[0].Trace.Request == nil {
+		t.Fatalf("expected parsed request")
+	}
+	if got, want := updates[0].Trace.Request.Method, "POST"; got != want {
+		t.Fatalf("method = %q, want %q", got, want)
+	}
+	if !updates[0].Trace.RequestTruncated || !updates[0].Trace.Request.BodyPartial {
+		t.Fatalf("truncated tls request should be marked partial/truncated")
+	}
+
+	updates, err = asm.Process(Event{
+		Timestamp: now.Add(5 * time.Millisecond),
+		ChainID:   9101,
+		PID:       105,
+		FD:        18,
+		FragIdx:   1,
+		Direction: DirectionRequest,
+		Source:    "tls_ssl_read",
+		Payload:   []byte("\"still\":\"body\"}"),
+	})
+	if err != nil {
+		t.Fatalf("follow-on tls body process failed: %v", err)
+	}
+	if len(updates) != 0 {
+		t.Fatalf("follow-on tls body should be ignored after request head emit, got %#v", updates)
+	}
+
+	respUpdates, err := asm.Process(Event{
+		Timestamp: now.Add(10 * time.Millisecond),
+		ChainID:   9101,
+		PID:       105,
+		FD:        18,
+		SrcIP:     "10.0.0.2",
+		DstIP:     "10.0.0.1",
+		SrcPort:   443,
+		DstPort:   54005,
+		FragIdx:   0,
+		Direction: DirectionResponse,
+		Source:    "tls_ssl_write",
+		Payload:   []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
+	})
+	if err != nil {
+		t.Fatalf("tls response process failed: %v", err)
+	}
+	if len(respUpdates) != 1 || respUpdates[0].Kind != "response" {
+		t.Fatalf("expected one response update, got %#v", respUpdates)
+	}
+	if respUpdates[0].Trace.Response == nil || respUpdates[0].Trace.Response.StatusCode != 200 {
+		t.Fatalf("expected parsed 200 response, got %#v", respUpdates[0].Trace.Response)
+	}
+
+	snap := asm.Snapshot()
+	if snap.RequestBufferStates != 0 {
+		t.Fatalf("request buffers should be drained after tls head emit, got %#v", snap)
+	}
+	if snap.PendingRequests != 0 {
+		t.Fatalf("request should be matched by response, got %#v", snap)
+	}
+}
+
+func TestAssemblerEmitsPartialTLSRequestWithoutHeaderTerminator(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 100*time.Millisecond)
+	now := time.Now()
+
+	reqPayload := []byte("GET /big-cookie HTTP/1.1\r\nHost: example.com\r\nCookie: session=" + strings.Repeat("a", 180))
+	updates, err := asm.Process(Event{
+		Timestamp:            now,
+		ChainID:              9102,
+		PID:                  106,
+		FD:                   19,
+		SrcIP:                "10.0.0.1",
+		DstIP:                "10.0.0.2",
+		SrcPort:              54006,
+		DstPort:              443,
+		FragIdx:              0,
+		Direction:            DirectionRequest,
+		Flags:                eventFlagCaptureTrunc,
+		ObservedMessageBytes: 768,
+		Source:               "tls_ssl_read",
+		Payload:              reqPayload,
+	})
+	if err != nil {
+		t.Fatalf("partial tls request process failed: %v", err)
+	}
+	if len(updates) != 1 || updates[0].Kind != "request" {
+		t.Fatalf("expected one truncated request update, got %#v", updates)
+	}
+	if updates[0].Trace.Request == nil {
+		t.Fatalf("expected parsed request")
+	}
+	if got, want := updates[0].Trace.Request.Method, "GET"; got != want {
+		t.Fatalf("method = %q, want %q", got, want)
+	}
+	if got, want := updates[0].Trace.Request.URL, "/big-cookie"; got != want {
+		t.Fatalf("url = %q, want %q", got, want)
+	}
+	if !updates[0].Trace.RequestTruncated {
+		t.Fatalf("expected truncated request flag")
+	}
+
+	respUpdates, err := asm.Process(Event{
+		Timestamp:            now.Add(10 * time.Millisecond),
+		ChainID:              9102,
+		PID:                  106,
+		FD:                   19,
+		SrcIP:                "10.0.0.2",
+		DstIP:                "10.0.0.1",
+		SrcPort:              443,
+		DstPort:              54006,
+		FragIdx:              0,
+		Direction:            DirectionResponse,
+		Flags:                eventFlagCaptureTrunc,
+		ObservedMessageBytes: 32768,
+		Source:               "tls_ssl_write",
+		Payload:              []byte("HTTP/1.1 200 OK\r\nContent-Length: 50000\r\n\r\nhello"),
+	})
+	if err != nil {
+		t.Fatalf("partial tls response process failed: %v", err)
+	}
+	if len(respUpdates) != 0 {
+		t.Fatalf("truncated response should wait for stall/size signal, got %#v", respUpdates)
+	}
+
+	respUpdates, err = asm.Process(Event{
+		Timestamp:            now.Add(20 * time.Millisecond),
+		ChainID:              9102,
+		PID:                  106,
+		FD:                   19,
+		SrcIP:                "10.0.0.2",
+		DstIP:                "10.0.0.1",
+		SrcPort:              443,
+		DstPort:              54006,
+		Direction:            DirectionResponse,
+		Flags:                eventFlagSizeOnly,
+		ObservedMessageBytes: 50000,
+		Source:               "tls_ssl_write",
+	})
+	if err != nil {
+		t.Fatalf("tls response size-only process failed: %v", err)
+	}
+	if len(respUpdates) != 0 {
+		t.Fatalf("size-only progress should not emit immediately, got %#v", respUpdates)
+	}
+
+	flushed := asm.FlushStalled(now.Add(200 * time.Millisecond))
+	if len(flushed) != 1 || flushed[0].Kind != "response" {
+		t.Fatalf("expected one stalled response update, got %#v", flushed)
+	}
+	if flushed[0].Trace.Response == nil || flushed[0].Trace.Response.StatusCode != 200 {
+		t.Fatalf("expected parsed response, got %#v", flushed[0].Trace.Response)
+	}
+}
+
+func TestAssemblerKeepsCollectingPayloadAfterTruncationFlag(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
+	now := time.Now()
+
+	reqUpdates, err := asm.Process(Event{
+		Timestamp: now,
+		ChainID:   9201,
+		PID:       107,
+		FD:        20,
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+		SrcPort:   54007,
+		DstPort:   443,
+		FragIdx:   0,
+		Direction: DirectionRequest,
+		Payload:   []byte("GET /chunked HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+	})
+	if err != nil || len(reqUpdates) != 1 {
+		t.Fatalf("request emit failed: updates=%d err=%v", len(reqUpdates), err)
+	}
+
+	respUpdates, err := asm.Process(Event{
+		Timestamp:            now.Add(10 * time.Millisecond),
+		ChainID:              9201,
+		PID:                  107,
+		FD:                   20,
+		SrcIP:                "10.0.0.2",
+		DstIP:                "10.0.0.1",
+		SrcPort:              443,
+		DstPort:              54007,
+		FragIdx:              0,
+		Direction:            DirectionResponse,
+		Flags:                eventFlagCaptureTrunc,
+		ObservedMessageBytes: 2000,
+		Source:               "tls_ssl_write",
+		Payload:              []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npe"),
+	})
+	if err != nil {
+		t.Fatalf("first response fragment failed: %v", err)
+	}
+	if len(respUpdates) != 0 {
+		t.Fatalf("expected no response yet, got %#v", respUpdates)
+	}
+
+	respUpdates, err = asm.Process(Event{
+		Timestamp:            now.Add(20 * time.Millisecond),
+		ChainID:              9201,
+		PID:                  107,
+		FD:                   20,
+		SrcIP:                "10.0.0.2",
+		DstIP:                "10.0.0.1",
+		SrcPort:              443,
+		DstPort:              54007,
+		FragIdx:              1,
+		Direction:            DirectionResponse,
+		ObservedMessageBytes: 2500,
+		Source:               "tls_ssl_write",
+		Payload:              []byte("dia\r\n0\r\n\r\n"),
+	})
+	if err != nil {
+		t.Fatalf("second response fragment failed: %v", err)
+	}
+	if len(respUpdates) != 1 || respUpdates[0].Kind != "response" {
+		t.Fatalf("expected one completed response, got %#v", respUpdates)
+	}
+	if respUpdates[0].Trace.Response == nil {
+		t.Fatalf("expected parsed response")
+	}
+	if got, want := respUpdates[0].Trace.Response.Body, "Wikipedia"; got != want {
+		t.Fatalf("body mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestAssemblerTLSKeepsNewRequestsQueuedOnKeepAliveConnection(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
+	now := time.Now()
+
+	req1Updates, err := asm.Process(Event{
+		Timestamp: now,
+		ChainID:   9301,
+		PID:       108,
+		FD:        21,
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+		SrcPort:   54008,
+		DstPort:   443,
+		FragIdx:   0,
+		Direction: DirectionRequest,
+		Source:    "tls_ssl_read",
+		Payload:   []byte("GET /query HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+	})
+	if err != nil || len(req1Updates) != 1 {
+		t.Fatalf("first tls request emit failed: updates=%d err=%v", len(req1Updates), err)
+	}
+
+	req2Updates, err := asm.Process(Event{
+		Timestamp: now.Add(5 * time.Millisecond),
+		ChainID:   9301,
+		PID:       108,
+		FD:        21,
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+		SrcPort:   54008,
+		DstPort:   443,
+		FragIdx:   1,
+		Direction: DirectionRequest,
+		Source:    "tls_ssl_read",
+		Payload:   []byte("DELETE /delete HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+	})
+	if err != nil || len(req2Updates) != 1 {
+		t.Fatalf("second tls request should queue as a new request: updates=%d err=%v", len(req2Updates), err)
+	}
+
+	if req1Updates[0].Trace.Request == nil || req2Updates[0].Trace.Request == nil {
+		t.Fatalf("expected parsed requests, got %#v and %#v", req1Updates[0].Trace.Request, req2Updates[0].Trace.Request)
+	}
+	if got, want := req1Updates[0].Trace.Request.URL, "/query"; got != want {
+		t.Fatalf("first request url = %q, want %q", got, want)
+	}
+	if got, want := req2Updates[0].Trace.Request.URL, "/delete"; got != want {
+		t.Fatalf("second request url = %q, want %q", got, want)
+	}
+	if req1Updates[0].Trace.ChainID == req2Updates[0].Trace.ChainID {
+		t.Fatalf("logical chain ids should differ across queued requests")
+	}
+
+	resp1Updates, err := asm.Process(Event{
+		Timestamp: now.Add(10 * time.Millisecond),
+		ChainID:   9301,
+		PID:       108,
+		FD:        21,
+		SrcIP:     "10.0.0.2",
+		DstIP:     "10.0.0.1",
+		SrcPort:   443,
+		DstPort:   54008,
+		FragIdx:   0,
+		Direction: DirectionResponse,
+		Source:    "tls_ssl_write",
+		Payload:   []byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst"),
+	})
+	if err != nil || len(resp1Updates) != 1 {
+		t.Fatalf("first tls response emit failed: updates=%d err=%v", len(resp1Updates), err)
+	}
+	if got, want := resp1Updates[0].Trace.ChainID, req1Updates[0].Trace.ChainID; got != want {
+		t.Fatalf("first response chain = %d, want %d", got, want)
+	}
+
+	resp2Updates, err := asm.Process(Event{
+		Timestamp: now.Add(15 * time.Millisecond),
+		ChainID:   9301,
+		PID:       108,
+		FD:        21,
+		SrcIP:     "10.0.0.2",
+		DstIP:     "10.0.0.1",
+		SrcPort:   443,
+		DstPort:   54008,
+		FragIdx:   1,
+		Direction: DirectionResponse,
+		Source:    "tls_ssl_write",
+		Payload:   []byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"),
+	})
+	if err != nil || len(resp2Updates) != 1 {
+		t.Fatalf("second tls response emit failed: updates=%d err=%v", len(resp2Updates), err)
+	}
+	if got, want := resp2Updates[0].Trace.ChainID, req2Updates[0].Trace.ChainID; got != want {
+		t.Fatalf("second response chain = %d, want %d", got, want)
+	}
+
+	snap := asm.Snapshot()
+	if snap.PendingRequests != 0 {
+		t.Fatalf("pending requests should be drained, got %#v", snap)
 	}
 }

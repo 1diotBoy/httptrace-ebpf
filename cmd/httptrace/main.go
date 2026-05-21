@@ -28,6 +28,9 @@ func main() {
 	flag.StringVar(&cfg.DstIP, "dst-ip", cfg.DstIP, "filter by IPv4 endpoint; if src-ip is empty, matches either endpoint")
 	flag.UintVar(&cfg.SrcPort, "src-port", cfg.SrcPort, "filter by port endpoint; if dst-port is empty, matches either endpoint")
 	flag.UintVar(&cfg.DstPort, "dst-port", cfg.DstPort, "filter by port endpoint; if src-port is empty, matches either endpoint")
+	flag.BoolVar(&cfg.EnableTLS, "enable-tls", cfg.EnableTLS, "enable HTTPS plaintext capture through OpenSSL uprobes; disabled by default")
+	flag.StringVar(&cfg.TLSLibPath, "tls-lib-path", cfg.TLSLibPath, "comma-separated libssl paths override; empty auto-discovers nginx mapped libssl")
+	flag.StringVar(&cfg.TLSComm, "tls-comm", cfg.TLSComm, "process comm name used by TLS uprobes, default nginx")
 	flag.BoolVar(&cfg.DisableKernelFilter, "disable-kernel-filter", cfg.DisableKernelFilter, "disable kernel-side IP/port filtering for isolation; all filtering is skipped before perf output")
 	flag.BoolVar(&cfg.DisableUserTuple, "disable-user-tuple", cfg.DisableUserTuple, "disable /proc tuple resolve and user-space tuple filter; keep kernel tuple in output when available")
 

@@ -93,7 +93,11 @@ func TryParseMessageHead(direction uint8, data []byte, opts ParseOptions) (*Pars
 			return msg, true, nil
 		}
 		if len(body) > 0 {
-			msg.Body = string(body)
+			if preview, ok := decodeChunkedBodyPreview(body); ok {
+				msg.Body = string(preview)
+			} else {
+				msg.Body = string(body)
+			}
 			msg.BodyPartial = true
 		}
 		return msg, true, nil
@@ -128,6 +132,87 @@ func TryParseMessageHead(direction uint8, data []byte, opts ParseOptions) (*Pars
 		msg.BodyPartial = true
 		return msg, true, nil
 	}
+}
+
+// TryParsePartialHead 是针对截断捕获的一种尽力而为的回退机制，
+// 在这种情况下，HTTP 开始行存在，但完整的头部终止符可能不存在。
+// 当验证器友好的捕获限制在用户空间中完整的请求/响应头可用之前阻止我们时，
+// 它主要由TLS路径使用。
+func TryParsePartialHead(direction uint8, data []byte) (*ParsedMessage, bool, error) {
+	lineEnd := bytes.Index(data, []byte("\r\n"))
+	if lineEnd < 0 {
+		return nil, false, nil
+	}
+
+	startLine := string(data[:lineEnd])
+	headers := make(textproto.MIMEHeader)
+	cursor := lineEnd + 2
+	bodyStart := len(data)
+	for cursor < len(data) {
+		next := bytes.Index(data[cursor:], []byte("\r\n"))
+		if next < 0 {
+			break
+		}
+		if next == 0 {
+			bodyStart = cursor + 2
+			break
+		}
+		line := string(data[cursor : cursor+next])
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) == 2 {
+			key := textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(parts[0]))
+			value := strings.TrimSpace(parts[1])
+			headers.Add(key, value)
+		}
+		cursor += next + 2
+	}
+
+	msg := &ParsedMessage{
+		Direction:     direction,
+		StartLine:     startLine,
+		Headers:       flattenHeaders(headers),
+		HeaderValues:  cloneHeaders(headers),
+		ContentLength: -1,
+		ConsumedBytes: len(data),
+	}
+	if raw := headers.Get("Content-Length"); raw != "" {
+		if v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); err == nil {
+			msg.ContentLength = v
+		}
+	}
+	msg.TransferEncoding = headers.Get("Transfer-Encoding")
+	msg.Chunked = strings.Contains(strings.ToLower(msg.TransferEncoding), "chunked")
+
+	switch direction {
+	case DirectionRequest:
+		if err := parseRequestLine(startLine, msg); err != nil {
+			return nil, false, err
+		}
+	case DirectionResponse:
+		if err := parseStatusLine(startLine, msg); err != nil {
+			return nil, false, err
+		}
+	default:
+		return nil, false, fmt.Errorf("unsupported direction %d", direction)
+	}
+
+	if bodyStart < len(data) {
+		body := data[bodyStart:]
+		if msg.Chunked {
+			if preview, ok := decodeChunkedBodyPreview(body); ok {
+				msg.Body = string(preview)
+			} else {
+				msg.Body = string(body)
+			}
+		} else {
+			msg.Body = string(body)
+		}
+		msg.BodySizeBytes = len(msg.Body)
+		msg.BodyPartial = true
+	} else if msg.ContentLength > 0 || msg.Chunked || msg.TransferEncoding != "" {
+		msg.BodyPartial = true
+	}
+	return msg, true, nil
 }
 
 // FindMessageStart 在 buffer 里寻找下一个可信的 HTTP 消息起点。
@@ -320,6 +405,7 @@ func parseMessageHead(direction uint8, data []byte) (*ParsedMessage, textproto.M
 	}
 
 	head := string(data[:headerEnd])
+	// 头部明细分割
 	lines := strings.Split(head, "\r\n")
 	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
 		return nil, nil, 0, false, fmt.Errorf("empty start line")
@@ -493,6 +579,57 @@ func decodeChunkedBody(data []byte) ([]byte, int, bool, error) {
 		}
 		cursor += 2
 	}
+}
+
+// decodeChunkedBodyPreview best-effort strips chunk-size lines from a partial
+// chunked body. It returns already-decoded body bytes collected before the
+// first incomplete or malformed chunk boundary.
+func decodeChunkedBodyPreview(data []byte) ([]byte, bool) {
+	var out bytes.Buffer
+	cursor := 0
+	progress := false
+
+	for cursor < len(data) {
+		lineEnd := bytes.Index(data[cursor:], []byte("\r\n"))
+		if lineEnd < 0 {
+			break
+		}
+
+		line := strings.TrimSpace(string(data[cursor : cursor+lineEnd]))
+		sizeToken := line
+		if i := strings.Index(sizeToken, ";"); i >= 0 {
+			sizeToken = sizeToken[:i]
+		}
+		size, err := strconv.ParseInt(sizeToken, 16, 64)
+		if err != nil || size < 0 {
+			break
+		}
+		cursor += lineEnd + 2
+		if size == 0 {
+			return out.Bytes(), true
+		}
+
+		available := len(data) - cursor
+		if available <= 0 {
+			return out.Bytes(), progress
+		}
+		take := int(size)
+		if take > available {
+			take = available
+		}
+		out.Write(data[cursor : cursor+take])
+		progress = true
+		if take < int(size) {
+			return out.Bytes(), true
+		}
+		cursor += take
+		if len(data[cursor:]) < 2 || !bytes.HasPrefix(data[cursor:], []byte("\r\n")) {
+			return out.Bytes(), true
+		}
+		cursor += 2
+	}
+
+	return out.Bytes(), progress
 }
 
 func hasNoBody(direction uint8, msg *ParsedMessage, headers textproto.MIMEHeader, opts ParseOptions) bool {

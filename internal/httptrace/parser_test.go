@@ -65,6 +65,51 @@ func TestTryParseResponseHeadWithPartialBody(t *testing.T) {
 	}
 }
 
+func TestTryParsePartialResponseHead(t *testing.T) {
+	raw := []byte("HTTP/1.1 200 OK\r\nServer: Tengine\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\nCache-Control: no-cache")
+
+	msg, ok, err := TryParsePartialHead(DirectionResponse, raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("partial response head should be parseable")
+	}
+	if got, want := msg.StatusCode, 200; got != want {
+		t.Fatalf("status mismatch: got %d want %d", got, want)
+	}
+	if got, want := msg.Headers["Server"], "Tengine"; got != want {
+		t.Fatalf("server header mismatch: got %q want %q", got, want)
+	}
+	if !msg.Chunked {
+		t.Fatalf("expected chunked response")
+	}
+	if !msg.BodyPartial {
+		t.Fatalf("expected partial body marker for truncated response head")
+	}
+}
+
+func TestTryParseChunkedResponseHeadStripsChunkPrefixFromPartialBody(t *testing.T) {
+	raw := []byte("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npe")
+
+	msg, ok, err := TryParseMessageHead(DirectionResponse, raw, ParseOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("chunked response head should be parseable")
+	}
+	if !msg.Chunked {
+		t.Fatalf("expected chunked response")
+	}
+	if !msg.BodyPartial {
+		t.Fatalf("expected partial body marker")
+	}
+	if got, want := msg.Body, "Wikipe"; got != want {
+		t.Fatalf("body mismatch: got %q want %q", got, want)
+	}
+}
+
 func TestFindMessageStartRequest(t *testing.T) {
 	raw := []byte("xxPOST /api HTTP/1.1\r\nHost: example.com\r\n\r\n")
 	got := FindMessageStart(DirectionRequest, raw)

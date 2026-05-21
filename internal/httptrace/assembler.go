@@ -1,7 +1,9 @@
 package httptrace
 
 import (
+	"bytes"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -205,6 +207,15 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 		state.responseUpdated = state.lastUpdated
 	}
 
+	// TLS request bodies often continue across multiple SSL_read calls after we've
+	// already emitted a truncated request head. Ignore those body-only follow-on
+	// chunks, but still admit a brand new request on the same keep-alive
+	// connection; otherwise later requests never enter pendingRequests and
+	// subsequent responses shift onto the wrong logical request.
+	if event.Direction == DirectionRequest && len(state.pendingRequests) > 0 && isTLSSource(event.Source) && !looksLikeTLSRequestStart(event.Payload) {
+		return nil, nil
+	}
+
 	var stream *fragmentStream
 	switch event.Direction {
 	case DirectionRequest:
@@ -230,10 +241,8 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 		return nil, nil
 	}
 	if len(event.Payload) > 0 {
-		if !stream.truncated {
-			if _, exists := stream.received[event.FragIdx]; !exists {
-				stream.received[event.FragIdx] = append([]byte(nil), event.Payload...)
-			}
+		if _, exists := stream.received[event.FragIdx]; !exists {
+			stream.received[event.FragIdx] = append([]byte(nil), event.Payload...)
 		}
 	}
 	if event.Flags&eventFlagCaptureTrunc != 0 {
@@ -439,6 +448,27 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 			continue
 		}
 
+		// TLS plaintext capture currently emits verifier-friendly short fragments.
+		// Once request capture is marked truncated, favor preserving the parsed
+		// request head immediately instead of waiting for a full body that may
+		// never be captured into user space.
+		if state.requestStream.truncated {
+			msg, ok, err := TryParseMessageHead(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: false})
+			if err == nil && ok {
+				annotateParsedMessage(msg, &state.requestStream)
+				updates = append(updates, state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, true))
+				state.requestStream.consumeAll()
+				return updates, nil
+			}
+			msg, ok, err = TryParsePartialHead(DirectionRequest, state.requestStream.buffer)
+			if err == nil && ok {
+				annotateParsedMessage(msg, &state.requestStream)
+				updates = append(updates, state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, true))
+				state.requestStream.consumeAll()
+				return updates, nil
+			}
+		}
+
 		if resyncStream(DirectionRequest, &state.requestStream) {
 			continue
 		}
@@ -467,6 +497,21 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 	}
 
 	return updates, nil
+}
+
+func isTLSSource(source string) bool {
+	return strings.HasPrefix(source, "tls_")
+}
+
+func looksLikeTLSRequestStart(payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	if FindMessageStart(DirectionRequest, payload) == 0 {
+		return true
+	}
+	trimmed := bytes.TrimLeft(payload, "\r\n\t ")
+	return len(trimmed) != len(payload) && FindMessageStart(DirectionRequest, trimmed) == 0
 }
 
 func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error) {
@@ -562,6 +607,15 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 			if resyncStream(DirectionResponse, &state.responseStream) {
 				continue
 			}
+			if partial, ok, perr := TryParsePartialHead(DirectionResponse, state.responseStream.buffer); perr == nil && ok {
+				if len(state.pendingRequests) == 0 {
+					a.orphanResponses.Add(1)
+				}
+				annotateParsedMessage(partial, &state.responseStream)
+				updates = append(updates, state.buildResponseUpdate(partial, state.responseStream.firstTS, true))
+				state.responseStream.consumeAll()
+				return updates, nil
+			}
 			if synthetic, ok := BuildSyntheticResponse(state.responseStream.buffer); ok {
 				if len(state.pendingRequests) == 0 {
 					a.orphanResponses.Add(1)
@@ -575,6 +629,15 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 		if !ok {
 			if resyncStream(DirectionResponse, &state.responseStream) {
 				continue
+			}
+			if partial, ok, perr := TryParsePartialHead(DirectionResponse, state.responseStream.buffer); perr == nil && ok {
+				if len(state.pendingRequests) == 0 {
+					a.orphanResponses.Add(1)
+				}
+				annotateParsedMessage(partial, &state.responseStream)
+				updates = append(updates, state.buildResponseUpdate(partial, state.responseStream.firstTS, true))
+				state.responseStream.consumeAll()
+				return updates, nil
 			}
 			if synthetic, ok := BuildSyntheticResponse(state.responseStream.buffer); ok {
 				if len(state.pendingRequests) == 0 {
@@ -614,7 +677,10 @@ func (a *Assembler) promoteRequestForResponse(state *traceState) ([]Update, erro
 
 	msg, ok, err := TryParseMessageHead(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: true})
 	if err != nil || !ok {
-		return nil, err
+		msg, ok, err = TryParsePartialHead(DirectionRequest, state.requestStream.buffer)
+		if err != nil || !ok {
+			return nil, err
+		}
 	}
 
 	a.promotedRequests.Add(1)
@@ -676,6 +742,15 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 
 	msg, ok, err := TryParseMessageHead(DirectionResponse, state.responseStream.buffer, opts)
 	if err != nil || !ok {
+		if partial, ok, perr := TryParsePartialHead(DirectionResponse, state.responseStream.buffer); perr == nil && ok {
+			if len(state.pendingRequests) == 0 {
+				a.orphanResponses.Add(1)
+			}
+			annotateParsedMessage(partial, &state.responseStream)
+			update := state.buildResponseUpdate(partial, state.responseStream.firstTS, true)
+			state.responseStream.consumeAll()
+			return []Update{update}
+		}
 		if synthetic, ok := BuildSyntheticResponse(state.responseStream.buffer); ok {
 			if len(state.pendingRequests) == 0 {
 				a.orphanResponses.Add(1)

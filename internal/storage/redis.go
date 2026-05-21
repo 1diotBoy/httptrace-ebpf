@@ -160,7 +160,6 @@ func (s *RedisStore) readBodyLimitBytes(ctx context.Context, key string) (int64,
 	return limit, nil
 }
 
-// 用户态截断（已弃用）
 func parseBodyLimitBytes(raw string) (int64, error) {
 	value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 	if err != nil {
@@ -178,6 +177,7 @@ func parseBodyLimitBytes(raw string) (int64, error) {
 	return value, nil
 }
 
+// 用户态截断（已弃用）
 func (s *RedisStore) RequestCaptureLimitBytes() int {
 	requestMaxValueLock.RLock()
 	defer requestMaxValueLock.RUnlock()
