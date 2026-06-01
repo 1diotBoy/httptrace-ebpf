@@ -95,6 +95,7 @@ enum filter_debug_flags {
 	DEBUG_FLAG_SNAPSHOT = 1 << 0,
 	DEBUG_FLAG_LEGACY_SEND_PRIMARY_TCP = 1 << 8,
 	DEBUG_FLAG_LEGACY_RECV_PRIMARY_TCP = 1 << 9,
+	DEBUG_FLAG_CAPTURE_DISABLED = 1 << 10,
 };
 
 struct iovec_compat {
@@ -281,6 +282,12 @@ struct flow_state {
 	__u64 pending_req_chain1;
 	__u64 pending_req_chain2;
 	__u64 pending_req_chain3;
+	__u64 pending_req_sig0;
+	__u64 pending_req_sig1;
+	__u64 pending_req_sig2;
+	__u64 pending_req_sig3;
+	__u64 last_req_sig;
+	__u64 resp_req_sig;
 	__u64 req_observed_bytes;
 	__u64 resp_observed_bytes;
 	__u64 req_reported_bytes;
@@ -295,7 +302,8 @@ struct flow_state {
 	__u8 resp_active;
 	__u8 req_capture_stopped;
 	__u8 resp_capture_stopped;
-	__u8 pad0[3];
+	__u8 tls_role;
+	__u8 pad0[2];
 };
 
 struct recv_args {

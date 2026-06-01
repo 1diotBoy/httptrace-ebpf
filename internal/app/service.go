@@ -47,11 +47,18 @@ type Service struct {
 	store                    *storage.RedisStore
 	resolver                 *socketResolver
 	stats                    *stats
+	heartbeat                *heartbeatRuntime
 	resourcePlan             runtimeResourcePlan
 	hookStrategy             bpfgen.HookStrategy
 	lastRequestCaptureLimit  uint32
 	lastResponseCaptureLimit uint32
+	lastFilterDebugFlags     uint32
+	lastTLSFlags             uint32
 	lastDebugSnapshotSeq     uint64
+	startTime                time.Time
+	currentStatsDay          string
+	collectEnabled           atomic.Bool
+	dailyMu                  sync.Mutex
 }
 
 type stats struct {
@@ -59,6 +66,8 @@ type stats struct {
 	perfLost           atomic.Uint64
 	requests           atomic.Uint64
 	responses          atomic.Uint64
+	inputBytes         atomic.Uint64
+	outputBytes        atomic.Uint64
 	redisWrites        atomic.Uint64
 	redisFailures      atomic.Uint64
 	parseFailures      atomic.Uint64
@@ -101,6 +110,9 @@ type stats struct {
 	sourceMu           sync.Mutex
 	rawBySource        map[string]sourceDirectionCounts
 	updatesBySource    map[string]sourceUpdateCounts
+	rawChainsByKey     map[string]map[uint64]struct{}
+	updateChainsByKey  map[string]map[uint64]struct{}
+	rawChainDetails    map[string]rawChainDetail
 }
 
 type sourceDirectionCounts struct {
@@ -113,6 +125,16 @@ type sourceUpdateCounts struct {
 	Request  uint64
 	Response uint64
 	Other    uint64
+}
+
+type rawChainDetail struct {
+	Source    string
+	Direction uint8
+	ChainID   uint64
+	SockID    uint64
+	FD        int32
+	Comm      string
+	Prefix    string
 }
 
 type resolveRetryItem struct {
@@ -141,6 +163,22 @@ func kernelDebugFlags(debug bool, strategy bpfgen.HookStrategy) uint32 {
 	return flags
 }
 
+// 读取用户态下发的是否采集标志
+func (s *Service) currentKernelDebugFlags() uint32 {
+	flags := kernelDebugFlags(s.cfg.DebugKernel, s.hookStrategy)
+	if !s.collectEnabled.Load() {
+		flags |= dataCollectDisabledBit
+	}
+	return flags
+}
+
+func (s *Service) currentTLSFlags() uint32 {
+	if s == nil || s.collectEnabled.Load() {
+		return 0
+	}
+	return dataCollectDisabledBit
+}
+
 func NewService(cfg Config) (*Service, error) {
 	cfg, plan := cfg.normalizedForHost()
 	filter, err := cfg.ResolveFilter()
@@ -161,19 +199,32 @@ func NewService(cfg Config) (*Service, error) {
 	} else {
 		log.Printf("redis 地址为空， 不存储到redis ...")
 	}
+	startTime := time.Now()
+	heartbeat, err := newHeartbeatRuntime(cfg, startTime)
+	if err != nil {
+		return nil, err
+	}
 	log.Printf("runtime resource plan: %s", plan.Summary())
-	return &Service{
-		cfg:          cfg,
-		filter:       filter,
-		assembler:    httptrace.NewAssembler(cfg.MaxMessageBytes, cfg.TransactionTTL, cfg.ResponseStallTimeout),
-		store:        store,
-		resolver:     newSocketResolver(15 * time.Second),
-		stats:        &stats{},
-		resourcePlan: plan,
-	}, nil
+	svc := &Service{
+		cfg:             cfg,
+		filter:          filter,
+		assembler:       httptrace.NewAssembler(cfg.MaxMessageBytes, cfg.TransactionTTL, cfg.ResponseStallTimeout),
+		store:           store,
+		resolver:        newSocketResolver(15 * time.Second),
+		stats:           &stats{},
+		heartbeat:       heartbeat,
+		resourcePlan:    plan,
+		startTime:       startTime,
+		currentStatsDay: localDayStamp(startTime),
+	}
+	svc.collectEnabled.Store(true)
+	return svc, nil
 }
 
 func (s *Service) Close() error {
+	if s == nil || s.store == nil {
+		return nil
+	}
 	return s.store.Close()
 }
 
@@ -271,7 +322,7 @@ func (s *Service) Run(ctx context.Context) error {
 	var retryWG sync.WaitGroup
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 
 	wg.Add(1)
 	go func() {
@@ -302,6 +353,20 @@ func (s *Service) Run(ctx context.Context) error {
 			errCh <- err
 		}
 	}()
+
+	if s.heartbeat != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var tlsConfigMap *ebpf.Map
+			if tlsObjs != nil {
+				tlsConfigMap = tlsObjs.TLSConfigMap
+			}
+			if err := s.heartbeatLoop(ctx, objs.FilterMap, tlsConfigMap); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- err
+			}
+		}()
+	}
 
 	var runErr error
 	select {
@@ -356,19 +421,20 @@ func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 			kernelFilter.RequestCaptureBytes = uint32(s.cfg.CaptureBytes)
 			kernelFilter.ResponseCaptureBytes = uint32(s.cfg.CaptureBytes)
 		}
-		kernelFilter.DebugFlags = kernelDebugFlags(s.cfg.DebugKernel, objs.HookStrategy)
+		kernelFilter.DebugFlags = s.currentKernelDebugFlags()
 		if err := objs.FilterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update filter map: %w", err)
 		}
 		s.lastRequestCaptureLimit = kernelFilter.RequestCaptureBytes
 		s.lastResponseCaptureLimit = kernelFilter.ResponseCaptureBytes
+		s.lastFilterDebugFlags = kernelFilter.DebugFlags
 		return nil
 	}
 	if kernelFilter.Ifindex != 0 {
 		log.Printf("ifname filter is not enforced in kernel tuple-cache mode: socket-layer ifindex is not reliable enough")
 	}
 	kernelFilter.Ifindex = 0
-	kernelFilter.DebugFlags = kernelDebugFlags(s.cfg.DebugKernel, objs.HookStrategy)
+	kernelFilter.DebugFlags = s.currentKernelDebugFlags()
 	if objs.HookStrategy == bpfgen.HookStrategyLegacySock ||
 		objs.HookStrategy == bpfgen.HookStrategyLegacyTCPSend ||
 		objs.HookStrategy == bpfgen.HookStrategyLegacyTCPBoth {
@@ -382,23 +448,30 @@ func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 	}
 	s.lastRequestCaptureLimit = kernelFilter.RequestCaptureBytes
 	s.lastResponseCaptureLimit = kernelFilter.ResponseCaptureBytes
+	s.lastFilterDebugFlags = kernelFilter.DebugFlags
 	return nil
 }
 
+// 用户态同步 【 1. 内核采集限制 2. 内核采集开关 】 给 内核态
 func (s *Service) syncCaptureLimitsToKernel(filterMap *ebpf.Map) error {
-	if s == nil || s.store == nil || filterMap == nil {
+	if s == nil || filterMap == nil {
 		return nil
 	}
 
-	requestLimit := uint32(s.store.RequestCaptureLimitBytes())
-	responseLimit := uint32(s.store.ResponseCaptureLimitBytes())
-	if requestLimit == 0 {
-		requestLimit = uint32(s.cfg.CaptureBytes)
+	requestLimit := uint32(s.cfg.CaptureBytes)
+	responseLimit := uint32(s.cfg.CaptureBytes)
+	if s.store != nil {
+		if v := s.store.RequestCaptureLimitBytes(); v > 0 {
+			requestLimit = uint32(v)
+		}
+		if v := s.store.ResponseCaptureLimitBytes(); v > 0 {
+			responseLimit = uint32(v)
+		}
 	}
-	if responseLimit == 0 {
-		responseLimit = uint32(s.cfg.CaptureBytes)
-	}
-	if requestLimit == s.lastRequestCaptureLimit && responseLimit == s.lastResponseCaptureLimit {
+	debugFlags := s.currentKernelDebugFlags()
+	if requestLimit == s.lastRequestCaptureLimit &&
+		responseLimit == s.lastResponseCaptureLimit &&
+		debugFlags == s.lastFilterDebugFlags {
 		return nil
 	}
 
@@ -413,14 +486,15 @@ func (s *Service) syncCaptureLimitsToKernel(filterMap *ebpf.Map) error {
 	}
 	kernelFilter.RequestCaptureBytes = requestLimit
 	kernelFilter.ResponseCaptureBytes = responseLimit
-	kernelFilter.DebugFlags = kernelDebugFlags(s.cfg.DebugKernel, s.hookStrategy)
+	kernelFilter.DebugFlags = debugFlags
 	if err := filterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update dynamic capture limits: %w", err)
 	}
 
 	s.lastRequestCaptureLimit = requestLimit
 	s.lastResponseCaptureLimit = responseLimit
-	log.Printf("updated kernel capture limits request=%d response=%d", requestLimit, responseLimit)
+	s.lastFilterDebugFlags = debugFlags
+	log.Printf("updated kernel capture state request=%d response=%d enabled=%t", requestLimit, responseLimit, s.collectEnabled.Load())
 	return nil
 }
 
@@ -443,6 +517,7 @@ func (s *Service) installTLSConfig(configMap *ebpf.Map) error {
 	var cfg bpfgen.TlsTraceConfig
 	cfg.RequestCaptureBytes = requestLimit
 	cfg.ResponseCaptureBytes = responseLimit
+	cfg.Flags = s.currentTLSFlags()
 	for i, r := range tlstrace.ResolveTargetComm(s.cfg.TLSComm) {
 		if i >= len(cfg.Comm) {
 			break
@@ -451,6 +526,7 @@ func (s *Service) installTLSConfig(configMap *ebpf.Map) error {
 	}
 
 	key := uint32(0)
+	s.lastTLSFlags = cfg.Flags
 	if err := configMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update tls config map: %w", err)
 	}
@@ -606,12 +682,16 @@ func (s *Service) printHTTPTraceTag(tag string, update httptrace.Update) {
 func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace.Update, writeCh chan<- httptrace.Update) {
 	update.Trace = s.enrichTraceTupleForOutput(update.Trace)
 	update.Trace = s.sanitizeTraceForOutput(update.Trace)
-	s.stats.recordUpdateSource(update.Trace.CaptureSource, update.Kind)
+	s.stats.recordUpdateSource(update.Trace.CaptureSource, update.Kind, update.Trace.ChainID)
+	// 统计请求次数、请求大小
 	if update.Kind == "request" {
 		s.stats.requests.Add(1)
+		s.stats.inputBytes.Add(traceObservedBytes(update.Trace.Request))
 	}
+	// 统计响应次数、响应大小
 	if update.Kind == "response" {
 		s.stats.responses.Add(1)
+		s.stats.outputBytes.Add(traceObservedBytes(update.Trace.Response))
 	}
 	if tag == "stalled" && update.Kind == "response" {
 		s.stats.stallFlushes.Add(1)
@@ -684,14 +764,6 @@ func (s *Service) logAssemblyDiagnostic(tag string, update httptrace.Update) {
 }
 
 func (s *Service) enrichTraceTupleForOutput(trace httptrace.TraceDocument) httptrace.TraceDocument {
-	if trace.PID == 0 || trace.FD < 0 {
-		return trace
-	}
-	if (trace.SrcIP != "" && trace.SrcIP != "0.0.0.0" && trace.SrcPort != 0) &&
-		(trace.DstIP != "" && trace.DstIP != "0.0.0.0" && trace.DstPort != 0) {
-		return trace
-	}
-
 	event := httptrace.Event{
 		PID:     trace.PID,
 		FD:      trace.FD,
@@ -708,14 +780,31 @@ func (s *Service) enrichTraceTupleForOutput(trace httptrace.TraceDocument) httpt
 		event.Direction = httptrace.DirectionResponse
 	}
 
-	resolved, source := s.resolver.Resolve(event)
-	if source == resolveMiss || missingTuple(resolved) {
+	resolvedByResolver := false
+	if s != nil && s.resolver != nil && trace.PID != 0 && trace.FD >= 0 {
+		key := socketKey{pid: trace.PID, fd: trace.FD, sockID: trace.SockID}
+		if tuple, ok := s.resolver.lookupCache(key); ok {
+			event = applyResolvedTuple(event, tuple)
+			resolvedByResolver = true
+		} else if tuple, ok := resolveSocketTuple(trace.PID, trace.FD); ok {
+			s.resolver.storeCache(key, tuple)
+			event = applyResolvedTuple(event, tuple)
+			resolvedByResolver = true
+		}
+	}
+
+	if !resolvedByResolver && event.Direction == httptrace.DirectionRequest && !missingTuple(event) {
+		event.SrcIP, event.DstIP = event.DstIP, event.SrcIP
+		event.SrcPort, event.DstPort = event.DstPort, event.SrcPort
+	}
+
+	if missingTuple(event) {
 		return trace
 	}
-	trace.SrcIP = resolved.SrcIP
-	trace.DstIP = resolved.DstIP
-	trace.SrcPort = resolved.SrcPort
-	trace.DstPort = resolved.DstPort
+	trace.SrcIP = event.SrcIP
+	trace.DstIP = event.DstIP
+	trace.SrcPort = event.SrcPort
+	trace.DstPort = event.DstPort
 	return trace
 }
 
@@ -892,7 +981,21 @@ func (s *Service) enqueueRetry(ctx context.Context, retrySem chan struct{}, retr
 }
 
 func (s *Service) dispatchEvent(ctx context.Context, event httptrace.Event, worker chan<- httptrace.Event) error {
-	s.stats.recordRawSourceEvent(event.Source, event.Direction)
+	newRawChain := s.stats.recordRawSourceEvent(event)
+	if s.cfg.DebugKernel && newRawChain && strings.HasPrefix(event.Source, "tls_") {
+		log.Printf(
+			"tls raw chain source=%s dir=%d chain=%d sock=%d fd=%d seq=%d observed=%d comm=%s prefix=%q",
+			event.Source,
+			event.Direction,
+			event.ChainID,
+			event.SockID,
+			event.FD,
+			event.SeqHint,
+			event.ObservedMessageBytes,
+			event.Comm,
+			summarizePayloadPrefix(event.Payload, 48),
+		)
+	}
 	if s.shouldSuppressSocketEventForTLS(event) {
 		return nil
 	}
@@ -966,19 +1069,49 @@ func (s *Service) dispatchEvent(ctx context.Context, event httptrace.Event, work
 	}
 }
 
-func (s *stats) recordRawSourceEvent(source string, direction uint8) {
-	if s == nil {
-		return
-	}
+func sourceDirectionKey(source string, direction uint8) string {
 	if source == "" {
 		source = "unknown"
 	}
+	switch direction {
+	case httptrace.DirectionRequest:
+		return source + ":req"
+	case httptrace.DirectionResponse:
+		return source + ":resp"
+	default:
+		return source + ":unk"
+	}
+}
+
+func sourceUpdateKey(source, kind string) string {
+	if source == "" {
+		source = "unknown"
+	}
+	switch kind {
+	case "request":
+		return source + ":req"
+	case "response":
+		return source + ":resp"
+	default:
+		return source + ":other"
+	}
+}
+
+func (s *stats) recordRawSourceEvent(event httptrace.Event) bool {
+	if s == nil {
+		return false
+	}
+	source := event.Source
+	if source == "" {
+		source = "unknown"
+	}
+	newChain := false
 	s.sourceMu.Lock()
 	if s.rawBySource == nil {
 		s.rawBySource = make(map[string]sourceDirectionCounts)
 	}
 	counts := s.rawBySource[source]
-	switch direction {
+	switch event.Direction {
 	case httptrace.DirectionRequest:
 		counts.Request++
 	case httptrace.DirectionResponse:
@@ -987,10 +1120,39 @@ func (s *stats) recordRawSourceEvent(source string, direction uint8) {
 		counts.Unknown++
 	}
 	s.rawBySource[source] = counts
+	if event.ChainID != 0 {
+		if s.rawChainsByKey == nil {
+			s.rawChainsByKey = make(map[string]map[uint64]struct{})
+		}
+		key := sourceDirectionKey(source, event.Direction)
+		if s.rawChainsByKey[key] == nil {
+			s.rawChainsByKey[key] = make(map[uint64]struct{})
+		}
+		if _, exists := s.rawChainsByKey[key][event.ChainID]; !exists {
+			newChain = true
+		}
+		s.rawChainsByKey[key][event.ChainID] = struct{}{}
+		if newChain && strings.HasPrefix(source, "tls_") {
+			if s.rawChainDetails == nil {
+				s.rawChainDetails = make(map[string]rawChainDetail)
+			}
+			detailKey := fmt.Sprintf("%s:%d", key, event.ChainID)
+			s.rawChainDetails[detailKey] = rawChainDetail{
+				Source:    source,
+				Direction: event.Direction,
+				ChainID:   event.ChainID,
+				SockID:    event.SockID,
+				FD:        event.FD,
+				Comm:      event.Comm,
+				Prefix:    summarizePayloadPrefix(event.Payload, 48),
+			}
+		}
+	}
 	s.sourceMu.Unlock()
+	return newChain
 }
 
-func (s *stats) recordUpdateSource(source, kind string) {
+func (s *stats) recordUpdateSource(source, kind string, chainID uint64) {
 	if s == nil {
 		return
 	}
@@ -1011,6 +1173,16 @@ func (s *stats) recordUpdateSource(source, kind string) {
 		counts.Other++
 	}
 	s.updatesBySource[source] = counts
+	if chainID != 0 {
+		if s.updateChainsByKey == nil {
+			s.updateChainsByKey = make(map[string]map[uint64]struct{})
+		}
+		key := sourceUpdateKey(source, kind)
+		if s.updateChainsByKey[key] == nil {
+			s.updateChainsByKey[key] = make(map[uint64]struct{})
+		}
+		s.updateChainsByKey[key][chainID] = struct{}{}
+	}
 	s.sourceMu.Unlock()
 }
 
@@ -1058,8 +1230,114 @@ func (s *stats) updateSourceSummary() string {
 	return strings.Join(parts, " ")
 }
 
+func (s *stats) rawSourceChainSummary() string {
+	if s == nil {
+		return "none"
+	}
+	s.sourceMu.Lock()
+	defer s.sourceMu.Unlock()
+	if len(s.rawChainsByKey) == 0 {
+		return "none"
+	}
+	keys := make([]string, 0, len(s.rawChainsByKey))
+	for key := range s.rawChainsByKey {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", key, len(s.rawChainsByKey[key])))
+	}
+	return strings.Join(parts, " ")
+}
+
+func (s *stats) updateSourceChainSummary() string {
+	if s == nil {
+		return "none"
+	}
+	s.sourceMu.Lock()
+	defer s.sourceMu.Unlock()
+	if len(s.updateChainsByKey) == 0 {
+		return "none"
+	}
+	keys := make([]string, 0, len(s.updateChainsByKey))
+	for key := range s.updateChainsByKey {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", key, len(s.updateChainsByKey[key])))
+	}
+	return strings.Join(parts, " ")
+}
+
+func (s *stats) rawTLSChainDetailSummary() string {
+	if s == nil {
+		return "none"
+	}
+	s.sourceMu.Lock()
+	defer s.sourceMu.Unlock()
+	if len(s.rawChainDetails) == 0 {
+		return "none"
+	}
+	keys := make([]string, 0, len(s.rawChainDetails))
+	for key := range s.rawChainDetails {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		detail := s.rawChainDetails[key]
+		dir := "unk"
+		switch detail.Direction {
+		case httptrace.DirectionRequest:
+			dir = "req"
+		case httptrace.DirectionResponse:
+			dir = "resp"
+		}
+		parts = append(parts, fmt.Sprintf("%s:%s(chain=%d sock=%d fd=%d comm=%s prefix=%q)",
+			detail.Source,
+			dir,
+			detail.ChainID,
+			detail.SockID,
+			detail.FD,
+			detail.Comm,
+			detail.Prefix,
+		))
+	}
+	return strings.Join(parts, " ")
+}
+
+func summarizePayloadPrefix(payload []byte, limit int) string {
+	if limit <= 0 || len(payload) == 0 {
+		return ""
+	}
+	if len(payload) < limit {
+		limit = len(payload)
+	}
+	buf := make([]byte, 0, limit)
+	for _, b := range payload[:limit] {
+		switch b {
+		case '\r':
+			buf = append(buf, '\\', 'r')
+		case '\n':
+			buf = append(buf, '\\', 'n')
+		case '\t':
+			buf = append(buf, '\\', 't')
+		default:
+			if b < 0x20 || b > 0x7e {
+				buf = append(buf, '.')
+			} else {
+				buf = append(buf, b)
+			}
+		}
+	}
+	return string(buf)
+}
+
 func (s *Service) shouldSuppressSocketEventForTLS(event httptrace.Event) bool {
-	if s == nil || !s.cfg.EnableTLS {
+	if s == nil || !s.cfg.EnableTLS || !s.cfg.SuppressSocketForTLS {
 		return false
 	}
 	if event.Comm == "" {
@@ -1264,6 +1542,7 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.LoadedObjects, tlsCo
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-captureTicker.C:
+			s.RolloverDaily(time.Now(), objs)
 			if err := s.syncCaptureLimitsToKernel(objs.FilterMap); err != nil {
 				log.Printf("sync kernel capture limits error: %v", err)
 			}
@@ -1273,11 +1552,13 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.LoadedObjects, tlsCo
 				}
 			}
 		case <-flushTicker.C:
+			s.RolloverDaily(time.Now(), objs)
 			updates := s.assembler.FlushStalled(time.Now())
 			for _, update := range updates {
 				s.handleUpdate(ctx, "stalled", update, writeCh)
 			}
 		case <-statsTicker.C:
+			s.RolloverDaily(time.Now(), objs)
 			evictUpdates, evicted := s.assembler.EvictExpired(time.Now())
 			for _, update := range evictUpdates {
 				s.handleUpdate(ctx, "evicted", update, writeCh)
@@ -1357,6 +1638,10 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 	)
 	log.Printf("%s source raw(%s)", label, s.stats.rawSourceSummary())
 	log.Printf("%s source update(%s)", label, s.stats.updateSourceSummary())
+	// 临时日志调试
+	log.Printf("%s source chains raw(%s)", label, s.stats.rawSourceChainSummary())
+	log.Printf("%s source chains update(%s)", label, s.stats.updateSourceChainSummary())
+	log.Printf("%s tls raw chains(%s)", label, s.stats.rawTLSChainDetailSummary())
 	if s.cfg.DebugKernel {
 		recordsRead := s.stats.recordsRead.Load()
 		resolveProcCount := s.stats.resolverProc.Load()

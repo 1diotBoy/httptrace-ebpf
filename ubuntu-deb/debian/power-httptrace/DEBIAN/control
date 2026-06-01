@@ -2,7 +2,7 @@ Package: power-httptrace
 Version: 1.0.0-1
 Architecture: amd64
 Maintainer: POWER <admin@local>
-Installed-Size: 6821
+Installed-Size: 8517
 Depends: bash, systemd, logrotate
 Section: utils
 Priority: optional

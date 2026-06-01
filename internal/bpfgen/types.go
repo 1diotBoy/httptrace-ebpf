@@ -11,7 +11,7 @@ type HttpTraceFilterConfig struct {
 	DebugFlags           uint32
 }
 
-// 事件结构
+// 内核态原生事件结构
 type HttpTraceHttpEvent struct {
 	TsNs                 uint64
 	ChainId              uint64

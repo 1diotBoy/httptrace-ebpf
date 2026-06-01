@@ -144,6 +144,11 @@ static __always_inline __u32 read_debug_flags(void)
 	return cfg.debug_flags;
 }
 
+static __always_inline int capture_enabled(void)
+{
+	return (read_debug_flags() & DEBUG_FLAG_CAPTURE_DISABLED) == 0;
+}
+
 static __always_inline int legacy_send_primary_tcp(void)
 {
 	return (read_debug_flags() & DEBUG_FLAG_LEGACY_SEND_PRIMARY_TCP) != 0;
@@ -195,6 +200,7 @@ static __always_inline int read_payload_bytes(void *dst, __u32 len, const void *
 #endif
 }
 
+// tuple（五元组） 信息读取
 static __always_inline __attribute__((unused)) int extract_tuple(struct sock_compat *sk, struct recv_args *meta)
 {
 	struct sock_common_compat common = {};
@@ -1197,6 +1203,7 @@ static __attribute__((noinline)) int emit_data_event(void *ctx, const struct cap
 	 * 避免 verifier 报 "R2 unbounded memory access"。
 	 */
 
+	// 组装perf event 传给用户态
 	event->ts_ns = bpf_ktime_get_ns();
 	event->chain_id = call->chain_id;
 	event->sock_id = call->meta->sock_id;
@@ -1778,6 +1785,8 @@ static __always_inline int store_recv_args(struct sock_compat *sk, struct msghdr
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	struct kernel_stats *stats = stats_lookup();
 
+	if (!capture_enabled())
+		return 0;
 	if (claim_recv_guard(pid_tgid, msg, source) == RECV_GUARD_SKIP)
 		return 0;
 
@@ -1896,6 +1905,8 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 	__u64 seq_hint = 0;
 	__u16 flags = EVT_FLAG_HTTP_HINT;
 
+	if (!capture_enabled())
+		return 0;
 	meta = bpf_map_lookup_elem(&recv_args_map, &pid_tgid);
 	if (!meta) {
 		if (stats)
@@ -1993,6 +2004,8 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 	int started_new_response = 0;
 	int guard_action = SEND_GUARD_SKIP;
 
+	if (!capture_enabled())
+		return 0;
 	if (stats)
 		stats->send_calls += 1;
 	sock_id = prepare_send_scratch(sk, msg, fd, source);

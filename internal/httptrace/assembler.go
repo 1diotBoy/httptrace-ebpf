@@ -115,6 +115,7 @@ type pendingRequest struct {
 	requestTS        *time.Time
 	request          *ParsedMessage
 	requestTruncated bool
+	emitted          bool
 }
 
 type Snapshot struct {
@@ -394,6 +395,17 @@ func (a *Assembler) Snapshot() Snapshot {
 	return snap
 }
 
+func (a *Assembler) ResetCounters() {
+	if a == nil {
+		return
+	}
+	a.stalledFlushes.Swap(0)
+	a.evictedFlushes.Swap(0)
+	a.orphanResponses.Swap(0)
+	a.promotedRequests.Swap(0)
+	a.deferredResponses.Swap(0)
+}
+
 func (a *Assembler) HasState(chainID uint64) bool {
 	if chainID == 0 {
 		return false
@@ -450,7 +462,12 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 		}
 		if complete {
 			annotateParsedMessage(msg, &state.requestStream)
-			updates = append(updates, state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, false))
+			chainID := a.nextLogicalChainID(state)
+			if isTLSSource(state.requestSource) {
+				state.queuePendingRequest(chainID, msg, state.requestStream.firstTS, false, false)
+			} else {
+				updates = append(updates, state.buildRequestUpdate(chainID, msg, state.requestStream.firstTS, false))
+			}
 			state.requestStream.consume(msg.ConsumedBytes)
 			if isTLSSource(state.requestSource) {
 				// A TLS kernel chain is expected to represent one logical HTTP
@@ -473,14 +490,24 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 			msg, ok, err := TryParseMessageHead(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: false})
 			if err == nil && ok {
 				annotateParsedMessage(msg, &state.requestStream)
-				updates = append(updates, state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, true))
+				chainID := a.nextLogicalChainID(state)
+				if isTLSSource(state.requestSource) {
+					state.queuePendingRequest(chainID, msg, state.requestStream.firstTS, true, false)
+				} else {
+					updates = append(updates, state.buildRequestUpdate(chainID, msg, state.requestStream.firstTS, true))
+				}
 				state.requestStream.consumeAll()
 				return updates, nil
 			}
 			msg, ok, err = TryParsePartialHead(DirectionRequest, state.requestStream.buffer)
 			if err == nil && ok {
 				annotateParsedMessage(msg, &state.requestStream)
-				updates = append(updates, state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, true))
+				chainID := a.nextLogicalChainID(state)
+				if isTLSSource(state.requestSource) {
+					state.queuePendingRequest(chainID, msg, state.requestStream.firstTS, true, false)
+				} else {
+					updates = append(updates, state.buildRequestUpdate(chainID, msg, state.requestStream.firstTS, true))
+				}
 				state.requestStream.consumeAll()
 				return updates, nil
 			}
@@ -508,7 +535,12 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 			return updates, nil
 		}
 		annotateParsedMessage(msg, &state.requestStream)
-		updates = append(updates, state.buildRequestUpdate(a.nextLogicalChainID(state), msg, state.requestStream.firstTS, state.requestStream.truncated || msg.BodyPartial))
+		chainID := a.nextLogicalChainID(state)
+		if isTLSSource(state.requestSource) {
+			state.queuePendingRequest(chainID, msg, state.requestStream.firstTS, state.requestStream.truncated || msg.BodyPartial, false)
+		} else {
+			updates = append(updates, state.buildRequestUpdate(chainID, msg, state.requestStream.firstTS, state.requestStream.truncated || msg.BodyPartial))
+		}
 		state.requestStream.consumeAll()
 		return updates, nil
 	}
@@ -573,6 +605,9 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 				a.orphanResponses.Add(1)
 			}
 			annotateParsedMessage(msg, &state.responseStream)
+			if update, ok := state.emitDelayedTLSRequestUpdate(); ok {
+				updates = append(updates, update)
+			}
 			updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, false))
 			state.responseStream.consume(msg.ConsumedBytes)
 			continue
@@ -586,6 +621,9 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 				a.orphanResponses.Add(1)
 			}
 			annotateParsedMessage(head, &state.responseStream)
+			if update, ok := state.emitDelayedTLSRequestUpdate(); ok {
+				updates = append(updates, update)
+			}
 			updates = append(updates, state.buildResponseUpdate(head, state.responseStream.firstTS, true))
 			state.responseStream.consumeAll()
 			continue
@@ -609,6 +647,9 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 					a.orphanResponses.Add(1)
 				}
 				annotateParsedMessage(msg, &state.responseStream)
+				if update, ok := state.emitDelayedTLSRequestUpdate(); ok {
+					updates = append(updates, update)
+				}
 				updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, true))
 				state.responseStream.consume(consumed)
 				continue
@@ -629,6 +670,9 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 					a.orphanResponses.Add(1)
 				}
 				annotateParsedMessage(partial, &state.responseStream)
+				if update, ok := state.emitDelayedTLSRequestUpdate(); ok {
+					updates = append(updates, update)
+				}
 				updates = append(updates, state.buildResponseUpdate(partial, state.responseStream.firstTS, true))
 				state.responseStream.consumeAll()
 				return updates, nil
@@ -638,6 +682,9 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 					a.orphanResponses.Add(1)
 				}
 				annotateParsedMessage(synthetic, &state.responseStream)
+				if update, ok := state.emitDelayedTLSRequestUpdate(); ok {
+					updates = append(updates, update)
+				}
 				updates = append(updates, state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true))
 				state.responseStream.consumeAll()
 			}
@@ -652,6 +699,9 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 					a.orphanResponses.Add(1)
 				}
 				annotateParsedMessage(partial, &state.responseStream)
+				if update, ok := state.emitDelayedTLSRequestUpdate(); ok {
+					updates = append(updates, update)
+				}
 				updates = append(updates, state.buildResponseUpdate(partial, state.responseStream.firstTS, true))
 				state.responseStream.consumeAll()
 				return updates, nil
@@ -661,6 +711,9 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 					a.orphanResponses.Add(1)
 				}
 				annotateParsedMessage(synthetic, &state.responseStream)
+				if update, ok := state.emitDelayedTLSRequestUpdate(); ok {
+					updates = append(updates, update)
+				}
 				updates = append(updates, state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true))
 				state.responseStream.consumeAll()
 			}
@@ -670,6 +723,9 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 			a.orphanResponses.Add(1)
 		}
 		annotateParsedMessage(msg, &state.responseStream)
+		if update, ok := state.emitDelayedTLSRequestUpdate(); ok {
+			updates = append(updates, update)
+		}
 		updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, state.responseStream.truncated || msg.BodyPartial))
 		state.responseStream.consumeAll()
 		return updates, nil
@@ -748,6 +804,11 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 			a.orphanResponses.Add(1)
 		}
 		annotateParsedMessage(msg, &state.responseStream)
+		if update, ok := state.emitDelayedTLSRequestUpdate(); ok {
+			resp := state.buildResponseUpdate(msg, state.responseStream.firstTS, false)
+			state.responseStream.consume(msg.ConsumedBytes)
+			return []Update{update, resp}
+		}
 		update := state.buildResponseUpdate(msg, state.responseStream.firstTS, false)
 		state.responseStream.consume(msg.ConsumedBytes)
 		return []Update{update}
@@ -764,6 +825,11 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 				a.orphanResponses.Add(1)
 			}
 			annotateParsedMessage(partial, &state.responseStream)
+			if update, ok := state.emitDelayedTLSRequestUpdate(); ok {
+				resp := state.buildResponseUpdate(partial, state.responseStream.firstTS, true)
+				state.responseStream.consumeAll()
+				return []Update{update, resp}
+			}
 			update := state.buildResponseUpdate(partial, state.responseStream.firstTS, true)
 			state.responseStream.consumeAll()
 			return []Update{update}
@@ -773,6 +839,11 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 				a.orphanResponses.Add(1)
 			}
 			annotateParsedMessage(synthetic, &state.responseStream)
+			if update, ok := state.emitDelayedTLSRequestUpdate(); ok {
+				resp := state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true)
+				state.responseStream.consumeAll()
+				return []Update{update, resp}
+			}
 			update := state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true)
 			state.responseStream.consumeAll()
 			return []Update{update}
@@ -783,6 +854,11 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 		a.orphanResponses.Add(1)
 	}
 	annotateParsedMessage(msg, &state.responseStream)
+	if update, ok := state.emitDelayedTLSRequestUpdate(); ok {
+		resp := state.buildResponseUpdate(msg, state.responseStream.firstTS, true)
+		state.responseStream.consumeAll()
+		return []Update{update, resp}
+	}
 	update := state.buildResponseUpdate(msg, state.responseStream.firstTS, true)
 	state.responseStream.consumeAll()
 	return []Update{update}
@@ -798,27 +874,22 @@ func (a *Assembler) nextLogicalChainID(state *traceState) uint64 {
 }
 
 func (t *traceState) buildRequestUpdate(chainID uint64, msg *ParsedMessage, ts *time.Time, truncated bool) Update {
-	doc := t.base
-	doc.Kind = "request"
-	doc.ChainID = chainID
-	doc.RequestTS = cloneTimePtr(ts)
-	doc.ResponseTS = nil
-	doc.ResponseLatency = nil
-	doc.Request = msg
-	doc.Response = nil
-	doc.CaptureSource = t.requestSource
-	doc.RequestTruncated = truncated
-	doc.ResponseTruncated = false
+	update := t.makeRequestUpdate(pendingRequest{
+		chainID:          chainID,
+		requestTS:        cloneTimePtr(ts),
+		request:          msg,
+		requestTruncated: truncated,
+		emitted:          true,
+	})
 	t.requestEmitted = true
-
 	t.pendingRequests = append(t.pendingRequests, pendingRequest{
 		chainID:          chainID,
 		requestTS:        cloneTimePtr(ts),
 		request:          msg,
 		requestTruncated: truncated,
+		emitted:          true,
 	})
-
-	return Update{Kind: "request", Trace: doc}
+	return update
 }
 
 // 构建响应更新
@@ -839,6 +910,11 @@ func (t *traceState) buildResponseUpdate(msg *ParsedMessage, ts *time.Time, trun
 		pending := t.pendingRequests[0]
 		t.pendingRequests = t.pendingRequests[1:]
 		doc.ChainID = pending.chainID
+		if isTLSSource(t.responseSource) || isTLSSource(t.requestSource) {
+			doc.RequestTS = cloneTimePtr(pending.requestTS)
+			doc.Request = pending.request
+			doc.RequestTruncated = pending.requestTruncated
+		}
 		if pending.requestTS != nil && ts != nil {
 			latency := ts.Sub(*pending.requestTS).Seconds() * 1000
 			doc.ResponseLatency = &latency
@@ -848,6 +924,44 @@ func (t *traceState) buildResponseUpdate(msg *ParsedMessage, ts *time.Time, trun
 	}
 
 	return Update{Kind: "response", Trace: doc}
+}
+
+func (t *traceState) queuePendingRequest(chainID uint64, msg *ParsedMessage, ts *time.Time, truncated bool, emitted bool) {
+	t.requestEmitted = true
+	t.pendingRequests = append(t.pendingRequests, pendingRequest{
+		chainID:          chainID,
+		requestTS:        cloneTimePtr(ts),
+		request:          msg,
+		requestTruncated: truncated,
+		emitted:          emitted,
+	})
+}
+
+func (t *traceState) makeRequestUpdate(pending pendingRequest) Update {
+	doc := t.base
+	doc.Kind = "request"
+	doc.ChainID = pending.chainID
+	doc.RequestTS = cloneTimePtr(pending.requestTS)
+	doc.ResponseTS = nil
+	doc.ResponseLatency = nil
+	doc.Request = pending.request
+	doc.Response = nil
+	doc.CaptureSource = t.requestSource
+	doc.RequestTruncated = pending.requestTruncated
+	doc.ResponseTruncated = false
+	return Update{Kind: "request", Trace: doc}
+}
+
+func (t *traceState) emitDelayedTLSRequestUpdate() (Update, bool) {
+	if !isTLSSource(t.requestSource) || len(t.pendingRequests) == 0 {
+		return Update{}, false
+	}
+	if t.pendingRequests[0].emitted {
+		return Update{}, false
+	}
+	pending := t.pendingRequests[0]
+	t.pendingRequests[0].emitted = true
+	return t.makeRequestUpdate(pending), true
 }
 
 func (t *traceState) canDelete() bool {

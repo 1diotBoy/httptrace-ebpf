@@ -178,7 +178,8 @@ func TestDispatchEventPassesThroughLegacyExistingChainFragment(t *testing.T) {
 	}
 }
 
-func TestDispatchEventSuppressesLegacySocketEventForTLSComm(t *testing.T) {
+// 测试当 TLS 开启时，是否默认保留传统的 socket 事件
+func TestDispatchEventKeepsLegacySocketEventForTLSCommByDefault(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.EnableTLS = true
 	cfg.TLSComm = "nginx"
@@ -205,15 +206,19 @@ func TestDispatchEventSuppressesLegacySocketEventForTLSComm(t *testing.T) {
 
 	select {
 	case got := <-ch:
-		t.Fatalf("legacy socket event should be suppressed when TLS is enabled: %#v", got)
+		if got.ChainID != event.ChainID || got.Source != event.Source {
+			t.Fatalf("unexpected event delivered: %#v", got)
+		}
 	default:
+		t.Fatalf("legacy socket event should be kept by default when TLS is enabled")
 	}
 }
 
-func TestDispatchEventKeepsTLSEventForTLSComm(t *testing.T) {
+func TestDispatchEventSuppressesLegacySocketEventForTLSCommWhenConfigured(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.EnableTLS = true
 	cfg.TLSComm = "nginx"
+	cfg.SuppressSocketForTLS = true
 
 	svc := &Service{
 		cfg:    cfg,
@@ -223,6 +228,39 @@ func TestDispatchEventKeepsTLSEventForTLSComm(t *testing.T) {
 	ch := make(chan httptrace.Event, 1)
 	event := httptrace.Event{
 		ChainID:   201,
+		FD:        12,
+		Direction: httptrace.DirectionRequest,
+		Source:    "sock_recvmsg",
+		Comm:      "nginx",
+		SrcIP:     "10.0.0.1",
+		DstIP:     "10.0.0.2",
+	}
+
+	if err := svc.dispatchEvent(context.Background(), event, ch); err != nil {
+		t.Fatalf("dispatchEvent returned error: %v", err)
+	}
+
+	select {
+	case got := <-ch:
+		t.Fatalf("legacy socket event should be suppressed when configured: %#v", got)
+	default:
+	}
+}
+
+func TestDispatchEventKeepsTLSEventForTLSComm(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.EnableTLS = true
+	cfg.TLSComm = "nginx"
+	cfg.SuppressSocketForTLS = true
+
+	svc := &Service{
+		cfg:    cfg,
+		filter: ResolvedFilter{},
+		stats:  &stats{},
+	}
+	ch := make(chan httptrace.Event, 1)
+	event := httptrace.Event{
+		ChainID:   202,
 		FD:        12,
 		Direction: httptrace.DirectionRequest,
 		Source:    "tls_ssl_read",
@@ -303,6 +341,66 @@ func TestSanitizeTraceForOutputKeepsKernelTuple(t *testing.T) {
 	got := svc.sanitizeTraceForOutput(trace)
 	if got.SrcIP != trace.SrcIP || got.DstIP != trace.DstIP || got.SrcPort != trace.SrcPort || got.DstPort != trace.DstPort {
 		t.Fatalf("kernel tuple fields should be preserved, got %#v want %#v", got, trace)
+	}
+}
+
+func TestEnrichTraceTupleForOutputSwapsRequestTupleWithoutResolver(t *testing.T) {
+	svc := &Service{}
+	trace := httptrace.TraceDocument{
+		Kind:    "request",
+		SrcIP:   "10.0.0.2",
+		DstIP:   "10.0.0.1",
+		SrcPort: 8080,
+		DstPort: 52344,
+	}
+
+	got := svc.enrichTraceTupleForOutput(trace)
+	if got.SrcIP != "10.0.0.1" || got.DstIP != "10.0.0.2" || got.SrcPort != 52344 || got.DstPort != 8080 {
+		t.Fatalf("request tuple should be normalized to client->server, got %#v", got)
+	}
+}
+
+func TestEnrichTraceTupleForOutputKeepsResponseTupleWithoutResolver(t *testing.T) {
+	svc := &Service{}
+	trace := httptrace.TraceDocument{
+		Kind:    "response",
+		SrcIP:   "10.0.0.2",
+		DstIP:   "10.0.0.1",
+		SrcPort: 8080,
+		DstPort: 52344,
+	}
+
+	got := svc.enrichTraceTupleForOutput(trace)
+	if got.SrcIP != trace.SrcIP || got.DstIP != trace.DstIP || got.SrcPort != trace.SrcPort || got.DstPort != trace.DstPort {
+		t.Fatalf("response tuple should stay server->client, got %#v want %#v", got, trace)
+	}
+}
+
+func TestEnrichTraceTupleForOutputUsesResolverDirection(t *testing.T) {
+	resolver := newSocketResolver(time.Second)
+	key := socketKey{pid: 1234, fd: 9, sockID: 77}
+	resolver.storeCache(key, cachedSocketTuple{
+		localIP:    "172.16.0.10",
+		remoteIP:   "172.16.0.20",
+		localPort:  8080,
+		remotePort: 55000,
+	})
+	svc := &Service{resolver: resolver}
+
+	trace := httptrace.TraceDocument{
+		Kind:    "request",
+		PID:     1234,
+		FD:      9,
+		SockID:  77,
+		SrcIP:   "10.0.0.2",
+		DstIP:   "10.0.0.1",
+		SrcPort: 8080,
+		DstPort: 52344,
+	}
+
+	got := svc.enrichTraceTupleForOutput(trace)
+	if got.SrcIP != "172.16.0.20" || got.DstIP != "172.16.0.10" || got.SrcPort != 55000 || got.DstPort != 8080 {
+		t.Fatalf("resolver-normalized tuple mismatch: got %#v", got)
 	}
 }
 

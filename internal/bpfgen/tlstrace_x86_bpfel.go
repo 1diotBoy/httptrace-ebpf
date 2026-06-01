@@ -76,13 +76,13 @@ type TlsTraceProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type TlsTraceMapSpecs struct {
-	Events       *ebpf.MapSpec `ebpf:"events"`
-	ScratchHeap  *ebpf.MapSpec `ebpf:"scratch_heap"`
-	TlsConfigMap *ebpf.MapSpec `ebpf:"tls_config_map"`
-	TlsFdArgsMap *ebpf.MapSpec `ebpf:"tls_fd_args_map"`
-	TlsFdMap     *ebpf.MapSpec `ebpf:"tls_fd_map"`
-	TlsFlowMap   *ebpf.MapSpec `ebpf:"tls_flow_map"`
-	TlsRwArgsMap *ebpf.MapSpec `ebpf:"tls_rw_args_map"`
+	Events        *ebpf.MapSpec `ebpf:"events"`
+	ScratchHeap   *ebpf.MapSpec `ebpf:"scratch_heap"`
+	TlsConfigMap  *ebpf.MapSpec `ebpf:"tls_config_map"`
+	TlsFdArgsMap  *ebpf.MapSpec `ebpf:"tls_fd_args_map"`
+	TlsFlowMap    *ebpf.MapSpec `ebpf:"tls_flow_map"`
+	TlsRwArgsMap  *ebpf.MapSpec `ebpf:"tls_rw_args_map"`
+	TlsSessionMap *ebpf.MapSpec `ebpf:"tls_session_map"`
 }
 
 // TlsTraceVariableSpecs contains global variables before they are loaded into the kernel.
@@ -111,13 +111,13 @@ func (o *TlsTraceObjects) Close() error {
 //
 // It can be passed to LoadTlsTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type TlsTraceMaps struct {
-	Events       *ebpf.Map `ebpf:"events"`
-	ScratchHeap  *ebpf.Map `ebpf:"scratch_heap"`
-	TlsConfigMap *ebpf.Map `ebpf:"tls_config_map"`
-	TlsFdArgsMap *ebpf.Map `ebpf:"tls_fd_args_map"`
-	TlsFdMap     *ebpf.Map `ebpf:"tls_fd_map"`
-	TlsFlowMap   *ebpf.Map `ebpf:"tls_flow_map"`
-	TlsRwArgsMap *ebpf.Map `ebpf:"tls_rw_args_map"`
+	Events        *ebpf.Map `ebpf:"events"`
+	ScratchHeap   *ebpf.Map `ebpf:"scratch_heap"`
+	TlsConfigMap  *ebpf.Map `ebpf:"tls_config_map"`
+	TlsFdArgsMap  *ebpf.Map `ebpf:"tls_fd_args_map"`
+	TlsFlowMap    *ebpf.Map `ebpf:"tls_flow_map"`
+	TlsRwArgsMap  *ebpf.Map `ebpf:"tls_rw_args_map"`
+	TlsSessionMap *ebpf.Map `ebpf:"tls_session_map"`
 }
 
 func (m *TlsTraceMaps) Close() error {
@@ -126,9 +126,9 @@ func (m *TlsTraceMaps) Close() error {
 		m.ScratchHeap,
 		m.TlsConfigMap,
 		m.TlsFdArgsMap,
-		m.TlsFdMap,
 		m.TlsFlowMap,
 		m.TlsRwArgsMap,
+		m.TlsSessionMap,
 	)
 }
 

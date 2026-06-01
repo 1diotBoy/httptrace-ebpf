@@ -786,17 +786,8 @@ func TestAssemblerEmitsTruncatedTLSRequestHeadAndIgnoresFollowOnBody(t *testing.
 	if err != nil {
 		t.Fatalf("truncated tls request process failed: %v", err)
 	}
-	if len(updates) != 1 || updates[0].Kind != "request" {
-		t.Fatalf("expected one request update, got %#v", updates)
-	}
-	if updates[0].Trace.Request == nil {
-		t.Fatalf("expected parsed request")
-	}
-	if got, want := updates[0].Trace.Request.Method, "POST"; got != want {
-		t.Fatalf("method = %q, want %q", got, want)
-	}
-	if !updates[0].Trace.RequestTruncated || !updates[0].Trace.Request.BodyPartial {
-		t.Fatalf("truncated tls request should be marked partial/truncated")
+	if len(updates) != 0 {
+		t.Fatalf("tls request should wait for response before emit, got %#v", updates)
 	}
 
 	updates, err = asm.Process(Event{
@@ -833,11 +824,17 @@ func TestAssemblerEmitsTruncatedTLSRequestHeadAndIgnoresFollowOnBody(t *testing.
 	if err != nil {
 		t.Fatalf("tls response process failed: %v", err)
 	}
-	if len(respUpdates) != 1 || respUpdates[0].Kind != "response" {
-		t.Fatalf("expected one response update, got %#v", respUpdates)
+	if len(respUpdates) != 2 || respUpdates[0].Kind != "request" || respUpdates[1].Kind != "response" {
+		t.Fatalf("expected delayed request + response updates, got %#v", respUpdates)
 	}
-	if respUpdates[0].Trace.Response == nil || respUpdates[0].Trace.Response.StatusCode != 200 {
-		t.Fatalf("expected parsed 200 response, got %#v", respUpdates[0].Trace.Response)
+	if respUpdates[0].Trace.Request == nil || respUpdates[0].Trace.Request.Method != "POST" {
+		t.Fatalf("expected delayed parsed request, got %#v", respUpdates[0].Trace.Request)
+	}
+	if !respUpdates[0].Trace.RequestTruncated || !respUpdates[0].Trace.Request.BodyPartial {
+		t.Fatalf("truncated tls request should be marked partial/truncated")
+	}
+	if respUpdates[1].Trace.Response == nil || respUpdates[1].Trace.Response.StatusCode != 200 {
+		t.Fatalf("expected parsed 200 response, got %#v", respUpdates[1].Trace.Response)
 	}
 
 	snap := asm.Snapshot()
@@ -873,20 +870,8 @@ func TestAssemblerEmitsPartialTLSRequestWithoutHeaderTerminator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("partial tls request process failed: %v", err)
 	}
-	if len(updates) != 1 || updates[0].Kind != "request" {
-		t.Fatalf("expected one truncated request update, got %#v", updates)
-	}
-	if updates[0].Trace.Request == nil {
-		t.Fatalf("expected parsed request")
-	}
-	if got, want := updates[0].Trace.Request.Method, "GET"; got != want {
-		t.Fatalf("method = %q, want %q", got, want)
-	}
-	if got, want := updates[0].Trace.Request.URL, "/big-cookie"; got != want {
-		t.Fatalf("url = %q, want %q", got, want)
-	}
-	if !updates[0].Trace.RequestTruncated {
-		t.Fatalf("expected truncated request flag")
+	if len(updates) != 0 {
+		t.Fatalf("tls request should wait for response before emit, got %#v", updates)
 	}
 
 	respUpdates, err := asm.Process(Event{
@@ -934,11 +919,17 @@ func TestAssemblerEmitsPartialTLSRequestWithoutHeaderTerminator(t *testing.T) {
 	}
 
 	flushed := asm.FlushStalled(now.Add(200 * time.Millisecond))
-	if len(flushed) != 1 || flushed[0].Kind != "response" {
-		t.Fatalf("expected one stalled response update, got %#v", flushed)
+	if len(flushed) != 2 || flushed[0].Kind != "request" || flushed[1].Kind != "response" {
+		t.Fatalf("expected delayed request + stalled response updates, got %#v", flushed)
 	}
-	if flushed[0].Trace.Response == nil || flushed[0].Trace.Response.StatusCode != 200 {
-		t.Fatalf("expected parsed response, got %#v", flushed[0].Trace.Response)
+	if flushed[0].Trace.Request == nil || flushed[0].Trace.Request.Method != "GET" || flushed[0].Trace.Request.URL != "/big-cookie" {
+		t.Fatalf("expected delayed parsed request, got %#v", flushed[0].Trace.Request)
+	}
+	if !flushed[0].Trace.RequestTruncated {
+		t.Fatalf("expected truncated request flag")
+	}
+	if flushed[1].Trace.Response == nil || flushed[1].Trace.Response.StatusCode != 200 {
+		t.Fatalf("expected parsed response, got %#v", flushed[1].Trace.Response)
 	}
 }
 
@@ -1033,8 +1024,8 @@ func TestAssemblerTLSIgnoresSecondRequestOnSameChain(t *testing.T) {
 		Source:    "tls_ssl_read",
 		Payload:   []byte("GET /query HTTP/1.1\r\nHost: example.com\r\n\r\n"),
 	})
-	if err != nil || len(req1Updates) != 1 {
-		t.Fatalf("first tls request emit failed: updates=%d err=%v", len(req1Updates), err)
+	if err != nil || len(req1Updates) != 0 {
+		t.Fatalf("first tls request should queue until response: updates=%d err=%v", len(req1Updates), err)
 	}
 
 	req2Updates, err := asm.Process(Event{
@@ -1057,13 +1048,6 @@ func TestAssemblerTLSIgnoresSecondRequestOnSameChain(t *testing.T) {
 	if len(req2Updates) != 0 {
 		t.Fatalf("same tls chain must not emit a second logical request, got %#v", req2Updates)
 	}
-	if req1Updates[0].Trace.Request == nil {
-		t.Fatalf("expected parsed first request")
-	}
-	if got, want := req1Updates[0].Trace.Request.URL, "/query"; got != want {
-		t.Fatalf("first request url = %q, want %q", got, want)
-	}
-
 	resp1Updates, err := asm.Process(Event{
 		Timestamp: now.Add(10 * time.Millisecond),
 		ChainID:   9301,
@@ -1078,10 +1062,19 @@ func TestAssemblerTLSIgnoresSecondRequestOnSameChain(t *testing.T) {
 		Source:    "tls_ssl_write",
 		Payload:   []byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst"),
 	})
-	if err != nil || len(resp1Updates) != 1 {
+	if err != nil || len(resp1Updates) != 2 {
 		t.Fatalf("first tls response emit failed: updates=%d err=%v", len(resp1Updates), err)
 	}
-	if got, want := resp1Updates[0].Trace.ChainID, req1Updates[0].Trace.ChainID; got != want {
+	if resp1Updates[0].Kind != "request" || resp1Updates[0].Trace.Request == nil {
+		t.Fatalf("expected delayed request update first, got %#v", resp1Updates)
+	}
+	if got, want := resp1Updates[0].Trace.Request.URL, "/query"; got != want {
+		t.Fatalf("first request url = %q, want %q", got, want)
+	}
+	if resp1Updates[1].Kind != "response" {
+		t.Fatalf("expected response update second, got %#v", resp1Updates)
+	}
+	if got, want := resp1Updates[1].Trace.ChainID, resp1Updates[0].Trace.ChainID; got != want {
 		t.Fatalf("first response chain = %d, want %d", got, want)
 	}
 
@@ -1115,14 +1108,8 @@ func TestAssemblerTLSEmitsOnlyFirstRequestFromSingleChainBuffer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tls request process failed: %v", err)
 	}
-	if len(updates) != 1 || updates[0].Kind != "request" {
-		t.Fatalf("expected one tls request update, got %#v", updates)
-	}
-	if updates[0].Trace.Request == nil {
-		t.Fatalf("expected parsed request")
-	}
-	if got, want := updates[0].Trace.Request.URL, "/first"; got != want {
-		t.Fatalf("request url = %q, want %q", got, want)
+	if len(updates) != 0 {
+		t.Fatalf("tls request should wait for response before emit, got %#v", updates)
 	}
 
 	respUpdates, err := asm.Process(Event{
@@ -1142,10 +1129,13 @@ func TestAssemblerTLSEmitsOnlyFirstRequestFromSingleChainBuffer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tls response process failed: %v", err)
 	}
-	if len(respUpdates) != 1 || respUpdates[0].Kind != "response" {
-		t.Fatalf("expected one tls response update, got %#v", respUpdates)
+	if len(respUpdates) != 2 || respUpdates[0].Kind != "request" || respUpdates[1].Kind != "response" {
+		t.Fatalf("expected delayed request + one tls response update, got %#v", respUpdates)
 	}
-	if got, want := respUpdates[0].Trace.ChainID, updates[0].Trace.ChainID; got != want {
+	if got, want := respUpdates[0].Trace.Request.URL, "/first"; got != want {
+		t.Fatalf("request url = %q, want %q", got, want)
+	}
+	if got, want := respUpdates[1].Trace.ChainID, respUpdates[0].Trace.ChainID; got != want {
 		t.Fatalf("response chain = %d, want %d", got, want)
 	}
 

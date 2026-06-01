@@ -28,9 +28,11 @@ type Config struct {
 	DstIP                string
 	SrcPort              uint
 	DstPort              uint
+	HeartbeatServer      string
 	EnableTLS            bool   // 是否启用 TLS 明文采集，默认关闭
 	TLSLibPath           string // 逗号分隔的 libssl 路径覆盖项，空时自动发现
 	TLSComm              string // uprobes 目标进程名，默认 nginx
+	SuppressSocketForTLS bool   // 是否在 TLS 开启时抑制同 comm 的传统 socket 事件，默认不抑制，允许同时采 HTTP+HTTPS
 	DisableKernelFilter  bool   // 是否禁用内核态过滤 ，默认不禁用
 	DisableUserTuple     bool   // 是否禁用用户态过滤 ，默认禁用
 	CaptureBytes         int    // 内核侧每个请求/响应最大采集字节数，默认32KB
@@ -118,6 +120,7 @@ func DefaultConfig() Config {
 	return Config{
 		EnableTLS:            false,
 		TLSComm:              "nginx",
+		SuppressSocketForTLS: false,
 		CaptureBytes:         32 * 1024,
 		DisableKernelFilter:  false,
 		DisableUserTuple:     true,
