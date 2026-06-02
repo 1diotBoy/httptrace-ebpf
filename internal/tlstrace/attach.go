@@ -75,6 +75,8 @@ func attachLibrary(objs *bpfgen.LoadedTLSObjects, path string) ([]link.Link, err
 		{symbol: "SSL_set_wfd", prog: objs.UprobeSslSetWfd},
 		{symbol: "SSL_set_wfd", ret: true, prog: objs.UretprobeSslSetWfd},
 		{symbol: "SSL_shutdown", prog: objs.UprobeSslShutdown},
+		{symbol: "SSL_clear", prog: objs.UprobeSslClear},
+		{symbol: "SSL_set_accept_state", prog: objs.UprobeSslSetAcceptState},
 	}
 	for _, item := range optional {
 		if item.prog == nil {

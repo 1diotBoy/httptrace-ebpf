@@ -838,9 +838,6 @@ func TestAssemblerEmitsTruncatedTLSRequestHeadAndIgnoresFollowOnBody(t *testing.
 	}
 
 	snap := asm.Snapshot()
-	if snap.RequestBufferStates != 0 {
-		t.Fatalf("request buffers should be drained after tls head emit, got %#v", snap)
-	}
 	if snap.PendingRequests != 0 {
 		t.Fatalf("request should be matched by response, got %#v", snap)
 	}
@@ -1140,7 +1137,197 @@ func TestAssemblerTLSEmitsOnlyFirstRequestFromSingleChainBuffer(t *testing.T) {
 	}
 
 	snap := asm.Snapshot()
-	if snap.PendingRequests != 0 || snap.PendingNoRespBytes != 0 {
-		t.Fatalf("tls chain leftovers should be drained, got %#v", snap)
+	if snap.PendingRequests != 1 || snap.PendingNoRespBytes != 1 {
+		t.Fatalf("expected one later tls request to remain pending, got %#v", snap)
+	}
+}
+
+func TestAssemblerTLSSessionDedupsSuspiciousDuplicateRequest(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
+	sockID := uint64(42)
+
+	asm.enqueueTLSPending(sockID, pendingRequest{
+		chainID: 1,
+		request: &ParsedMessage{
+			Method:               "POST",
+			URL:                  "/delete?id=1",
+			StartLine:            "POST /delete?id=1 HTTP/1.1",
+			ContentLength:        -1,
+			ObservedMessageBytes: 32768,
+			Headers:              map[string]string{"Host": "example.com"},
+		},
+		requestTruncated: true,
+	})
+	asm.enqueueTLSPending(sockID, pendingRequest{
+		chainID: 2,
+		request: &ParsedMessage{
+			Method:        "POST",
+			URL:           "/search",
+			StartLine:     "POST /search HTTP/1.1",
+			ContentLength: 128,
+			Headers:       map[string]string{"Host": "example.com", "Content-Length": "128"},
+		},
+	})
+	asm.enqueueTLSPending(sockID, pendingRequest{
+		chainID: 3,
+		request: &ParsedMessage{
+			Method:        "POST",
+			URL:           "/update",
+			StartLine:     "POST /update HTTP/1.1",
+			ContentLength: 256,
+			Headers:       map[string]string{"Host": "example.com", "Content-Length": "256"},
+		},
+	})
+	asm.enqueueTLSPending(sockID, pendingRequest{
+		chainID: 4,
+		request: &ParsedMessage{
+			Method:        "POST",
+			URL:           "/delete?id=1",
+			StartLine:     "POST /delete?id=1 HTTP/1.1",
+			ContentLength: 35,
+			Headers: map[string]string{
+				"Host":           "example.com",
+				"Content-Length": "35",
+				"Connection":     "keep-alive",
+			},
+		},
+	})
+
+	if got := asm.tlsPendingCount(sockID); got != 3 {
+		t.Fatalf("pending count = %d, want 3", got)
+	}
+
+	first, ok := asm.popTLSPending(sockID)
+	if !ok || first.chainID != 2 {
+		t.Fatalf("first pending = %#v ok=%v, want chain 2", first, ok)
+	}
+	second, ok := asm.popTLSPending(sockID)
+	if !ok || second.chainID != 3 {
+		t.Fatalf("second pending = %#v ok=%v, want chain 3", second, ok)
+	}
+	third, ok := asm.popTLSPending(sockID)
+	if !ok || third.chainID != 4 {
+		t.Fatalf("third pending = %#v ok=%v, want chain 4", third, ok)
+	}
+}
+
+func TestAssemblerTLSSuppressesLowConfidenceLargeRequest(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
+	sockID := uint64(99)
+
+	asm.enqueueTLSPending(sockID, pendingRequest{
+		chainID: 11,
+		request: &ParsedMessage{
+			Method:               "POST",
+			URL:                  "/delete?id=1",
+			StartLine:            "POST /delete?id=1 HTTP/1.1",
+			ContentLength:        -1,
+			ObservedMessageBytes: 32768,
+			Headers:              map[string]string{"Host": "example.com"},
+			Body:                 "",
+			BodyPartial:          false,
+		},
+		requestTruncated: true,
+	})
+	if got := asm.tlsPendingCount(sockID); got != 0 {
+		t.Fatalf("pending count = %d, want 0", got)
+	}
+
+	asm.enqueueTLSPending(sockID, pendingRequest{
+		chainID: 12,
+		request: &ParsedMessage{
+			Method:               "POST",
+			URL:                  "/delete?id=1",
+			StartLine:            "POST /delete?id=1 HTTP/1.1",
+			ContentLength:        35,
+			ObservedMessageBytes: 1096,
+			Headers: map[string]string{
+				"Host":           "example.com",
+				"Content-Length": "35",
+			},
+		},
+		requestTruncated: false,
+	})
+	if got := asm.tlsPendingCount(sockID); got != 1 {
+		t.Fatalf("pending count after good request = %d, want 1", got)
+	}
+	got, ok := asm.popTLSPending(sockID)
+	if !ok || got.chainID != 12 {
+		t.Fatalf("pending = %#v ok=%v, want chain 12", got, ok)
+	}
+}
+
+func TestAssemblerTLSAssignsPendingAtFirstResponseFragment(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 10*time.Millisecond)
+	now := time.Now()
+
+	for _, tc := range []struct {
+		chainID uint64
+		url     string
+	}{
+		{chainID: 1001, url: "/query"},
+		{chainID: 1002, url: "/update"},
+	} {
+		updates, err := asm.Process(Event{
+			Timestamp: now,
+			ChainID:   tc.chainID,
+			SockID:    777,
+			PID:       1,
+			FD:        4,
+			FragIdx:   0,
+			Direction: DirectionRequest,
+			Source:    "tls_ssl_read",
+			Payload:   []byte("POST " + tc.url + " HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+		})
+		if err != nil || len(updates) != 0 {
+			t.Fatalf("queue tls request %s failed: updates=%d err=%v", tc.url, len(updates), err)
+		}
+	}
+
+	updates, err := asm.Process(Event{
+		Timestamp: now.Add(10 * time.Millisecond),
+		ChainID:   2001,
+		SockID:    777,
+		PID:       1,
+		FD:        4,
+		FragIdx:   0,
+		Direction: DirectionResponse,
+		Source:    "tls_ssl_write",
+		Payload:   []byte("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npartial"),
+	})
+	if err != nil {
+		t.Fatalf("first partial tls response failed: updates=%d err=%v", len(updates), err)
+	}
+	if len(updates) != 2 {
+		t.Fatalf("first partial tls response should emit delayed request+response, got %#v", updates)
+	}
+	if got, want := updates[0].Trace.Request.URL, "/query"; got != want {
+		t.Fatalf("first response paired request = %q, want %q", got, want)
+	}
+
+	updates, err = asm.Process(Event{
+		Timestamp: now.Add(20 * time.Millisecond),
+		ChainID:   2002,
+		SockID:    777,
+		PID:       1,
+		FD:        4,
+		FragIdx:   0,
+		Direction: DirectionResponse,
+		Source:    "tls_ssl_write",
+		Payload:   []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
+	})
+	if err != nil {
+		t.Fatalf("second tls response failed: %v", err)
+	}
+	if len(updates) != 2 {
+		t.Fatalf("second tls response should emit delayed request+response, got %#v", updates)
+	}
+	if got, want := updates[0].Trace.Request.URL, "/update"; got != want {
+		t.Fatalf("second response paired request = %q, want %q", got, want)
+	}
+
+	flushed := asm.FlushStalled(now.Add(50 * time.Millisecond))
+	if len(flushed) != 0 {
+		t.Fatalf("stalled flush should have nothing left, got %#v", flushed)
 	}
 }

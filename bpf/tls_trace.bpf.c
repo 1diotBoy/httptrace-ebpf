@@ -369,6 +369,7 @@ static __always_inline void start_request_capture(struct flow_state *state, __u6
 		return;
 
 	state->last_req_chain_id = chain_id;
+	state->last_req_sig = sig;
 	state->req_frag_idx = 0;
 	state->req_capture_bytes = 0;
 	state->req_observed_bytes = 0;
@@ -404,6 +405,13 @@ static __always_inline void start_response_capture(struct flow_state *state, __u
 	state->resp_capture_stopped = 0;
 	state->resp_active = 1;
 	state->req_active = 0;
+}
+
+static __always_inline __u64 peek_pending_request_sig(const struct flow_state *state)
+{
+	if (!state || !state->pending_count)
+		return 0;
+	return state->pending_req_sig0;
 }
 
 static __always_inline __u32 read_tls_prefix_legacy_bytes(__u64 base, __u32 available, char *buf, __u32 buf_len)
@@ -519,9 +527,21 @@ static __always_inline int looks_like_http_request(const char *buf, __u32 len)
 
 static __always_inline int looks_like_http_response(const char *buf, __u32 len)
 {
-	if (len < 5)
+	if (len < 12)
 		return 0;
-	return buf[0] == 'H' && buf[1] == 'T' && buf[2] == 'T' && buf[3] == 'P' && buf[4] == '/';
+	if (!(buf[0] == 'H' && buf[1] == 'T' && buf[2] == 'T' && buf[3] == 'P' && buf[4] == '/'))
+		return 0;
+	if (!(buf[5] == '1' && buf[6] == '.' && (buf[7] == '0' || buf[7] == '1')))
+		return 0;
+	if (buf[8] != ' ')
+		return 0;
+	if (buf[9] < '1' || buf[9] > '5')
+		return 0;
+	if (buf[10] < '0' || buf[10] > '9')
+		return 0;
+	if (buf[11] < '0' || buf[11] > '9')
+		return 0;
+	return 1;
 }
 
 static __always_inline int tls_starts_with_http_request(const struct tls_rw_args *args, __u32 size)
@@ -553,7 +573,7 @@ static __always_inline int tls_starts_with_http_request(const struct tls_rw_args
 
 static __always_inline int tls_starts_with_http_response(const struct tls_rw_args *args, __u32 size)
 {
-	char prefix[8] = {};
+	char prefix[16] = {};
 	__u32 prefix_len = 0;
 
 	if (!args)
@@ -582,21 +602,25 @@ static __always_inline __u8 tls_detect_http_direction(const struct tls_rw_args *
 
 static __always_inline void update_tls_role(struct flow_state *state, const struct tls_rw_args *args, __u8 direction)
 {
+	__u8 role = TLS_ROLE_UNKNOWN;
+
 	if (!state || !args)
+		return;
+	if (state->tls_role != TLS_ROLE_UNKNOWN)
 		return;
 	if (direction == DIR_REQUEST) {
 		if (args->source == SRC_TLS_SSL_READ || args->source == SRC_TLS_SSL_READ_EX)
-			state->tls_role = TLS_ROLE_SERVER;
+			role = TLS_ROLE_SERVER;
 		else if (args->source == SRC_TLS_SSL_WRITE || args->source == SRC_TLS_SSL_WRITE_EX)
-			state->tls_role = TLS_ROLE_CLIENT;
-		return;
-	}
-	if (direction == DIR_RESPONSE) {
+			role = TLS_ROLE_CLIENT;
+	} else if (direction == DIR_RESPONSE) {
 		if (args->source == SRC_TLS_SSL_READ || args->source == SRC_TLS_SSL_READ_EX)
-			state->tls_role = TLS_ROLE_CLIENT;
+			role = TLS_ROLE_CLIENT;
 		else if (args->source == SRC_TLS_SSL_WRITE || args->source == SRC_TLS_SSL_WRITE_EX)
-			state->tls_role = TLS_ROLE_SERVER;
+			role = TLS_ROLE_SERVER;
 	}
+	if (role != TLS_ROLE_UNKNOWN)
+		state->tls_role = role;
 }
 
 static __always_inline __u64 tls_request_signature(const struct tls_rw_args *args, __u32 size)
@@ -648,6 +672,7 @@ static __always_inline __u64 select_tls_response_chain(const struct tls_rw_args 
 						       struct flow_state *state, __u32 size)
 {
 	__u64 chain_id = 0;
+	__u64 chain_sig = 0;
 	int starts_new_response = 0;
 
 	if (!state)
@@ -665,13 +690,18 @@ static __always_inline __u64 select_tls_response_chain(const struct tls_rw_args 
 	 * observed in practice.
 	 */
 	if (!state->resp_active || starts_new_response) {
+		chain_sig = peek_pending_request_sig(state);
 		chain_id = pop_pending_request(state);
-		if (chain_id)
+		if (chain_id) {
+			state->resp_req_sig = chain_sig;
 			return chain_id;
+		}
 	}
 
 	if (state->resp_chain_id)
 		return state->resp_chain_id;
+	if (!state->resp_req_sig)
+		state->resp_req_sig = state->last_req_sig;
 	return state->last_req_chain_id;
 }
 
@@ -1049,6 +1079,10 @@ static __always_inline int handle_tls_request(void *ctx, const struct tls_rw_arg
 	 * original logical chain instead of forking a second one.
 	 */
 	if (starts_new_request || !state->last_req_chain_id) {
+		if (request_sig && state->resp_active && state->resp_req_sig == request_sig)
+			return 0;
+		if (request_sig && state->req_active && state->last_req_sig == request_sig)
+			return 0;
 		if (request_sig)
 			chain_id = find_pending_request_by_sig(state, request_sig);
 		if (!chain_id) {
@@ -1056,6 +1090,7 @@ static __always_inline int handle_tls_request(void *ctx, const struct tls_rw_arg
 			start_request_capture(state, chain_id, request_sig);
 		} else {
 			state->last_req_chain_id = chain_id;
+			state->last_req_sig = request_sig;
 			state->req_active = 1;
 		}
 	} else {
@@ -1225,6 +1260,40 @@ static __always_inline int cleanup_tls_state(struct pt_regs *ctx, void *ssl)
 	return 0;
 }
 
+static __always_inline int advance_tls_generation(void *ssl)
+{
+	struct tls_ssl_base_key base = {};
+	struct tls_ssl_key key = {};
+	struct tls_session_entry entry = {};
+	struct tls_session_entry *session = NULL;
+	char comm[16] = {};
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+
+	if (!ssl)
+		return 0;
+	if (bpf_get_current_comm(comm, 16) < 0)
+		return 0;
+	if (!comm_allowed(comm))
+		return 0;
+
+	fill_ssl_base_key(&base, pid_tgid, ssl);
+	key.tgid = base.tgid;
+	key.ssl_ptr = base.ssl_ptr;
+	session = bpf_map_lookup_elem(&tls_session_map, &base);
+	if (session) {
+		entry = *session;
+		key.generation = session->generation;
+		bpf_map_delete_elem(&tls_flow_map, &key);
+	}
+	entry.generation += 1;
+	if (entry.generation == 0)
+		entry.generation = 1;
+	entry.read_fd = -1;
+	entry.write_fd = -1;
+	bpf_map_update_elem(&tls_session_map, &base, &entry, BPF_ANY);
+	return 0;
+}
+
 SEC("uprobe/SSL_read")
 int uprobe_ssl_read(struct pt_regs *ctx)
 {
@@ -1323,6 +1392,18 @@ SEC("uprobe/SSL_free")
 int uprobe_ssl_free(struct pt_regs *ctx)
 {
 	return cleanup_tls_state(ctx, (void *)PT_REGS_PARM1(ctx));
+}
+
+SEC("uprobe/SSL_clear")
+int uprobe_ssl_clear(struct pt_regs *ctx)
+{
+	return advance_tls_generation((void *)PT_REGS_PARM1(ctx));
+}
+
+SEC("uprobe/SSL_set_accept_state")
+int uprobe_ssl_set_accept_state(struct pt_regs *ctx)
+{
+	return advance_tls_generation((void *)PT_REGS_PARM1(ctx));
 }
 
 char LICENSE[] SEC("license") = "GPL";

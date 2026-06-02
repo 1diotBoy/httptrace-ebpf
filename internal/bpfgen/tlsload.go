@@ -16,15 +16,17 @@ type LoadedTLSObjects struct {
 	UprobeSslWriteEx    *ebpf.Program
 	UretprobeSslWriteEx *ebpf.Program
 
-	UprobeSslSetFd     *ebpf.Program
-	UretprobeSslSetFd  *ebpf.Program
-	UprobeSslSetRfd    *ebpf.Program
-	UretprobeSslSetRfd *ebpf.Program
-	UprobeSslSetWfd    *ebpf.Program
-	UretprobeSslSetWfd *ebpf.Program
-	UprobeSslShutdown  *ebpf.Program
-	UprobeSslFree      *ebpf.Program
-	closer             closer
+	UprobeSslClear          *ebpf.Program
+	UprobeSslSetFd          *ebpf.Program
+	UretprobeSslSetFd       *ebpf.Program
+	UprobeSslSetAcceptState *ebpf.Program
+	UprobeSslSetRfd         *ebpf.Program
+	UretprobeSslSetRfd      *ebpf.Program
+	UprobeSslSetWfd         *ebpf.Program
+	UretprobeSslSetWfd      *ebpf.Program
+	UprobeSslShutdown       *ebpf.Program
+	UprobeSslFree           *ebpf.Program
+	closer                  closer
 }
 
 func (o *LoadedTLSObjects) Close() error {
@@ -43,24 +45,26 @@ func LoadTLSObjects(opts *ebpf.CollectionOptions) (*LoadedTLSObjects, error) {
 	}
 
 	return &LoadedTLSObjects{
-		Events:              raw.Events,
-		TLSConfigMap:        raw.TlsConfigMap,
-		UprobeSslRead:       raw.UprobeSslRead,
-		UretprobeSslRead:    raw.UretprobeSslRead,
-		UprobeSslWrite:      raw.UprobeSslWrite,
-		UretprobeSslWrite:   raw.UretprobeSslWrite,
-		UprobeSslReadEx:     raw.UprobeSslReadEx,
-		UretprobeSslReadEx:  raw.UretprobeSslReadEx,
-		UprobeSslWriteEx:    raw.UprobeSslWriteEx,
-		UretprobeSslWriteEx: raw.UretprobeSslWriteEx,
-		UprobeSslSetFd:      raw.UprobeSslSetFd,
-		UretprobeSslSetFd:   raw.UretprobeSslSetFd,
-		UprobeSslSetRfd:     raw.UprobeSslSetRfd,
-		UretprobeSslSetRfd:  raw.UretprobeSslSetRfd,
-		UprobeSslSetWfd:     raw.UprobeSslSetWfd,
-		UretprobeSslSetWfd:  raw.UretprobeSslSetWfd,
-		UprobeSslShutdown:   raw.UprobeSslShutdown,
-		UprobeSslFree:       raw.UprobeSslFree,
-		closer:              &raw,
+		Events:                  raw.Events,
+		TLSConfigMap:            raw.TlsConfigMap,
+		UprobeSslRead:           raw.UprobeSslRead,
+		UretprobeSslRead:        raw.UretprobeSslRead,
+		UprobeSslWrite:          raw.UprobeSslWrite,
+		UretprobeSslWrite:       raw.UretprobeSslWrite,
+		UprobeSslReadEx:         raw.UprobeSslReadEx,
+		UretprobeSslReadEx:      raw.UretprobeSslReadEx,
+		UprobeSslWriteEx:        raw.UprobeSslWriteEx,
+		UretprobeSslWriteEx:     raw.UretprobeSslWriteEx,
+		UprobeSslClear:          raw.UprobeSslClear,
+		UprobeSslSetFd:          raw.UprobeSslSetFd,
+		UretprobeSslSetFd:       raw.UretprobeSslSetFd,
+		UprobeSslSetAcceptState: raw.UprobeSslSetAcceptState,
+		UprobeSslSetRfd:         raw.UprobeSslSetRfd,
+		UretprobeSslSetRfd:      raw.UretprobeSslSetRfd,
+		UprobeSslSetWfd:         raw.UprobeSslSetWfd,
+		UretprobeSslSetWfd:      raw.UretprobeSslSetWfd,
+		UprobeSslShutdown:       raw.UprobeSslShutdown,
+		UprobeSslFree:           raw.UprobeSslFree,
+		closer:                  &raw,
 	}, nil
 }

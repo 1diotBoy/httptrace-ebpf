@@ -217,6 +217,7 @@ func NewService(cfg Config) (*Service, error) {
 		startTime:       startTime,
 		currentStatsDay: localDayStamp(startTime),
 	}
+	svc.assembler.SetDebugTLSQueue(cfg.DebugKernel)
 	svc.collectEnabled.Store(true)
 	return svc, nil
 }
@@ -1465,6 +1466,36 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 }
 
 func (s *Service) logKernelFragment(cpu int, raw bpfgen.HttpTraceHttpEvent, event httptrace.Event) {
+	if strings.HasPrefix(event.Source, "tls_") {
+		if event.Flags&flagControl != 0 {
+			log.Printf(
+				"kernel tls control cpu=%d chain=%d source=%s flags=%s fd=%d seq=%d",
+				cpu,
+				event.ChainID,
+				event.Source,
+				formatEventFlags(event.Flags),
+				event.FD,
+				event.SeqHint,
+			)
+			return
+		}
+		log.Printf(
+			"kernel tls event cpu=%d chain=%d dir=%d source=%s frag=%d payload=%d total=%d observed=%d flags=%s fd=%d seq=%d prefix=%q",
+			cpu,
+			event.ChainID,
+			event.Direction,
+			event.Source,
+			event.FragIdx,
+			raw.PayloadLen,
+			raw.TotalLen,
+			event.ObservedMessageBytes,
+			formatEventFlags(event.Flags),
+			event.FD,
+			event.SeqHint,
+			summarizePayloadPrefix(event.Payload, 64),
+		)
+		return
+	}
 	if event.Flags&flagControl != 0 {
 		log.Printf(
 			"kernel control cpu=%d chain=%d source=%s flags=%s fd=%d seq=%d",

@@ -54,22 +54,24 @@ type TlsTraceSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type TlsTraceProgramSpecs struct {
-	UprobeSslFree       *ebpf.ProgramSpec `ebpf:"uprobe_ssl_free"`
-	UprobeSslRead       *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read"`
-	UprobeSslReadEx     *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_ex"`
-	UprobeSslSetFd      *ebpf.ProgramSpec `ebpf:"uprobe_ssl_set_fd"`
-	UprobeSslSetRfd     *ebpf.ProgramSpec `ebpf:"uprobe_ssl_set_rfd"`
-	UprobeSslSetWfd     *ebpf.ProgramSpec `ebpf:"uprobe_ssl_set_wfd"`
-	UprobeSslShutdown   *ebpf.ProgramSpec `ebpf:"uprobe_ssl_shutdown"`
-	UprobeSslWrite      *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write"`
-	UprobeSslWriteEx    *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write_ex"`
-	UretprobeSslRead    *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_read"`
-	UretprobeSslReadEx  *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_read_ex"`
-	UretprobeSslSetFd   *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_set_fd"`
-	UretprobeSslSetRfd  *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_set_rfd"`
-	UretprobeSslSetWfd  *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_set_wfd"`
-	UretprobeSslWrite   *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_write"`
-	UretprobeSslWriteEx *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_write_ex"`
+	UprobeSslClear          *ebpf.ProgramSpec `ebpf:"uprobe_ssl_clear"`
+	UprobeSslFree           *ebpf.ProgramSpec `ebpf:"uprobe_ssl_free"`
+	UprobeSslRead           *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read"`
+	UprobeSslReadEx         *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_ex"`
+	UprobeSslSetAcceptState *ebpf.ProgramSpec `ebpf:"uprobe_ssl_set_accept_state"`
+	UprobeSslSetFd          *ebpf.ProgramSpec `ebpf:"uprobe_ssl_set_fd"`
+	UprobeSslSetRfd         *ebpf.ProgramSpec `ebpf:"uprobe_ssl_set_rfd"`
+	UprobeSslSetWfd         *ebpf.ProgramSpec `ebpf:"uprobe_ssl_set_wfd"`
+	UprobeSslShutdown       *ebpf.ProgramSpec `ebpf:"uprobe_ssl_shutdown"`
+	UprobeSslWrite          *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write"`
+	UprobeSslWriteEx        *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write_ex"`
+	UretprobeSslRead        *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_read"`
+	UretprobeSslReadEx      *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_read_ex"`
+	UretprobeSslSetFd       *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_set_fd"`
+	UretprobeSslSetRfd      *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_set_rfd"`
+	UretprobeSslSetWfd      *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_set_wfd"`
+	UretprobeSslWrite       *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_write"`
+	UretprobeSslWriteEx     *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_write_ex"`
 }
 
 // TlsTraceMapSpecs contains maps before they are loaded into the kernel.
@@ -142,29 +144,33 @@ type TlsTraceVariables struct {
 //
 // It can be passed to LoadTlsTraceObjects or ebpf.CollectionSpec.LoadAndAssign.
 type TlsTracePrograms struct {
-	UprobeSslFree       *ebpf.Program `ebpf:"uprobe_ssl_free"`
-	UprobeSslRead       *ebpf.Program `ebpf:"uprobe_ssl_read"`
-	UprobeSslReadEx     *ebpf.Program `ebpf:"uprobe_ssl_read_ex"`
-	UprobeSslSetFd      *ebpf.Program `ebpf:"uprobe_ssl_set_fd"`
-	UprobeSslSetRfd     *ebpf.Program `ebpf:"uprobe_ssl_set_rfd"`
-	UprobeSslSetWfd     *ebpf.Program `ebpf:"uprobe_ssl_set_wfd"`
-	UprobeSslShutdown   *ebpf.Program `ebpf:"uprobe_ssl_shutdown"`
-	UprobeSslWrite      *ebpf.Program `ebpf:"uprobe_ssl_write"`
-	UprobeSslWriteEx    *ebpf.Program `ebpf:"uprobe_ssl_write_ex"`
-	UretprobeSslRead    *ebpf.Program `ebpf:"uretprobe_ssl_read"`
-	UretprobeSslReadEx  *ebpf.Program `ebpf:"uretprobe_ssl_read_ex"`
-	UretprobeSslSetFd   *ebpf.Program `ebpf:"uretprobe_ssl_set_fd"`
-	UretprobeSslSetRfd  *ebpf.Program `ebpf:"uretprobe_ssl_set_rfd"`
-	UretprobeSslSetWfd  *ebpf.Program `ebpf:"uretprobe_ssl_set_wfd"`
-	UretprobeSslWrite   *ebpf.Program `ebpf:"uretprobe_ssl_write"`
-	UretprobeSslWriteEx *ebpf.Program `ebpf:"uretprobe_ssl_write_ex"`
+	UprobeSslClear          *ebpf.Program `ebpf:"uprobe_ssl_clear"`
+	UprobeSslFree           *ebpf.Program `ebpf:"uprobe_ssl_free"`
+	UprobeSslRead           *ebpf.Program `ebpf:"uprobe_ssl_read"`
+	UprobeSslReadEx         *ebpf.Program `ebpf:"uprobe_ssl_read_ex"`
+	UprobeSslSetAcceptState *ebpf.Program `ebpf:"uprobe_ssl_set_accept_state"`
+	UprobeSslSetFd          *ebpf.Program `ebpf:"uprobe_ssl_set_fd"`
+	UprobeSslSetRfd         *ebpf.Program `ebpf:"uprobe_ssl_set_rfd"`
+	UprobeSslSetWfd         *ebpf.Program `ebpf:"uprobe_ssl_set_wfd"`
+	UprobeSslShutdown       *ebpf.Program `ebpf:"uprobe_ssl_shutdown"`
+	UprobeSslWrite          *ebpf.Program `ebpf:"uprobe_ssl_write"`
+	UprobeSslWriteEx        *ebpf.Program `ebpf:"uprobe_ssl_write_ex"`
+	UretprobeSslRead        *ebpf.Program `ebpf:"uretprobe_ssl_read"`
+	UretprobeSslReadEx      *ebpf.Program `ebpf:"uretprobe_ssl_read_ex"`
+	UretprobeSslSetFd       *ebpf.Program `ebpf:"uretprobe_ssl_set_fd"`
+	UretprobeSslSetRfd      *ebpf.Program `ebpf:"uretprobe_ssl_set_rfd"`
+	UretprobeSslSetWfd      *ebpf.Program `ebpf:"uretprobe_ssl_set_wfd"`
+	UretprobeSslWrite       *ebpf.Program `ebpf:"uretprobe_ssl_write"`
+	UretprobeSslWriteEx     *ebpf.Program `ebpf:"uretprobe_ssl_write_ex"`
 }
 
 func (p *TlsTracePrograms) Close() error {
 	return _TlsTraceClose(
+		p.UprobeSslClear,
 		p.UprobeSslFree,
 		p.UprobeSslRead,
 		p.UprobeSslReadEx,
+		p.UprobeSslSetAcceptState,
 		p.UprobeSslSetFd,
 		p.UprobeSslSetRfd,
 		p.UprobeSslSetWfd,
