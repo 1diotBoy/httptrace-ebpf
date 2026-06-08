@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,7 @@ import (
 )
 
 const minChunkedResponseStallTimeout = 5 * time.Second
+const minConservativeResponseStallTimeout = 5 * time.Second
 
 const (
 	eventFlagEnd          = 1 << 1
@@ -76,7 +78,7 @@ type Update struct {
 type Assembler struct {
 	shards            []stateShard
 	tlsShards         []tlsSessionShard
-	maxMessageBytes   int
+	maxMessageBytes   atomic.Int64
 	maxIdle           time.Duration
 	responseStall     time.Duration
 	debugTLSQueue     bool
@@ -88,8 +90,15 @@ type Assembler struct {
 }
 
 type stateShard struct {
-	mu     sync.Mutex
-	traces map[uint64]*traceState
+	mu        sync.Mutex
+	traces    map[uint64]*traceState
+	closedTLS map[uint64]tlsClosedDirections
+}
+
+type tlsClosedDirections struct {
+	request  bool
+	response bool
+	at       time.Time
 }
 
 type tlsSessionShard struct {
@@ -154,6 +163,7 @@ func NewAssembler(maxMessageBytes int, maxIdle, responseStall time.Duration) *As
 	shards := make([]stateShard, 64)
 	for i := range shards {
 		shards[i].traces = make(map[uint64]*traceState)
+		shards[i].closedTLS = make(map[uint64]tlsClosedDirections)
 	}
 	tlsShards := make([]tlsSessionShard, 64)
 	for i := range tlsShards {
@@ -162,13 +172,35 @@ func NewAssembler(maxMessageBytes int, maxIdle, responseStall time.Duration) *As
 	if responseStall <= 0 {
 		responseStall = 500 * time.Millisecond
 	}
-	return &Assembler{
-		shards:          shards,
-		tlsShards:       tlsShards,
-		maxMessageBytes: maxMessageBytes,
-		maxIdle:         maxIdle,
-		responseStall:   responseStall,
+	asm := &Assembler{
+		shards:        shards,
+		tlsShards:     tlsShards,
+		maxIdle:       maxIdle,
+		responseStall: responseStall,
 	}
+	asm.SetMaxMessageBytes(maxMessageBytes)
+	return asm
+}
+
+func (a *Assembler) MaxMessageBytes() int {
+	if a == nil {
+		return 32 * 1024
+	}
+	v := int(a.maxMessageBytes.Load())
+	if v <= 0 {
+		return 32 * 1024
+	}
+	return v
+}
+
+func (a *Assembler) SetMaxMessageBytes(limit int) {
+	if a == nil {
+		return
+	}
+	if limit <= 0 {
+		limit = 32 * 1024
+	}
+	a.maxMessageBytes.Store(int64(limit))
 }
 
 func (a *Assembler) SetDebugTLSQueue(debug bool) {
@@ -176,6 +208,74 @@ func (a *Assembler) SetDebugTLSQueue(debug bool) {
 		return
 	}
 	a.debugTLSQueue = debug
+}
+
+func debugBufferPreview(data []byte, limit int) string {
+	if limit <= 0 || len(data) == 0 {
+		return ""
+	}
+	if len(data) > limit {
+		data = data[:limit]
+	}
+	replacer := strings.NewReplacer("\r", "\\r", "\n", "\\n", "\x00", ".")
+	return replacer.Replace(string(data))
+}
+
+func debugBufferSuffix(data []byte, limit int) string {
+	if limit <= 0 || len(data) == 0 {
+		return ""
+	}
+	if len(data) > limit {
+		data = data[len(data)-limit:]
+	}
+	replacer := strings.NewReplacer("\r", "\\r", "\n", "\\n", "\x00", ".")
+	return replacer.Replace(string(data))
+}
+
+func shouldDebugResponseDetail(msg *ParsedMessage, truncated bool) bool {
+	if msg == nil {
+		return false
+	}
+	if truncated || msg.BodyPartial || msg.Chunked || msg.StatusCode >= 400 {
+		return true
+	}
+	if strings.Contains(msg.Body, `"errCode":"-100"`) || strings.Contains(msg.Body, "无权限") {
+		return true
+	}
+	return false
+}
+
+func (a *Assembler) logResponseDecision(path string, state *traceState, msg *ParsedMessage, truncated bool) {
+	if a == nil || !a.debugTLSQueue || state == nil || msg == nil {
+		return
+	}
+	if !shouldDebugResponseDetail(msg, truncated) {
+		return
+	}
+	buf := state.responseStream.buffer
+	log.Printf(
+		"response parse path=%s chain=%d sock=%d src=%s status=%d cl=%d te=%q conn=%q chunked=%t body_partial=%t truncated=%t stream_trunc=%t final_ready=%t observed=%d buf_len=%d consumed=%d body_bytes=%d raw_prefix=%q raw_suffix=%q body_preview=%q",
+		path,
+		state.base.ChainID,
+		state.base.SockID,
+		state.responseSource,
+		msg.StatusCode,
+		msg.ContentLength,
+		msg.TransferEncoding,
+		msg.Headers["Connection"],
+		msg.Chunked,
+		msg.BodyPartial,
+		truncated,
+		state.responseStream.truncated,
+		state.responseStream.finalReady,
+		state.responseStream.observedBytes,
+		len(buf),
+		msg.ConsumedBytes,
+		len(msg.Body),
+		debugBufferPreview(buf, 160),
+		debugBufferSuffix(buf, 120),
+		debugBufferPreview([]byte(msg.Body), 160),
+	)
 }
 
 // Process 是用户态聚合的核心入口：
@@ -191,6 +291,24 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 	shard := &a.shards[event.ChainID%uint64(len(a.shards))]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
+	if closed, ok := shard.closedTLS[event.ChainID]; ok {
+		if time.Since(closed.at) > a.maxIdle {
+			delete(shard.closedTLS, event.ChainID)
+		} else if (event.Direction == DirectionRequest && closed.request) ||
+			(event.Direction == DirectionResponse && closed.response) {
+			return nil, nil
+		}
+	}
+	if isTLSSource(event.Source) {
+		// TLS raw chain 的首片段如果根本不像 HTTP request line，
+		// 说明这更像是被内核态误起出来的噪声 chain（常见前缀是 JS/CSS/body 碎片）。
+		// 这类 chain 后续即便再来同 chain 的 response，也不应该参与真实业务配对，
+		// 否则会把请求/响应数抬高，并污染最终落库结果。
+		if event.Direction == DirectionRequest && event.FragIdx == 0 && len(event.Payload) > 0 && !looksLikeTLSRequestStart(event.Payload) {
+			markClosedTLSRawChain(shard, event.ChainID, true, true)
+			return nil, nil
+		}
+	}
 
 	state := shard.traces[event.ChainID]
 	if event.Flags&eventFlagControl != 0 && event.Flags&eventFlagClose != 0 {
@@ -289,14 +407,14 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 		stream.truncated = true
 	}
 	if !stream.truncated {
-		stream.drain(a.maxMessageBytes)
+		stream.drain(a.MaxMessageBytes())
 	} else {
 		for frag := range stream.received {
 			if frag < stream.nextFrag {
 				delete(stream.received, frag)
 			}
 		}
-		stream.drain(a.maxMessageBytes)
+		stream.drain(a.MaxMessageBytes())
 	}
 	return a.tryEmitUpdates(state, shard, event.ChainID, false)
 }
@@ -343,8 +461,8 @@ func (a *Assembler) FlushStalled(now time.Time) []Update {
 				continue
 			}
 			timeout := a.responseStall
-			if timeout < minChunkedResponseStallTimeout && responseLooksChunked(state.responseStream.buffer) {
-				timeout = minChunkedResponseStallTimeout
+			if timeout < minConservativeResponseStallTimeout && responseNeedsConservativeStall(state.responseStream.buffer) {
+				timeout = minConservativeResponseStallTimeout
 			}
 			if now.Sub(state.responseUpdated) < timeout {
 				continue
@@ -356,19 +474,30 @@ func (a *Assembler) FlushStalled(now time.Time) []Update {
 			}
 			if state.canDelete() {
 				delete(shard.traces, chainID)
+				markClosedTLSChain(shard, chainID, state)
 			}
 		}
 		shard.mu.Unlock()
 	}
+	updates = append(updates, a.flushStalledTLSPending(now)...)
 	return updates
 }
 
+// EvictExpired 是周期性 idle eviction 的核心：
+// 1. 根据 last_updated 时间戳，移除超过 maxIdle 的 state。
+// 2. 尝试解析完整 HTTP。
+// 3. 请求一旦完整就立即返回 update，响应完整后再返回完整链路 update。
 func (a *Assembler) EvictExpired(now time.Time) ([]Update, int) {
 	evicted := 0
 	updates := make([]Update, 0, 16)
 	for i := range a.shards {
 		shard := &a.shards[i]
 		shard.mu.Lock()
+		for chainID, closed := range shard.closedTLS {
+			if now.Sub(closed.at) > a.maxIdle {
+				delete(shard.closedTLS, chainID)
+			}
+		}
 		for chainID, state := range shard.traces {
 			if now.Sub(state.lastUpdated) <= a.maxIdle {
 				continue
@@ -379,10 +508,15 @@ func (a *Assembler) EvictExpired(now time.Time) ([]Update, int) {
 				a.evictedFlushes.Add(uint64(len(flushed)))
 			}
 			delete(shard.traces, chainID)
+			markClosedTLSChain(shard, chainID, state)
 			evicted++
 		}
 		shard.mu.Unlock()
 	}
+	// TLS delayed requests 不能在周期性 idle eviction 里直接移除。
+	// 它们和 response 通过 tls session FIFO 关联；如果这里先删掉 request，
+	// 后面晚到的 response 就会永久失配，表现成 response 样本数偏少。
+	// TLS pending 只在 shutdown 收尾时统一 flush。
 	return updates, evicted
 }
 
@@ -402,11 +536,98 @@ func (a *Assembler) FlushAll() ([]Update, int) {
 				updates = append(updates, flushed...)
 			}
 			delete(shard.traces, chainID)
+			markClosedTLSChain(shard, chainID, state)
 			flushedStates++
+		}
+		clear(shard.closedTLS)
+		shard.mu.Unlock()
+	}
+	tlsUpdates, tlsFlushed := a.flushAllTLSPending()
+	updates = append(updates, tlsUpdates...)
+	flushedStates += tlsFlushed
+	return updates, flushedStates
+}
+
+func (a *Assembler) flushStalledTLSPending(now time.Time) []Update {
+	if a == nil || a.responseStall <= 0 {
+		return nil
+	}
+	updates := make([]Update, 0, 8)
+	for i := range a.tlsShards {
+		shard := &a.tlsShards[i]
+		shard.mu.Lock()
+		for _, session := range shard.sessions {
+			for idx := range session.pending {
+				pending := &session.pending[idx]
+				if pending.emitted || pending.requestTS == nil {
+					continue
+				}
+				if now.Sub(*pending.requestTS) < a.responseStall {
+					continue
+				}
+				if update, ok := emitPendingRequestUpdate(pending); ok {
+					updates = append(updates, update)
+				}
+			}
 		}
 		shard.mu.Unlock()
 	}
-	return updates, flushedStates
+	return updates
+}
+
+func (a *Assembler) evictExpiredTLSPending(now time.Time) ([]Update, int) {
+	if a == nil {
+		return nil, 0
+	}
+	updates := make([]Update, 0, 8)
+	evicted := 0
+	for i := range a.tlsShards {
+		shard := &a.tlsShards[i]
+		shard.mu.Lock()
+		for sockID, session := range shard.sessions {
+			keep := session.pending[:0]
+			for _, pending := range session.pending {
+				if pending.requestTS == nil || now.Sub(*pending.requestTS) <= a.maxIdle {
+					keep = append(keep, pending)
+					continue
+				}
+				if update, ok := emitPendingRequestUpdate(&pending); ok {
+					updates = append(updates, update)
+				}
+				evicted++
+			}
+			if len(keep) == 0 {
+				delete(shard.sessions, sockID)
+				continue
+			}
+			session.pending = keep
+		}
+		shard.mu.Unlock()
+	}
+	return updates, evicted
+}
+
+func (a *Assembler) flushAllTLSPending() ([]Update, int) {
+	if a == nil {
+		return nil, 0
+	}
+	updates := make([]Update, 0, 8)
+	flushed := 0
+	for i := range a.tlsShards {
+		shard := &a.tlsShards[i]
+		shard.mu.Lock()
+		for sockID, session := range shard.sessions {
+			for idx := range session.pending {
+				if update, ok := emitPendingRequestUpdate(&session.pending[idx]); ok {
+					updates = append(updates, update)
+				}
+				flushed++
+			}
+			delete(shard.sessions, sockID)
+		}
+		shard.mu.Unlock()
+	}
+	return updates, flushed
 }
 
 func (a *Assembler) Snapshot() Snapshot {
@@ -450,6 +671,156 @@ func (a *Assembler) Snapshot() Snapshot {
 	return snap
 }
 
+func (a *Assembler) DebugTLSPendingStateSummary(now time.Time, limit int) string {
+	if a == nil || limit == 0 {
+		return "none"
+	}
+	type detail struct {
+		chainID     uint64
+		sockID      uint64
+		requestSrc  string
+		responseSrc string
+		reqBufLen   int
+		respBufLen  int
+		reqRecv     int
+		respRecv    int
+		respAgeMs   int64
+		tlsAssigned bool
+		reqPrefix   string
+		respPrefix  string
+	}
+	items := make([]detail, 0, limit)
+	for i := range a.shards {
+		shard := &a.shards[i]
+		shard.mu.Lock()
+		for _, state := range shard.traces {
+			if !isTLSSource(state.requestSource) && !isTLSSource(state.responseSource) {
+				continue
+			}
+			if len(state.requestStream.buffer) == 0 && len(state.responseStream.buffer) == 0 &&
+				len(state.requestStream.received) == 0 && len(state.responseStream.received) == 0 {
+				continue
+			}
+			age := int64(0)
+			if !state.responseUpdated.IsZero() {
+				age = now.Sub(state.responseUpdated).Milliseconds()
+			}
+			items = append(items, detail{
+				chainID:     state.base.ChainID,
+				sockID:      state.base.SockID,
+				requestSrc:  state.requestSource,
+				responseSrc: state.responseSource,
+				reqBufLen:   len(state.requestStream.buffer),
+				respBufLen:  len(state.responseStream.buffer),
+				reqRecv:     len(state.requestStream.received),
+				respRecv:    len(state.responseStream.received),
+				respAgeMs:   age,
+				tlsAssigned: state.tlsAssigned != nil,
+				reqPrefix:   summarizeDebugPrefix(state.requestStream.buffer, 48),
+				respPrefix:  summarizeDebugPrefix(state.responseStream.buffer, 48),
+			})
+		}
+		shard.mu.Unlock()
+	}
+	if len(items) == 0 {
+		return "none"
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].respBufLen != items[j].respBufLen {
+			return items[i].respBufLen > items[j].respBufLen
+		}
+		if items[i].reqBufLen != items[j].reqBufLen {
+			return items[i].reqBufLen > items[j].reqBufLen
+		}
+		return items[i].chainID < items[j].chainID
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		parts = append(parts, fmt.Sprintf("chain=%d sock=%d req_src=%s resp_src=%s req_buf=%d req_recv=%d resp_buf=%d resp_recv=%d resp_age_ms=%d assigned=%t req_prefix=%q resp_prefix=%q",
+			item.chainID, item.sockID, item.requestSrc, item.responseSrc,
+			item.reqBufLen, item.reqRecv, item.respBufLen, item.respRecv,
+			item.respAgeMs, item.tlsAssigned, item.reqPrefix, item.respPrefix))
+	}
+	return strings.Join(parts, " | ")
+}
+
+func (a *Assembler) DebugTLSPendingQueueSummary(now time.Time, limit int) string {
+	if a == nil || limit == 0 {
+		return "none"
+	}
+	type detail struct {
+		sockID        uint64
+		chainID       uint64
+		requestSource string
+		emitted       bool
+		ageMs         int64
+		sig           string
+		quality       int
+		truncated     bool
+		observed      uint64
+		contentLength int64
+		bodyPartial   bool
+		startLine     string
+	}
+	items := make([]detail, 0, limit)
+	for i := range a.tlsShards {
+		shard := &a.tlsShards[i]
+		shard.mu.Lock()
+		for sockID, session := range shard.sessions {
+			for _, pending := range session.pending {
+				age := int64(0)
+				if pending.requestTS != nil {
+					age = now.Sub(*pending.requestTS).Milliseconds()
+				}
+				startLine := ""
+				if pending.request != nil {
+					startLine = pending.request.StartLine
+				}
+				items = append(items, detail{
+					sockID:        sockID,
+					chainID:       pending.chainID,
+					requestSource: pending.requestSource,
+					emitted:       pending.emitted,
+					ageMs:         age,
+					sig:           tlsPendingSignature(pending),
+					quality:       tlsPendingQuality(pending),
+					truncated:     pending.requestTruncated,
+					observed:      pendingObserved(pending),
+					contentLength: pendingContentLength(pending),
+					bodyPartial:   pendingBodyPartial(pending),
+					startLine:     summarizeDebugPrefix([]byte(startLine), 64),
+				})
+			}
+		}
+		shard.mu.Unlock()
+	}
+	if len(items) == 0 {
+		return "none"
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].ageMs != items[j].ageMs {
+			return items[i].ageMs > items[j].ageMs
+		}
+		if items[i].sockID != items[j].sockID {
+			return items[i].sockID < items[j].sockID
+		}
+		return items[i].chainID < items[j].chainID
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		parts = append(parts, fmt.Sprintf("sock=%d chain=%d src=%s emitted=%t age_ms=%d quality=%d truncated=%t observed=%d content_length=%d body_partial=%t sig=%q start_line=%q",
+			item.sockID, item.chainID, item.requestSource, item.emitted, item.ageMs, item.quality,
+			item.truncated, item.observed, item.contentLength, item.bodyPartial, item.sig, item.startLine))
+	}
+	return strings.Join(parts, " | ")
+}
+
 func (a *Assembler) tlsSessionShardFor(sockID uint64) *tlsSessionShard {
 	if a == nil || len(a.tlsShards) == 0 {
 		return nil
@@ -460,31 +831,31 @@ func (a *Assembler) tlsSessionShardFor(sockID uint64) *tlsSessionShard {
 	return &a.tlsShards[sockID%uint64(len(a.tlsShards))]
 }
 
+// enqueueTLSPending 将 TLS 请求添加到 TLS 会话队列中
 func (a *Assembler) enqueueTLSPending(sockID uint64, pending pendingRequest) {
 	shard := a.tlsSessionShardFor(sockID)
 	if shard == nil {
 		return
 	}
-	if tlsPendingShouldSuppress(pending) {
-		if a.debugTLSQueue {
-			log.Printf("tls queue suppress sock=%d chain=%d source=%s sig=%q quality=%d observed=%d content_length=%d truncated=%t body_partial=%t",
-				sockID, pending.chainID, pending.requestSource, tlsPendingSignature(pending), tlsPendingQuality(pending),
-				pendingObserved(pending), pendingContentLength(pending), pending.requestTruncated, pendingBodyPartial(pending))
-		}
-		return
-	}
+	sig := tlsPendingSignature(pending)
+	lowConfidence := tlsPendingShouldSuppress(pending)
 	shard.mu.Lock()
 	session := shard.sessions[sockID]
 	if session == nil {
 		session = &tlsSessionState{}
 		shard.sessions[sockID] = session
 	}
-	if sig := tlsPendingSignature(pending); sig != "" {
+	if sig != "" {
 		for idx, existing := range session.pending {
 			if tlsPendingSignature(existing) != sig {
 				continue
 			}
-			if tlsPendingLooksSuspicious(existing) && tlsPendingQuality(pending) > tlsPendingQuality(existing) {
+			// 这里只允许替换“极像 phantom 的脏请求”，不要把同一条 keep-alive 连接上
+			// 连续出现的真实同 URL 请求互相折叠掉。
+			// 之前使用 tlsPendingLooksSuspicious（truncated/body_partial/大 body 都算可疑）
+			// 会把像 /serviceinfo/update 这种大 body 的真实重复调用也当成 duplicate，
+			// 最终表现成 raw request 已经到了用户态，但 update 数偏少。
+			if tlsPendingShouldSuppress(existing) && tlsPendingQuality(pending) > tlsPendingQuality(existing) {
 				if a.debugTLSQueue {
 					log.Printf("tls queue replace sock=%d old_chain=%d new_chain=%d sig=%q old_quality=%d new_quality=%d",
 						sockID, existing.chainID, pending.chainID, sig, tlsPendingQuality(existing), tlsPendingQuality(pending))
@@ -492,7 +863,7 @@ func (a *Assembler) enqueueTLSPending(sockID uint64, pending pendingRequest) {
 				session.pending = append(session.pending[:idx], session.pending[idx+1:]...)
 				break
 			}
-			if tlsPendingLooksSuspicious(pending) && tlsPendingQuality(existing) >= tlsPendingQuality(pending) {
+			if tlsPendingShouldSuppress(pending) && tlsPendingQuality(existing) >= tlsPendingQuality(pending) {
 				if a.debugTLSQueue {
 					log.Printf("tls queue drop-duplicate sock=%d chain=%d existing_chain=%d sig=%q existing_quality=%d new_quality=%d",
 						sockID, pending.chainID, existing.chainID, sig, tlsPendingQuality(existing), tlsPendingQuality(pending))
@@ -502,10 +873,29 @@ func (a *Assembler) enqueueTLSPending(sockID uint64, pending pendingRequest) {
 			}
 		}
 	}
+	// 对带 method/url 签名的 TLS request，不要在入队前直接 suppress。
+	// 高并发下这类“低质量”请求里有一部分其实是真实请求；如果这里先丢掉，
+	// 后续 response 仍然会出来，就会形成 response > request 的缺口。
+	//
+	// 保留它们进入 TLS session FIFO 后，后续同签名的更高质量请求仍然可以把它替换掉，
+	// 这样既能处理 phantom duplicate，又不会凭空少记 request。
+	if lowConfidence && sig == "" {
+		if a.debugTLSQueue {
+			log.Printf("tls queue suppress sock=%d chain=%d source=%s sig=%q quality=%d observed=%d content_length=%d truncated=%t body_partial=%t",
+				sockID, pending.chainID, pending.requestSource, sig, tlsPendingQuality(pending),
+				pendingObserved(pending), pendingContentLength(pending), pending.requestTruncated, pendingBodyPartial(pending))
+		}
+		shard.mu.Unlock()
+		return
+	}
 	session.pending = append(session.pending, pending)
 	if a.debugTLSQueue {
-		log.Printf("tls queue enqueue sock=%d chain=%d source=%s sig=%q quality=%d size=%d",
-			sockID, pending.chainID, pending.requestSource, tlsPendingSignature(pending), tlsPendingQuality(pending), len(session.pending))
+		action := "enqueue"
+		if lowConfidence {
+			action = "enqueue-low-confidence"
+		}
+		log.Printf("tls queue %s sock=%d chain=%d source=%s sig=%q quality=%d size=%d",
+			action, sockID, pending.chainID, pending.requestSource, sig, tlsPendingQuality(pending), len(session.pending))
 	}
 	shard.mu.Unlock()
 }
@@ -584,6 +974,57 @@ func (a *Assembler) consumeTLSPendingForState(state *traceState) (pendingRequest
 	return pending, ok
 }
 
+func emitPendingRequestUpdate(pending *pendingRequest) (Update, bool) {
+	if pending == nil || pending.emitted {
+		return Update{}, false
+	}
+	pending.emitted = true
+	return buildRequestUpdateFromPending(*pending), true
+}
+
+func markClosedTLSChain(shard *stateShard, chainID uint64, state *traceState) {
+	if shard == nil || state == nil {
+		return
+	}
+	if shard.closedTLS == nil {
+		shard.closedTLS = make(map[uint64]tlsClosedDirections)
+	}
+	closed := shard.closedTLS[chainID]
+	if state.requestEmitted {
+		closed.request = true
+	}
+	if !state.responseUpdated.IsZero() {
+		closed.response = true
+	}
+	closed.at = time.Now()
+	shard.closedTLS[chainID] = closed
+}
+
+func markClosedTLSRawChain(shard *stateShard, chainID uint64, request, response bool) {
+	if shard == nil {
+		return
+	}
+	if shard.closedTLS == nil {
+		shard.closedTLS = make(map[uint64]tlsClosedDirections)
+	}
+	closed := shard.closedTLS[chainID]
+	if request {
+		closed.request = true
+	}
+	if response {
+		closed.response = true
+	}
+	closed.at = time.Now()
+	shard.closedTLS[chainID] = closed
+}
+
+func (t *traceState) appendTLSResponseUpdates(updates []Update, pending pendingRequest, msg *ParsedMessage, ts *time.Time, truncated bool) []Update {
+	if req, ok := emitPendingRequestUpdate(&pending); ok {
+		updates = append(updates, req)
+	}
+	return append(updates, t.buildResponseUpdateFromPending(pending, msg, ts, truncated))
+}
+
 func tlsPendingSignature(p pendingRequest) string {
 	if p.request == nil {
 		return ""
@@ -625,17 +1066,6 @@ func tlsPendingQuality(p pendingRequest) int {
 		score -= 30
 	}
 	return score
-}
-
-func tlsPendingLooksSuspicious(p pendingRequest) bool {
-	if p.request == nil {
-		return true
-	}
-	req := p.request
-	if p.requestTruncated || req.BodyPartial || req.ContentLength < 0 {
-		return true
-	}
-	return req.ObservedMessageBytes > 8192
 }
 
 func tlsPendingShouldSuppress(p pendingRequest) bool {
@@ -708,6 +1138,7 @@ func (a *Assembler) finalizeOnClose(state *traceState, shard *stateShard, chainI
 	}
 	if state.canDelete() {
 		delete(shard.traces, chainID)
+		markClosedTLSChain(shard, chainID, state)
 	}
 	return updates, nil
 }
@@ -729,6 +1160,7 @@ func (a *Assembler) tryEmitUpdates(state *traceState, shard *stateShard, chainID
 
 	if state.canDelete() {
 		delete(shard.traces, chainID)
+		markClosedTLSChain(shard, chainID, state)
 	}
 	return updates, nil
 }
@@ -932,8 +1364,7 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 			annotateParsedMessage(msg, &state.responseStream)
 			if tlsSource {
 				if pending, ok := a.consumeTLSPendingForState(state); ok {
-					updates = append(updates, state.makeRequestUpdate(pending))
-					updates = append(updates, state.buildResponseUpdateFromPending(pending, msg, state.responseStream.firstTS, false))
+					updates = state.appendTLSResponseUpdates(updates, pending, msg, state.responseStream.firstTS, false)
 				} else {
 					a.orphanResponses.Add(1)
 					updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, false))
@@ -955,14 +1386,13 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 			annotateParsedMessage(head, &state.responseStream)
 			if tlsSource {
 				if pending, ok := a.consumeTLSPendingForState(state); ok {
-					updates = append(updates, state.makeRequestUpdate(pending))
-					updates = append(updates, state.buildResponseUpdateFromPending(pending, head, state.responseStream.firstTS, true))
+					updates = state.appendTLSResponseUpdates(updates, pending, head, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, head))
 				} else {
 					a.orphanResponses.Add(1)
-					updates = append(updates, state.buildResponseUpdate(head, state.responseStream.firstTS, true))
+					updates = append(updates, state.buildResponseUpdate(head, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, head)))
 				}
 			} else {
-				updates = append(updates, state.buildResponseUpdate(head, state.responseStream.firstTS, true))
+				updates = append(updates, state.buildResponseUpdate(head, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, head)))
 			}
 			state.responseStream.consumeAll()
 			continue
@@ -976,7 +1406,7 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 		// 说明当前这条 response 在 HTTP 语义上已经结束。
 		// Nginx/sendfile 场景下 body 可能走了 sendpage 等旁路，当前 sendmsg 缓冲里只有响应头；
 		// 这时不能一直等待“完整 body”，否则就会出现 request 数对上、response 持续偏少。
-		if pendingCount > 1 {
+		if !tlsSource && pendingCount > 1 {
 			msg, consumed, ok, err := splitAndParsePartialResponse(state.responseStream.buffer, opts)
 			if err != nil {
 				return updates, nil
@@ -988,14 +1418,13 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 				annotateParsedMessage(msg, &state.responseStream)
 				if tlsSource {
 					if pending, ok := a.consumeTLSPendingForState(state); ok {
-						updates = append(updates, state.makeRequestUpdate(pending))
-						updates = append(updates, state.buildResponseUpdateFromPending(pending, msg, state.responseStream.firstTS, true))
+						updates = state.appendTLSResponseUpdates(updates, pending, msg, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, msg))
 					} else {
 						a.orphanResponses.Add(1)
-						updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, true))
+						updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, msg)))
 					}
 				} else {
-					updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, true))
+					updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, msg)))
 				}
 				state.responseStream.consume(consumed)
 				continue
@@ -1016,16 +1445,16 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 					a.orphanResponses.Add(1)
 				}
 				annotateParsedMessage(partial, &state.responseStream)
+				maybePromoteStalledChunkedResponse(&state.responseStream, partial)
 				if tlsSource {
 					if pending, ok := a.consumeTLSPendingForState(state); ok {
-						updates = append(updates, state.makeRequestUpdate(pending))
-						updates = append(updates, state.buildResponseUpdateFromPending(pending, partial, state.responseStream.firstTS, true))
+						updates = state.appendTLSResponseUpdates(updates, pending, partial, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, partial))
 					} else {
 						a.orphanResponses.Add(1)
-						updates = append(updates, state.buildResponseUpdate(partial, state.responseStream.firstTS, true))
+						updates = append(updates, state.buildResponseUpdate(partial, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, partial)))
 					}
 				} else {
-					updates = append(updates, state.buildResponseUpdate(partial, state.responseStream.firstTS, true))
+					updates = append(updates, state.buildResponseUpdate(partial, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, partial)))
 				}
 				state.responseStream.consumeAll()
 				return updates, nil
@@ -1037,14 +1466,13 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 				annotateParsedMessage(synthetic, &state.responseStream)
 				if tlsSource {
 					if pending, ok := a.consumeTLSPendingForState(state); ok {
-						updates = append(updates, state.makeRequestUpdate(pending))
-						updates = append(updates, state.buildResponseUpdateFromPending(pending, synthetic, state.responseStream.firstTS, true))
+						updates = state.appendTLSResponseUpdates(updates, pending, synthetic, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, synthetic))
 					} else {
 						a.orphanResponses.Add(1)
-						updates = append(updates, state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true))
+						updates = append(updates, state.buildResponseUpdate(synthetic, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, synthetic)))
 					}
 				} else {
-					updates = append(updates, state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true))
+					updates = append(updates, state.buildResponseUpdate(synthetic, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, synthetic)))
 				}
 				state.responseStream.consumeAll()
 			}
@@ -1059,16 +1487,16 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 					a.orphanResponses.Add(1)
 				}
 				annotateParsedMessage(partial, &state.responseStream)
+				maybePromoteStalledChunkedResponse(&state.responseStream, partial)
 				if tlsSource {
 					if pending, ok := a.consumeTLSPendingForState(state); ok {
-						updates = append(updates, state.makeRequestUpdate(pending))
-						updates = append(updates, state.buildResponseUpdateFromPending(pending, partial, state.responseStream.firstTS, true))
+						updates = state.appendTLSResponseUpdates(updates, pending, partial, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, partial))
 					} else {
 						a.orphanResponses.Add(1)
-						updates = append(updates, state.buildResponseUpdate(partial, state.responseStream.firstTS, true))
+						updates = append(updates, state.buildResponseUpdate(partial, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, partial)))
 					}
 				} else {
-					updates = append(updates, state.buildResponseUpdate(partial, state.responseStream.firstTS, true))
+					updates = append(updates, state.buildResponseUpdate(partial, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, partial)))
 				}
 				state.responseStream.consumeAll()
 				return updates, nil
@@ -1080,14 +1508,13 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 				annotateParsedMessage(synthetic, &state.responseStream)
 				if tlsSource {
 					if pending, ok := a.consumeTLSPendingForState(state); ok {
-						updates = append(updates, state.makeRequestUpdate(pending))
-						updates = append(updates, state.buildResponseUpdateFromPending(pending, synthetic, state.responseStream.firstTS, true))
+						updates = state.appendTLSResponseUpdates(updates, pending, synthetic, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, synthetic))
 					} else {
 						a.orphanResponses.Add(1)
-						updates = append(updates, state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true))
+						updates = append(updates, state.buildResponseUpdate(synthetic, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, synthetic)))
 					}
 				} else {
-					updates = append(updates, state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true))
+					updates = append(updates, state.buildResponseUpdate(synthetic, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, synthetic)))
 				}
 				state.responseStream.consumeAll()
 			}
@@ -1099,14 +1526,13 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 		annotateParsedMessage(msg, &state.responseStream)
 		if tlsSource {
 			if pending, ok := a.consumeTLSPendingForState(state); ok {
-				updates = append(updates, state.makeRequestUpdate(pending))
-				updates = append(updates, state.buildResponseUpdateFromPending(pending, msg, state.responseStream.firstTS, state.responseStream.truncated || msg.BodyPartial))
+				updates = state.appendTLSResponseUpdates(updates, pending, msg, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, msg))
 			} else {
 				a.orphanResponses.Add(1)
-				updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, state.responseStream.truncated || msg.BodyPartial))
+				updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, msg)))
 			}
 		} else {
-			updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, state.responseStream.truncated || msg.BodyPartial))
+			updates = append(updates, state.buildResponseUpdate(msg, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, msg)))
 		}
 		state.responseStream.consumeAll()
 		return updates, nil
@@ -1196,12 +1622,12 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 			a.orphanResponses.Add(1)
 		}
 		annotateParsedMessage(msg, &state.responseStream)
+		a.logResponseDecision("stalled-complete", state, msg, false)
 		if tlsSource {
 			if pending, ok := a.consumeTLSPendingForState(state); ok {
-				req := state.makeRequestUpdate(pending)
-				resp := state.buildResponseUpdateFromPending(pending, msg, state.responseStream.firstTS, false)
+				out := state.appendTLSResponseUpdates(nil, pending, msg, state.responseStream.firstTS, false)
 				state.responseStream.consume(msg.ConsumedBytes)
-				return []Update{req, resp}
+				return out
 			}
 		}
 		update := state.buildResponseUpdate(msg, state.responseStream.firstTS, false)
@@ -1220,15 +1646,16 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 				a.orphanResponses.Add(1)
 			}
 			annotateParsedMessage(partial, &state.responseStream)
+			maybePromoteStalledChunkedResponse(&state.responseStream, partial)
+			a.logResponseDecision("stalled-partial-head", state, partial, responseUpdateTruncated(&state.responseStream, partial))
 			if tlsSource {
 				if pending, ok := a.consumeTLSPendingForState(state); ok {
-					req := state.makeRequestUpdate(pending)
-					resp := state.buildResponseUpdateFromPending(pending, partial, state.responseStream.firstTS, true)
+					out := state.appendTLSResponseUpdates(nil, pending, partial, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, partial))
 					state.responseStream.consumeAll()
-					return []Update{req, resp}
+					return out
 				}
 			}
-			update := state.buildResponseUpdate(partial, state.responseStream.firstTS, true)
+			update := state.buildResponseUpdate(partial, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, partial))
 			state.responseStream.consumeAll()
 			return []Update{update}
 		}
@@ -1237,15 +1664,15 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 				a.orphanResponses.Add(1)
 			}
 			annotateParsedMessage(synthetic, &state.responseStream)
+			a.logResponseDecision("stalled-synthetic", state, synthetic, responseUpdateTruncated(&state.responseStream, synthetic))
 			if tlsSource {
 				if pending, ok := a.consumeTLSPendingForState(state); ok {
-					req := state.makeRequestUpdate(pending)
-					resp := state.buildResponseUpdateFromPending(pending, synthetic, state.responseStream.firstTS, true)
+					out := state.appendTLSResponseUpdates(nil, pending, synthetic, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, synthetic))
 					state.responseStream.consumeAll()
-					return []Update{req, resp}
+					return out
 				}
 			}
-			update := state.buildResponseUpdate(synthetic, state.responseStream.firstTS, true)
+			update := state.buildResponseUpdate(synthetic, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, synthetic))
 			state.responseStream.consumeAll()
 			return []Update{update}
 		}
@@ -1255,15 +1682,16 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 		a.orphanResponses.Add(1)
 	}
 	annotateParsedMessage(msg, &state.responseStream)
+	maybePromoteStalledChunkedResponse(&state.responseStream, msg)
+	a.logResponseDecision("stalled-head", state, msg, responseUpdateTruncated(&state.responseStream, msg))
 	if tlsSource {
 		if pending, ok := a.consumeTLSPendingForState(state); ok {
-			req := state.makeRequestUpdate(pending)
-			resp := state.buildResponseUpdateFromPending(pending, msg, state.responseStream.firstTS, true)
+			out := state.appendTLSResponseUpdates(nil, pending, msg, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, msg))
 			state.responseStream.consumeAll()
-			return []Update{req, resp}
+			return out
 		}
 	}
-	update := state.buildResponseUpdate(msg, state.responseStream.firstTS, true)
+	update := state.buildResponseUpdate(msg, state.responseStream.firstTS, responseUpdateTruncated(&state.responseStream, msg))
 	state.responseStream.consumeAll()
 	return []Update{update}
 }
@@ -1300,6 +1728,21 @@ func (t *traceState) buildRequestUpdate(chainID uint64, msg *ParsedMessage, ts *
 	return update
 }
 
+func buildRequestUpdateFromPending(pending pendingRequest) Update {
+	doc := pending.requestBase
+	doc.Kind = "request"
+	doc.ChainID = pending.chainID
+	doc.RequestTS = cloneTimePtr(pending.requestTS)
+	doc.ResponseTS = nil
+	doc.ResponseLatency = nil
+	doc.Request = pending.request
+	doc.Response = nil
+	doc.CaptureSource = pending.requestSource
+	doc.RequestTruncated = pending.requestTruncated
+	doc.ResponseTruncated = false
+	return Update{Kind: "request", Trace: doc}
+}
+
 // 构建响应更新
 func (t *traceState) buildResponseUpdate(msg *ParsedMessage, ts *time.Time, truncated bool) Update {
 	doc := t.base
@@ -1318,11 +1761,6 @@ func (t *traceState) buildResponseUpdate(msg *ParsedMessage, ts *time.Time, trun
 		pending := t.pendingRequests[0]
 		t.pendingRequests = t.pendingRequests[1:]
 		doc.ChainID = pending.chainID
-		if isTLSSource(t.responseSource) || isTLSSource(t.requestSource) {
-			doc.RequestTS = cloneTimePtr(pending.requestTS)
-			doc.Request = pending.request
-			doc.RequestTruncated = pending.requestTruncated
-		}
 		if pending.requestTS != nil && ts != nil {
 			latency := ts.Sub(*pending.requestTS).Seconds() * 1000
 			doc.ResponseLatency = &latency
@@ -1339,11 +1777,11 @@ func (t *traceState) buildResponseUpdateFromPending(pending pendingRequest, msg 
 	doc.Kind = "response"
 	doc.ChainID = pending.chainID
 	doc.ResponseTS = cloneTimePtr(ts)
-	doc.RequestTS = cloneTimePtr(pending.requestTS)
-	doc.Request = pending.request
+	doc.RequestTS = nil
+	doc.Request = nil
 	doc.Response = msg
 	doc.CaptureSource = t.responseSource
-	doc.RequestTruncated = pending.requestTruncated
+	doc.RequestTruncated = false
 	doc.ResponseTruncated = truncated
 	if pending.requestTS != nil && ts != nil {
 		latency := ts.Sub(*pending.requestTS).Seconds() * 1000
@@ -1368,24 +1806,13 @@ func (t *traceState) queuePendingRequest(chainID uint64, msg *ParsedMessage, ts 
 }
 
 func (t *traceState) makeRequestUpdate(pending pendingRequest) Update {
-	doc := t.base
-	if pending.requestBase.ChainID != 0 || pending.requestBase.SockID != 0 || pending.requestBase.PID != 0 {
-		doc = pending.requestBase
+	if pending.requestBase.ChainID == 0 && pending.requestBase.SockID == 0 && pending.requestBase.PID == 0 {
+		pending.requestBase = t.base
 	}
-	doc.Kind = "request"
-	doc.ChainID = pending.chainID
-	doc.RequestTS = cloneTimePtr(pending.requestTS)
-	doc.ResponseTS = nil
-	doc.ResponseLatency = nil
-	doc.Request = pending.request
-	doc.Response = nil
-	doc.CaptureSource = t.requestSource
-	if pending.requestSource != "" {
-		doc.CaptureSource = pending.requestSource
+	if pending.requestSource == "" {
+		pending.requestSource = t.requestSource
 	}
-	doc.RequestTruncated = pending.requestTruncated
-	doc.ResponseTruncated = false
-	return Update{Kind: "request", Trace: doc}
+	return buildRequestUpdateFromPending(pending)
 }
 
 func (t *traceState) emitDelayedTLSRequestUpdate() (Update, bool) {
@@ -1422,13 +1849,13 @@ func (t *traceState) shouldFlushStalledResponse(now time.Time, stall time.Durati
 		return false
 	}
 	timeout := stall
-	if timeout < minChunkedResponseStallTimeout && responseLooksChunked(t.responseStream.buffer) {
-		timeout = minChunkedResponseStallTimeout
+	if timeout < minConservativeResponseStallTimeout && responseNeedsConservativeStall(t.responseStream.buffer) {
+		timeout = minConservativeResponseStallTimeout
 	}
 	return now.Sub(t.responseUpdated) >= timeout
 }
 
-func responseLooksChunked(data []byte) bool {
+func responseNeedsConservativeStall(data []byte) bool {
 	if len(data) == 0 {
 		return false
 	}
@@ -1436,7 +1863,16 @@ func responseLooksChunked(data []byte) bool {
 	if err != nil || !ok || msg == nil {
 		return false
 	}
-	return msg.Chunked
+	if msg.Chunked {
+		return true
+	}
+	if msg.StatusCode >= 400 {
+		return true
+	}
+	if strings.EqualFold(msg.Headers["Connection"], "close") {
+		return true
+	}
+	return false
 }
 
 func annotateParsedMessage(msg *ParsedMessage, stream *fragmentStream) {
@@ -1480,7 +1916,56 @@ func shouldEagerFlushErrorResponse(msg *ParsedMessage) bool {
 	if msg == nil {
 		return false
 	}
-	return msg.Direction == DirectionResponse && msg.StatusCode >= 400
+	if msg.Direction != DirectionResponse || msg.StatusCode < 400 {
+		return false
+	}
+	if msg.BodyPartial {
+		return false
+	}
+	if msg.Chunked || msg.TransferEncoding != "" {
+		return false
+	}
+	if strings.EqualFold(msg.Headers["Connection"], "close") {
+		return false
+	}
+	return true
+}
+
+func responseUpdateTruncated(stream *fragmentStream, msg *ParsedMessage) bool {
+	if msg != nil && msg.StatusCode == 502 {
+		return false
+	}
+	if stream == nil {
+		return msg != nil && msg.BodyPartial
+	}
+	if msg == nil {
+		return stream.truncated
+	}
+	return stream.truncated || msg.BodyPartial
+}
+
+func maybePromoteStalledChunkedResponse(stream *fragmentStream, msg *ParsedMessage) {
+	if stream == nil || msg == nil || !msg.Chunked || !msg.BodyPartial || stream.truncated {
+		return
+	}
+	if stream.observedBytes == 0 || stream.observedBytes <= uint64(len(stream.buffer)) {
+		return
+	}
+	_, _, bodyStart, ok, err := parseMessageHead(DirectionResponse, stream.buffer)
+	if err != nil || !ok {
+		return
+	}
+	decoded, missing, framingOnly := decodeChunkedBodyMissingOnlyFraming(stream.buffer[bodyStart:])
+	if !framingOnly {
+		return
+	}
+	missingObserved := int(stream.observedBytes) - len(stream.buffer)
+	if missingObserved < missing {
+		return
+	}
+	msg.Body = string(decoded)
+	msg.BodySizeBytes = len(decoded)
+	msg.BodyPartial = false
 }
 
 func (s *fragmentStream) drain(maxMessageBytes int) {
@@ -1531,6 +2016,33 @@ func (s *fragmentStream) consumeAll() {
 	s.observedBytes = 0
 	s.truncated = false
 	s.finalReady = false
+}
+
+func summarizeDebugPrefix(payload []byte, limit int) string {
+	if limit <= 0 || len(payload) == 0 {
+		return ""
+	}
+	if len(payload) < limit {
+		limit = len(payload)
+	}
+	buf := make([]byte, 0, limit)
+	for _, b := range payload[:limit] {
+		switch b {
+		case '\r':
+			buf = append(buf, '\\', 'r')
+		case '\n':
+			buf = append(buf, '\\', 'n')
+		case '\t':
+			buf = append(buf, '\\', 't')
+		default:
+			if b < 0x20 || b > 0x7e {
+				buf = append(buf, '.')
+			} else {
+				buf = append(buf, b)
+			}
+		}
+	}
+	return string(buf)
 }
 
 func (d TraceDocument) SummaryLine() string {

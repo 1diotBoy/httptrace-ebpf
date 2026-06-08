@@ -1,0 +1,56 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "httptrace debug",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/cmd/httptrace",
+            "args": [
+                "-heartbeat-server",
+                "http://172.18.40.177:20001/power-asm/",
+                "-ifname",
+                "ens32",
+                "-dst-port",
+                "55555",
+                "-disable-kernel-filter=true",
+                "-disable-user-tuple=true",
+                "-txn-ttl",
+                "30m",
+                "-response-stall-timeout",
+                "500ms",
+                "-capture-bytes",
+                "32768",
+                "-max-message-bytes",
+                "32768",
+                "-perf-pages",
+                "1024",
+                "-workers",
+                "8",
+                "-redis-workers",
+                "8",
+                "-redis-queue-size",
+                "32768",
+                "-print-summary=false",
+                "-print-http=false",
+                "-debug-kernel=true",
+                "-log-interval",
+                "10s",
+                "-redis-db",
+                "6",
+                "-redis-addr",
+                "127.0.0.1:6379",
+                "-redis-password",
+                "9/L16DcUm3zIJgui54F/hayuh/bsXcdLdv3De12EkH4="
+            ],
+            "env": {},
+            "showLog": true,
+            "dlvFlags": [
+                "--check-go-version=false"
+            ],
+            "apiVersion": 2,
+            "buildFlags": "-gcflags=all=-N"
+        }
+    ]
+}

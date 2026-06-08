@@ -106,13 +106,31 @@ struct bpf_map_def SEC("maps") scratch_heap = {
  * http_event.payload.
  */
 #define TLS_EVENT_COPY_MAX 255
+/*
+ * TLS plaintext can arrive in a single large SSL_read/SSL_write call even when
+ * the overall HTTP message is well below the 32KB logical capture limit.
+ *
+ * On modern kernels we can afford a slightly larger per-call fragment budget.
+ * For 4.19-style legacy verifiers, keep the program smaller and fall back to a
+ * tighter fragment window so the uretprobe loader stays stable.
+ */
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
 #define TLS_EVENT_MAX_FRAGMENTS 6
+#else
+#define TLS_EVENT_MAX_FRAGMENTS 12
+#endif
 #define TLS_EVENT_CAPTURE_MAX_BYTES (TLS_EVENT_COPY_MAX * TLS_EVENT_MAX_FRAGMENTS)
 #define TLS_REQUEST_SIG_PREFIX_BYTES 32
 
 #define TLS_ROLE_UNKNOWN 0
 #define TLS_ROLE_SERVER 1
 #define TLS_ROLE_CLIENT 2
+
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
+#define TLS_LEGACY_HELPER __attribute__((noinline))
+#else
+#define TLS_LEGACY_HELPER __always_inline
+#endif
 
 #define EMIT_TLS_FRAGMENT_STEP()                                                                  \
 	do {                                                                                      \
@@ -591,7 +609,7 @@ static __always_inline int tls_starts_with_http_response(const struct tls_rw_arg
 	return looks_like_http_response(prefix, prefix_len);
 }
 
-static __always_inline __u8 tls_detect_http_direction(const struct tls_rw_args *args, __u32 size)
+static __always_inline __attribute__((unused)) __u8 tls_detect_http_direction(const struct tls_rw_args *args, __u32 size)
 {
 	if (tls_starts_with_http_request(args, size))
 		return DIR_REQUEST;
@@ -600,7 +618,7 @@ static __always_inline __u8 tls_detect_http_direction(const struct tls_rw_args *
 	return DIR_UNKNOWN;
 }
 
-static __always_inline void update_tls_role(struct flow_state *state, const struct tls_rw_args *args, __u8 direction)
+static __always_inline __attribute__((unused)) void update_tls_role(struct flow_state *state, const struct tls_rw_args *args, __u8 direction)
 {
 	__u8 role = TLS_ROLE_UNKNOWN;
 
@@ -938,6 +956,12 @@ static __always_inline int capture_plaintext(void *ctx, const struct tls_rw_args
 	EMIT_TLS_FRAGMENT_STEP();
 	EMIT_TLS_FRAGMENT_STEP();
 	EMIT_TLS_FRAGMENT_STEP();
+	EMIT_TLS_FRAGMENT_STEP();
+	EMIT_TLS_FRAGMENT_STEP();
+	EMIT_TLS_FRAGMENT_STEP();
+	EMIT_TLS_FRAGMENT_STEP();
+	EMIT_TLS_FRAGMENT_STEP();
+	EMIT_TLS_FRAGMENT_STEP();
 	captured = emit_offset;
 
 	if (is_request) {
@@ -1019,7 +1043,7 @@ static __always_inline int store_fd_args(void *ssl, __s32 fd, __u8 source)
 	return bpf_map_update_elem(&tls_fd_args_map, &pid_tgid, &args, BPF_ANY);
 }
 
-static __always_inline __u32 resolve_plaintext_size(const struct tls_rw_args *args, long ret)
+static TLS_LEGACY_HELPER __u32 resolve_plaintext_size(const struct tls_rw_args *args, long ret)
 {
 	__u64 processed = 0;
 
@@ -1041,7 +1065,7 @@ static __always_inline __u32 resolve_plaintext_size(const struct tls_rw_args *ar
 	return ret;
 }
 
-static __always_inline int handle_tls_request(void *ctx, const struct tls_rw_args *args, __u32 size)
+static TLS_LEGACY_HELPER int handle_tls_request(void *ctx, const struct tls_rw_args *args, __u32 size)
 {
 	struct flow_state *state = NULL;
 	struct tls_fd_entry fd_entry = {};
@@ -1102,7 +1126,7 @@ static __always_inline int handle_tls_request(void *ctx, const struct tls_rw_arg
 					DIR_REQUEST, args->source, size);
 }
 
-static __always_inline int handle_tls_response(void *ctx, const struct tls_rw_args *args, __u32 size)
+static TLS_LEGACY_HELPER int handle_tls_response(void *ctx, const struct tls_rw_args *args, __u32 size)
 {
 	struct flow_state *state = NULL;
 	struct tls_fd_entry fd_entry = {};
@@ -1131,10 +1155,12 @@ static __always_inline int handle_tls_response(void *ctx, const struct tls_rw_ar
 					DIR_RESPONSE, args->source, size);
 }
 
-static __always_inline int handle_rw_return(struct pt_regs *ctx)
+static TLS_LEGACY_HELPER __attribute__((unused)) int handle_rw_return(struct pt_regs *ctx)
 {
 	struct tls_rw_args *args = NULL;
+#if !defined(LEGACY_VERIFIER) && !defined(COMPACT_VERIFIER)
 	struct flow_state *state = NULL;
+#endif
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 size = 0;
 	__u8 direction = DIR_UNKNOWN;
@@ -1146,6 +1172,22 @@ static __always_inline int handle_rw_return(struct pt_regs *ctx)
 
 	size = resolve_plaintext_size(args, ret);
 	if (size > 0) {
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
+		/*
+		 * Older 4.19-style verifiers are very sensitive to the larger TLS
+		 * direction/role state machine. Keep the return-path classifier as
+		 * small as possible here:
+		 * - SSL_read / SSL_read_ex: plaintext request from nginx frontend
+		 * - SSL_write / SSL_write_ex: plaintext response back to client
+		 *
+		 * This matches our nginx-focused deployment target and mirrors the
+		 * minimal stable strategy we already use elsewhere for legacy HTTP.
+		 */
+		if (args->source == SRC_TLS_SSL_READ || args->source == SRC_TLS_SSL_READ_EX)
+			direction = DIR_REQUEST;
+		else
+			direction = DIR_RESPONSE;
+#else
 		if (ensure_tls_flow_exists(&args->key) == 0)
 			state = bpf_map_lookup_elem(&tls_flow_map, &args->key);
 
@@ -1178,6 +1220,7 @@ static __always_inline int handle_rw_return(struct pt_regs *ctx)
 			else
 				direction = DIR_RESPONSE;
 		}
+#endif
 
 		if (direction == DIR_REQUEST)
 			handle_tls_request(ctx, args, size);
@@ -1188,6 +1231,46 @@ static __always_inline int handle_rw_return(struct pt_regs *ctx)
 	bpf_map_delete_elem(&tls_rw_args_map, &pid_tgid);
 	return 0;
 }
+
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
+static __attribute__((noinline)) int handle_rw_return_legacy_request(struct pt_regs *ctx)
+{
+	struct tls_rw_args *args = NULL;
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 size = 0;
+	long ret = PT_REGS_RC(ctx);
+
+	args = bpf_map_lookup_elem(&tls_rw_args_map, &pid_tgid);
+	if (!args)
+		return 0;
+
+	size = resolve_plaintext_size(args, ret);
+	if (size > 0)
+		handle_tls_request(ctx, args, size);
+
+	bpf_map_delete_elem(&tls_rw_args_map, &pid_tgid);
+	return 0;
+}
+
+static __attribute__((noinline)) int handle_rw_return_legacy_response(struct pt_regs *ctx)
+{
+	struct tls_rw_args *args = NULL;
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 size = 0;
+	long ret = PT_REGS_RC(ctx);
+
+	args = bpf_map_lookup_elem(&tls_rw_args_map, &pid_tgid);
+	if (!args)
+		return 0;
+
+	size = resolve_plaintext_size(args, ret);
+	if (size > 0)
+		handle_tls_response(ctx, args, size);
+
+	bpf_map_delete_elem(&tls_rw_args_map, &pid_tgid);
+	return 0;
+}
+#endif
 
 static __always_inline int handle_fd_return(struct pt_regs *ctx)
 {
@@ -1304,7 +1387,11 @@ int uprobe_ssl_read(struct pt_regs *ctx)
 SEC("uretprobe/SSL_read")
 int uretprobe_ssl_read(struct pt_regs *ctx)
 {
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
+	return handle_rw_return_legacy_request(ctx);
+#else
 	return handle_rw_return(ctx);
+#endif
 }
 
 SEC("uprobe/SSL_write")
@@ -1317,7 +1404,11 @@ int uprobe_ssl_write(struct pt_regs *ctx)
 SEC("uretprobe/SSL_write")
 int uretprobe_ssl_write(struct pt_regs *ctx)
 {
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
+	return handle_rw_return_legacy_response(ctx);
+#else
 	return handle_rw_return(ctx);
+#endif
 }
 
 SEC("uprobe/SSL_read_ex")
@@ -1330,7 +1421,11 @@ int uprobe_ssl_read_ex(struct pt_regs *ctx)
 SEC("uretprobe/SSL_read_ex")
 int uretprobe_ssl_read_ex(struct pt_regs *ctx)
 {
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
+	return handle_rw_return_legacy_request(ctx);
+#else
 	return handle_rw_return(ctx);
+#endif
 }
 
 SEC("uprobe/SSL_write_ex")
@@ -1343,7 +1438,11 @@ int uprobe_ssl_write_ex(struct pt_regs *ctx)
 SEC("uretprobe/SSL_write_ex")
 int uretprobe_ssl_write_ex(struct pt_regs *ctx)
 {
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
+	return handle_rw_return_legacy_response(ctx);
+#else
 	return handle_rw_return(ctx);
+#endif
 }
 
 SEC("uprobe/SSL_set_fd")

@@ -179,6 +179,38 @@ func (s *Service) currentTLSFlags() uint32 {
 	return dataCollectDisabledBit
 }
 
+func (s *Service) currentCaptureLimits() (uint32, uint32, int) {
+	if s == nil {
+		return 32 * 1024, 32 * 1024, 32 * 1024
+	}
+
+	requestLimit := uint32(s.cfg.CaptureBytes)
+	responseLimit := uint32(s.cfg.CaptureBytes)
+	if s.store != nil {
+		if v := s.store.RequestCaptureLimitBytes(); v > 0 {
+			requestLimit = uint32(v)
+		}
+		if v := s.store.ResponseCaptureLimitBytes(); v > 0 {
+			responseLimit = uint32(v)
+		}
+	}
+
+	assemblerLimit := s.cfg.MaxMessageBytes
+	if assemblerLimit <= 0 {
+		assemblerLimit = s.cfg.CaptureBytes
+	}
+	if int(requestLimit) > assemblerLimit {
+		assemblerLimit = int(requestLimit)
+	}
+	if int(responseLimit) > assemblerLimit {
+		assemblerLimit = int(responseLimit)
+	}
+	if assemblerLimit <= 0 {
+		assemblerLimit = 32 * 1024
+	}
+	return requestLimit, responseLimit, assemblerLimit
+}
+
 func NewService(cfg Config) (*Service, error) {
 	cfg, plan := cfg.normalizedForHost()
 	filter, err := cfg.ResolveFilter()
@@ -216,6 +248,10 @@ func NewService(cfg Config) (*Service, error) {
 		resourcePlan:    plan,
 		startTime:       startTime,
 		currentStatsDay: localDayStamp(startTime),
+	}
+	if svc.assembler != nil {
+		_, _, assemblerLimit := svc.currentCaptureLimits()
+		svc.assembler.SetMaxMessageBytes(assemblerLimit)
 	}
 	svc.assembler.SetDebugTLSQueue(cfg.DebugKernel)
 	svc.collectEnabled.Store(true)
@@ -303,7 +339,11 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 		defer closeAll(tlsLinks)
 
-		tlsReader, err = perf.NewReader(tlsObjs.Events, s.cfg.PerfBufferBytes())
+		tlsPerfBytes := s.cfg.PerfBufferBytes() * 4
+		if tlsPerfBytes < s.cfg.PerfBufferBytes() {
+			tlsPerfBytes = s.cfg.PerfBufferBytes()
+		}
+		tlsReader, err = perf.NewReader(tlsObjs.Events, tlsPerfBytes)
 		if err != nil {
 			return fmt.Errorf("create tls perf reader: %w", err)
 		}
@@ -411,6 +451,10 @@ func (s *Service) Run(ctx context.Context) error {
 func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 	key := uint32(0)
 	kernelFilter := s.filter.Kernel
+	requestLimit, responseLimit, assemblerLimit := s.currentCaptureLimits()
+	if s.assembler != nil {
+		s.assembler.SetMaxMessageBytes(assemblerLimit)
+	}
 	if s.cfg.DisableKernelFilter {
 		log.Printf("kernel endpoint filter disabled by flag: all IP/port checks are skipped before perf output")
 		kernelFilter.Ifindex = 0
@@ -418,10 +462,8 @@ func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 		kernelFilter.DstIp = 0
 		kernelFilter.SrcPort = 0
 		kernelFilter.DstPort = 0
-		if s.cfg.CaptureBytes > 0 {
-			kernelFilter.RequestCaptureBytes = uint32(s.cfg.CaptureBytes)
-			kernelFilter.ResponseCaptureBytes = uint32(s.cfg.CaptureBytes)
-		}
+		kernelFilter.RequestCaptureBytes = requestLimit
+		kernelFilter.ResponseCaptureBytes = responseLimit
 		kernelFilter.DebugFlags = s.currentKernelDebugFlags()
 		if err := objs.FilterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update filter map: %w", err)
@@ -435,6 +477,8 @@ func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 		log.Printf("ifname filter is not enforced in kernel tuple-cache mode: socket-layer ifindex is not reliable enough")
 	}
 	kernelFilter.Ifindex = 0
+	kernelFilter.RequestCaptureBytes = requestLimit
+	kernelFilter.ResponseCaptureBytes = responseLimit
 	kernelFilter.DebugFlags = s.currentKernelDebugFlags()
 	if objs.HookStrategy == bpfgen.HookStrategyLegacySock ||
 		objs.HookStrategy == bpfgen.HookStrategyLegacyTCPSend ||
@@ -459,15 +503,9 @@ func (s *Service) syncCaptureLimitsToKernel(filterMap *ebpf.Map) error {
 		return nil
 	}
 
-	requestLimit := uint32(s.cfg.CaptureBytes)
-	responseLimit := uint32(s.cfg.CaptureBytes)
-	if s.store != nil {
-		if v := s.store.RequestCaptureLimitBytes(); v > 0 {
-			requestLimit = uint32(v)
-		}
-		if v := s.store.ResponseCaptureLimitBytes(); v > 0 {
-			responseLimit = uint32(v)
-		}
+	requestLimit, responseLimit, assemblerLimit := s.currentCaptureLimits()
+	if s.assembler != nil {
+		s.assembler.SetMaxMessageBytes(assemblerLimit)
 	}
 	debugFlags := s.currentKernelDebugFlags()
 	if requestLimit == s.lastRequestCaptureLimit &&
@@ -495,7 +533,7 @@ func (s *Service) syncCaptureLimitsToKernel(filterMap *ebpf.Map) error {
 	s.lastRequestCaptureLimit = requestLimit
 	s.lastResponseCaptureLimit = responseLimit
 	s.lastFilterDebugFlags = debugFlags
-	log.Printf("updated kernel capture state request=%d response=%d enabled=%t", requestLimit, responseLimit, s.collectEnabled.Load())
+	log.Printf("updated kernel capture state request=%dB response=%dB assembler=%dB enabled=%t", requestLimit, responseLimit, assemblerLimit, s.collectEnabled.Load())
 	return nil
 }
 
@@ -504,15 +542,9 @@ func (s *Service) installTLSConfig(configMap *ebpf.Map) error {
 		return nil
 	}
 
-	requestLimit := uint32(s.cfg.CaptureBytes)
-	responseLimit := uint32(s.cfg.CaptureBytes)
-	if s.store != nil {
-		if v := s.store.RequestCaptureLimitBytes(); v > 0 {
-			requestLimit = uint32(v)
-		}
-		if v := s.store.ResponseCaptureLimitBytes(); v > 0 {
-			responseLimit = uint32(v)
-		}
+	requestLimit, responseLimit, assemblerLimit := s.currentCaptureLimits()
+	if s.assembler != nil {
+		s.assembler.SetMaxMessageBytes(assemblerLimit)
 	}
 
 	var cfg bpfgen.TlsTraceConfig
@@ -531,6 +563,7 @@ func (s *Service) installTLSConfig(configMap *ebpf.Map) error {
 	if err := configMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update tls config map: %w", err)
 	}
+	log.Printf("updated tls capture state request=%dB response=%dB assembler=%dB flags=%d", requestLimit, responseLimit, assemblerLimit, cfg.Flags)
 	return nil
 }
 
@@ -862,20 +895,20 @@ func (s *Service) recordUpdatePath(tag, kind string) {
 }
 
 type consoleParsedMessage struct {
-	StartLine            string            `json:"start_line"`
+	StartLine            string            `json:"start_line"` // 起始行
 	Version              string            `json:"version,omitempty"`
-	Method               string            `json:"method,omitempty"`
-	URL                  string            `json:"url,omitempty"`
-	StatusCode           int               `json:"status_code,omitempty"`
-	Reason               string            `json:"reason,omitempty"`
-	Headers              map[string]string `json:"headers,omitempty"`
-	Body                 string            `json:"body,omitempty"`
-	BodySizeBytes        int               `json:"body_size_bytes,omitempty"`
-	ObservedMessageBytes uint64            `json:"observed_message_bytes,omitempty"`
-	ContentLength        int64             `json:"content_length,omitempty"`
-	TransferEncoding     string            `json:"transfer_encoding,omitempty"`
-	Chunked              bool              `json:"chunked,omitempty"`
-	BodyPartial          bool              `json:"body_partial,omitempty"`
+	Method               string            `json:"method,omitempty"`                 // 方法
+	URL                  string            `json:"url,omitempty"`                    // URL
+	StatusCode           int               `json:"status_code,omitempty"`            // 状态码
+	Reason               string            `json:"reason,omitempty"`                 // 原因
+	Headers              map[string]string `json:"headers,omitempty"`                // 头
+	Body                 string            `json:"body,omitempty"`                   // body
+	BodySizeBytes        int               `json:"body_size_bytes,omitempty"`        // body 字节数
+	ObservedMessageBytes uint64            `json:"observed_message_bytes,omitempty"` // 观察到的消息字节数
+	ContentLength        int64             `json:"content_length,omitempty"`         // 内容长度
+	TransferEncoding     string            `json:"transfer_encoding,omitempty"`      // 传输编码
+	Chunked              bool              `json:"chunked,omitempty"`                // 是否是 chunked
+	BodyPartial          bool              `json:"body_partial,omitempty"`           // 是否是部分 body
 }
 
 func newConsoleParsedMessage(msg *httptrace.ParsedMessage) *consoleParsedMessage {
@@ -983,6 +1016,7 @@ func (s *Service) enqueueRetry(ctx context.Context, retrySem chan struct{}, retr
 
 func (s *Service) dispatchEvent(ctx context.Context, event httptrace.Event, worker chan<- httptrace.Event) error {
 	newRawChain := s.stats.recordRawSourceEvent(event)
+	// https 明细日志
 	if s.cfg.DebugKernel && newRawChain && strings.HasPrefix(event.Source, "tls_") {
 		log.Printf(
 			"tls raw chain source=%s dir=%d chain=%d sock=%d fd=%d seq=%d observed=%d comm=%s prefix=%q",
@@ -1273,6 +1307,7 @@ func (s *stats) updateSourceChainSummary() string {
 	return strings.Join(parts, " ")
 }
 
+// rawTLSChainDetailSummary 打印 TLS 链路详情
 func (s *stats) rawTLSChainDetailSummary() string {
 	if s == nil {
 		return "none"
@@ -1306,6 +1341,63 @@ func (s *stats) rawTLSChainDetailSummary() string {
 			detail.Comm,
 			detail.Prefix,
 		))
+	}
+	return strings.Join(parts, " ")
+}
+
+// rawTLSMissingUpdateSummary 列出“已经进入用户态 raw 统计，但还没有产出 update”的 TLS chain。
+// 这能直接把问题边界钉在用户态聚合：
+// - 如果 raw 已经有 chain，但 update 没有，就不是内核 perf 丢样本；
+// - 再结合 prefix/sock/fd，就能看出缺口更偏 request 还是 response。
+func (s *stats) rawTLSMissingUpdateSummary(limit int) string {
+	if s == nil {
+		return "none"
+	}
+	s.sourceMu.Lock()
+	defer s.sourceMu.Unlock()
+	if len(s.rawChainDetails) == 0 {
+		return "none"
+	}
+	keys := make([]string, 0, len(s.rawChainDetails))
+	for key := range s.rawChainDetails {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	capHint := len(keys)
+	if limit > 0 && limit < capHint {
+		capHint = limit
+	}
+	parts := make([]string, 0, capHint)
+	for _, key := range keys {
+		detail := s.rawChainDetails[key]
+		updateKey := sourceDirectionKey(detail.Source, detail.Direction)
+		if chains := s.updateChainsByKey[updateKey]; chains != nil {
+			if _, ok := chains[detail.ChainID]; ok {
+				continue
+			}
+		}
+		dir := "unk"
+		switch detail.Direction {
+		case httptrace.DirectionRequest:
+			dir = "req"
+		case httptrace.DirectionResponse:
+			dir = "resp"
+		}
+		parts = append(parts, fmt.Sprintf("%s:%s(chain=%d sock=%d fd=%d comm=%s prefix=%q)",
+			detail.Source,
+			dir,
+			detail.ChainID,
+			detail.SockID,
+			detail.FD,
+			detail.Comm,
+			detail.Prefix,
+		))
+		if limit > 0 && len(parts) >= limit {
+			break
+		}
+	}
+	if len(parts) == 0 {
+		return "none"
 	}
 	return strings.Join(parts, " ")
 }
@@ -1590,6 +1682,11 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.LoadedObjects, tlsCo
 			}
 		case <-statsTicker.C:
 			s.RolloverDaily(time.Now(), objs)
+			// 在周期统计前再做一轮 stalled flush，尽量减少“统计时刻刚好还没刷掉”的尾部差值。
+			stalledUpdates := s.assembler.FlushStalled(time.Now())
+			for _, update := range stalledUpdates {
+				s.handleUpdate(ctx, "stalled", update, writeCh)
+			}
 			evictUpdates, evicted := s.assembler.EvictExpired(time.Now())
 			for _, update := range evictUpdates {
 				s.handleUpdate(ctx, "evicted", update, writeCh)
@@ -1669,10 +1766,27 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 	)
 	log.Printf("%s source raw(%s)", label, s.stats.rawSourceSummary())
 	log.Printf("%s source update(%s)", label, s.stats.updateSourceSummary())
-	// 临时日志调试
+	// raw/update chain 统计用于对比：
+	// raw 反映“内核 perf 事件层面”看到了多少唯一 chain，
+	// update 反映“用户态聚合后真正产出的文档层面”保留了多少唯一 chain。
 	log.Printf("%s source chains raw(%s)", label, s.stats.rawSourceChainSummary())
 	log.Printf("%s source chains update(%s)", label, s.stats.updateSourceChainSummary())
-	log.Printf("%s tls raw chains(%s)", label, s.stats.rawTLSChainDetailSummary())
+	// 仅输出 TLS raw chain 的首包概要，帮助排查同一 TLS 会话里
+	// request/response 起链是否异常、是否混入了可疑 duplicate/phantom request。
+	// log.Printf("%s tls raw chains(%s)", label, s.stats.rawTLSChainDetailSummary())
+	if missing := s.stats.rawTLSMissingUpdateSummary(24); missing != "none" {
+		log.Printf("%s tls raw missing update(%s)", label, missing)
+	}
+	if asmStats.PendingRequests > 0 {
+		if detail := s.assembler.DebugTLSPendingQueueSummary(time.Now(), 16); detail != "none" {
+			log.Printf("%s tls pending queue(%s)", label, detail)
+		}
+	}
+	if asmStats.RequestBufferStates > 0 || asmStats.ResponseBufferStates > 0 {
+		if detail := s.assembler.DebugTLSPendingStateSummary(time.Now(), 16); detail != "none" {
+			log.Printf("%s tls buffered states(%s)", label, detail)
+		}
+	}
 	if s.cfg.DebugKernel {
 		recordsRead := s.stats.recordsRead.Load()
 		resolveProcCount := s.stats.resolverProc.Load()
@@ -2133,7 +2247,16 @@ func decodeRawEvent(sample []byte) (bpfgen.HttpTraceHttpEvent, error) {
 
 // 内核态原始事件转换成更适合用户态处理的结构。
 func normalizeEvent(raw bpfgen.HttpTraceHttpEvent) httptrace.Event {
-	ts := time.Unix(0, int64(raw.TsNs))
+	// raw.TsNs 来自内核 bpf_ktime_get_ns()，它是单调时钟（自开机以来的 ns），
+	// 不是 Unix 墙钟时间。
+	//
+	// 之前直接 time.Unix(0, raw.TsNs) 会把事件时间落到 1970 附近，进而让
+	// TLS pending/stall/age 判断几乎立刻触发，表现成 request 被过早 flush，
+	// 最终比真实样本数多记请求。
+	//
+	// 这里改为使用“用户态收到 perf 事件时”的墙钟时间作为 Event.Timestamp。
+	// raw.TsNs 仍然保留在 Event.TsNS 中，仅用于调试/排序线索，不再参与墙钟语义。
+	ts := time.Now()
 	payloadLen := int(raw.PayloadLen)
 	if payloadLen > len(raw.Payload) {
 		payloadLen = len(raw.Payload)

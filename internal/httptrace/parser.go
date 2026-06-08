@@ -199,6 +199,13 @@ func TryParsePartialHead(direction uint8, data []byte) (*ParsedMessage, bool, er
 	if bodyStart < len(data) {
 		body := data[bodyStart:]
 		if msg.Chunked {
+			if decoded, consumed, complete, err := decodeChunkedBody(body); err == nil && complete {
+				msg.Body = string(decoded)
+				msg.BodySizeBytes = len(msg.Body)
+				msg.BodyPartial = false
+				msg.ConsumedBytes = bodyStart + consumed
+				return msg, true, nil
+			}
 			if preview, ok := decodeChunkedBodyPreview(body); ok {
 				msg.Body = string(preview)
 			} else {
@@ -314,6 +321,19 @@ func buildFallbackHTTPResponse(data []byte) (*ParsedMessage, bool) {
 	if raw := headers["Content-Length"]; raw != "" {
 		if v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); err == nil {
 			msg.ContentLength = v
+		}
+	}
+	if msg.Chunked {
+		body := data[headerEnd+len(headerSeparator):]
+		if decoded, consumed, complete, err := decodeChunkedBody(body); err == nil {
+			if complete {
+				msg.Body = string(decoded)
+				msg.BodyPartial = false
+				msg.ConsumedBytes = headerEnd + len(headerSeparator) + consumed
+			} else if preview, ok := decodeChunkedBodyPreview(body); ok {
+				msg.Body = string(preview)
+				msg.BodyPartial = true
+			}
 		}
 	}
 	return msg, true
@@ -539,6 +559,14 @@ func decodeChunkedBody(data []byte) ([]byte, int, bool, error) {
 	for {
 		lineEnd := bytes.Index(data[cursor:], []byte("\r\n"))
 		if lineEnd < 0 {
+			/* 抓取流可能在 chunked 结束块 "0\r\n\r\n" 上进一步少 1~2 个字节，
+			 * 例如只剩 "0" 或 "0\r"。这时 body 实际已经完整，只是终止符不完整。
+			 * 对这种终止块做容错，避免把完整的小响应误判成 partial。
+			 */
+			tail := strings.TrimSpace(string(data[cursor:]))
+			if tail == "0" {
+				return out.Bytes(), len(data), true, nil
+			}
 			return nil, 0, false, nil
 		}
 
@@ -554,6 +582,14 @@ func decodeChunkedBody(data []byte) ([]byte, int, bool, error) {
 		cursor += lineEnd + 2
 
 		if size == 0 {
+			/* 部分内核/抓取路径会在 chunked 结束块 "0\r\n\r\n" 的最后一个
+			 * 空行上丢 2 个字节，但此时 body 实际已经完整。对可观测性来说，
+			 * 只缺最终 trailer terminator 时，优先把它视为“complete enough”，
+			 * 避免把完整的小响应误标成 truncated。
+			 */
+			if len(data[cursor:]) == 0 {
+				return out.Bytes(), cursor, true, nil
+			}
 			if len(data[cursor:]) < 2 {
 				return nil, 0, false, nil
 			}
@@ -575,6 +611,14 @@ func decodeChunkedBody(data []byte) ([]byte, int, bool, error) {
 		out.Write(data[cursor : cursor+int(size)])
 		cursor += int(size)
 		if !bytes.HasPrefix(data[cursor:], []byte("\r\n")) {
+			/* 某些响应在 chunk body 之后会丢掉本应存在的 "\r\n"，
+			 * 但终止块 "0\r\n\r\n" 已经到了。这种场景正文其实完整，
+			 * 缺的仍然只是 framing，不应再判成 partial。
+			 */
+			switch string(data[cursor:]) {
+			case "0", "0\r", "0\r\n", "0\r\n\r", "0\r\n\r\n":
+				return out.Bytes(), len(data), true, nil
+			}
 			return nil, 0, false, fmt.Errorf("missing CRLF after chunk body")
 		}
 		cursor += 2
@@ -630,6 +674,82 @@ func decodeChunkedBodyPreview(data []byte) ([]byte, bool) {
 	}
 
 	return out.Bytes(), progress
+}
+
+// decodeChunkedBodyMissingOnlyFraming 判断 chunked 正文是否已经完整，
+// 只是缺少最后的 framing（例如 \r\n0\r\n\r\n）。
+// 返回 decoded 正文、仍缺失的 framing 字节数，以及是否命中该场景。
+func decodeChunkedBodyMissingOnlyFraming(data []byte) ([]byte, int, bool) {
+	var out bytes.Buffer
+	cursor := 0
+
+	for {
+		lineEnd := bytes.Index(data[cursor:], []byte("\r\n"))
+		if lineEnd < 0 {
+			switch string(data[cursor:]) {
+			case "0":
+				return out.Bytes(), 4, true
+			case "0\r":
+				return out.Bytes(), 3, true
+			case "0\r\n":
+				return out.Bytes(), 2, true
+			case "0\r\n\r":
+				return out.Bytes(), 1, true
+			default:
+				return nil, 0, false
+			}
+		}
+
+		line := strings.TrimSpace(string(data[cursor : cursor+lineEnd]))
+		sizeToken := line
+		if i := strings.Index(sizeToken, ";"); i >= 0 {
+			sizeToken = sizeToken[:i]
+		}
+		size, err := strconv.ParseInt(sizeToken, 16, 64)
+		if err != nil || size < 0 {
+			return nil, 0, false
+		}
+		cursor += lineEnd + 2
+
+		if size == 0 {
+			rem := data[cursor:]
+			switch {
+			case len(rem) == 0:
+				return out.Bytes(), 2, true
+			case bytes.Equal(rem, []byte("\r")):
+				return out.Bytes(), 1, true
+			case bytes.HasPrefix(rem, []byte("\r\n")):
+				return out.Bytes(), 0, true
+			default:
+				trailerEnd := bytes.Index(rem, headerSeparator)
+				if trailerEnd >= 0 {
+					return out.Bytes(), 0, true
+				}
+				return nil, 0, false
+			}
+		}
+
+		if len(data[cursor:]) < int(size) {
+			return nil, 0, false
+		}
+		out.Write(data[cursor : cursor+int(size)])
+		cursor += int(size)
+
+		switch {
+		case len(data[cursor:]) == 0:
+			return out.Bytes(), 7, true
+		case bytes.Equal(data[cursor:], []byte("\r")):
+			return out.Bytes(), 6, true
+		case len(data[cursor:]) < 2:
+			return nil, 0, false
+		case !bytes.HasPrefix(data[cursor:], []byte("\r\n")):
+			return nil, 0, false
+		}
+		cursor += 2
+		if len(data[cursor:]) == 0 {
+			return out.Bytes(), 5, true
+		}
+	}
 }
 
 func hasNoBody(direction uint8, msg *ParsedMessage, headers textproto.MIMEHeader, opts ParseOptions) bool {

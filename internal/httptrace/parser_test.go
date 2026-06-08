@@ -1,6 +1,7 @@
 package httptrace
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -40,6 +41,75 @@ func TestTryParseChunkedResponse(t *testing.T) {
 		t.Fatalf("status mismatch: got %d want %d", got, want)
 	}
 	if got, want := msg.Body, "Wikipedia"; got != want {
+		t.Fatalf("body mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestTryParseChunkedResponseWithoutFinalTrailerCRLFTreatsBodyAsCompleteEnough(t *testing.T) {
+	body := `{"errCode":"-100","errMsg":"forbidden"}`
+	raw := []byte(fmt.Sprintf(
+		"HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n",
+		len(body), body,
+	))
+
+	msg, complete, err := TryParseMessage(DirectionResponse, raw, ParseOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !complete {
+		t.Fatalf("response should be treated as complete-enough")
+	}
+	if got, want := msg.StatusCode, 403; got != want {
+		t.Fatalf("status mismatch: got %d want %d", got, want)
+	}
+	if msg.BodyPartial {
+		t.Fatalf("body should not be marked partial when only final trailer CRLF is missing")
+	}
+	if got, want := msg.Body, body; got != want {
+		t.Fatalf("body mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestTryParseChunkedResponseWithOnlyTerminalZeroTreatsBodyAsCompleteEnough(t *testing.T) {
+	body := `{"errCode":"-100","errMsg":"forbidden"}`
+	raw := []byte(fmt.Sprintf(
+		"HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0",
+		len(body), body,
+	))
+
+	msg, complete, err := TryParseMessage(DirectionResponse, raw, ParseOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !complete {
+		t.Fatalf("response should be treated as complete-enough")
+	}
+	if msg.BodyPartial {
+		t.Fatalf("body should not be marked partial when terminal zero chunk is cut at EOF")
+	}
+	if got, want := msg.Body, body; got != want {
+		t.Fatalf("body mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestTryParseChunkedResponseMissingCRLFBeforeTerminalZeroTreatsBodyAsCompleteEnough(t *testing.T) {
+	body := `{"errCode":"-100","errMsg":"forbidden"}`
+	raw := []byte(fmt.Sprintf(
+		"HTTP/1.1 200 \r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s0\r\n\r\n",
+		len(body), body,
+	))
+
+	msg, complete, err := TryParseMessage(DirectionResponse, raw, ParseOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !complete {
+		t.Fatalf("response should be treated as complete-enough")
+	}
+	if msg.BodyPartial {
+		t.Fatalf("body should not be marked partial when only CRLF before terminal zero is missing")
+	}
+	if got, want := msg.Body, body; got != want {
 		t.Fatalf("body mismatch: got %q want %q", got, want)
 	}
 }
@@ -86,6 +156,28 @@ func TestTryParsePartialResponseHead(t *testing.T) {
 	}
 	if !msg.BodyPartial {
 		t.Fatalf("expected partial body marker for truncated response head")
+	}
+}
+
+func TestTryParsePartialHeadChunkedBodyCompleteEnoughDoesNotStayPartial(t *testing.T) {
+	body := `{"errCode":"-100","errMsg":"forbidden"}`
+	raw := []byte(fmt.Sprintf(
+		"HTTP/1.1 200 \r\nServer: POWERLBS\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n%x\r\n%s0\r\n\r\n",
+		len(body), body,
+	))
+
+	msg, ok, err := TryParsePartialHead(DirectionResponse, raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("partial head should be parseable")
+	}
+	if msg.BodyPartial {
+		t.Fatalf("body should not remain partial when chunked body is complete-enough in partial-head path")
+	}
+	if got, want := msg.Body, body; got != want {
+		t.Fatalf("body mismatch: got %q want %q", got, want)
 	}
 }
 
@@ -169,10 +261,28 @@ func TestBuildSyntheticResponseStripsHTTPHeadersFromBody(t *testing.T) {
 	if strings.HasPrefix(msg.Body, "HTTP/1.1") {
 		t.Fatalf("body should not include response head: %q", msg.Body)
 	}
-	if got, want := msg.Body, "c4e\r\n{\"errCode\":\"0\""; got != want {
+	if got, want := msg.Body, "{\"errCode\":\"0\""; got != want {
 		t.Fatalf("body mismatch: got %q want %q", got, want)
 	}
 	if !msg.BodyPartial {
 		t.Fatalf("synthetic response should still be marked partial")
+	}
+}
+
+func TestBuildSyntheticResponseDecodesCompleteChunkedBodyFromFallbackHead(t *testing.T) {
+	body := `{"errCode":"-100","errMsg":"无权限访问，无法获取用户信息！"}`
+	raw := []byte(fmt.Sprintf("HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n", len(body), body))
+	msg, ok := BuildSyntheticResponse(raw)
+	if !ok {
+		t.Fatalf("expected synthetic response")
+	}
+	if got, want := msg.StartLine, "HTTP/1.1"; got != want {
+		t.Fatalf("start line mismatch: got %q want %q", got, want)
+	}
+	if got, want := msg.Body, body; got != want {
+		t.Fatalf("body mismatch: got %q want %q", got, want)
+	}
+	if msg.BodyPartial {
+		t.Fatalf("body should not be marked partial after complete chunk decode")
 	}
 }

@@ -1432,6 +1432,37 @@ static __attribute__((noinline)) int emit_chunk_once_legacy(void *ctx,
 			       state->common_flags, state->capture_limit);
 }
 
+/* legacy 4.19 verifier 路径不能接受通用 iov for-loop。
+ * 之前这里只固定展开了前 3 个 iov 段；如果 sendmsg 把同一条 HTTP 响应拆成更多 iov，
+ * observed_message_bytes 会按整条 iter.count 正常累计，但真正送到用户态的 payload
+ * 只包含前 3 段，最终表现成：
+ * - body 实际只有几 KB
+ * - observed_message_bytes 却已经十几万
+ * - 用户态在 32KB 处被迫截断
+ *
+ * 这里继续保持“固定展开 + noinline helper”的 verifier 友好形式，
+ * 但把可覆盖的 iov 段扩到 8 个，让前 32KB 明文更接近完整上送。
+ */
+#define DEFINE_CAPTURE_IOV_SLOT_LEGACY(fn_name, slot_idx)                                      \
+static __attribute__((noinline)) int fn_name(void *ctx, struct capture_call *call,            \
+						      struct legacy_capture_state *state)        \
+{                                                                                              \
+	if (!call->iter)                                                                       \
+		return 0;                                                                      \
+	if (state->captured >= call->total_len || state->total_captured >= state->capture_limit)\
+		return 0;                                                                      \
+	if (load_iter_segment(call->iter, slot_idx, &state->base, &state->seg_len) < 0)      \
+		return 0;                                                                      \
+	if (!state->base || state->seg_len == 0)                                               \
+		return 0;                                                                      \
+	if (state->seg_len > call->total_len - state->captured)                               \
+		state->seg_len = call->total_len - state->captured;                           \
+	if (state->seg_len > state->capture_limit - state->total_captured)                    \
+		state->seg_len = state->capture_limit - state->total_captured;                \
+	EMIT_CHUNK_LEGACY_8();                                                                  \
+	return 0;                                                                              \
+}
+
 static __attribute__((noinline)) int capture_iov_slot0_legacy(void *ctx, struct capture_call *call,
 							      struct legacy_capture_state *state)
 {
@@ -1453,47 +1484,13 @@ static __attribute__((noinline)) int capture_iov_slot0_legacy(void *ctx, struct 
 	return 0;
 }
 
-static __attribute__((noinline)) int capture_iov_slot1_legacy(void *ctx, struct capture_call *call,
-							      struct legacy_capture_state *state)
-{
-	if (!call->iter)
-		return 0;
-	if (state->captured >= call->total_len || state->total_captured >= state->capture_limit)
-		return 0;
-	if (load_iter_segment(call->iter, 1, &state->base, &state->seg_len) < 0)
-		return 0;
-	if (!state->base || state->seg_len == 0)
-		return 0;
-
-	if (state->seg_len > call->total_len - state->captured)
-		state->seg_len = call->total_len - state->captured;
-	if (state->seg_len > state->capture_limit - state->total_captured)
-		state->seg_len = state->capture_limit - state->total_captured;
-
-	EMIT_CHUNK_LEGACY_8();
-	return 0;
-}
-
-static __attribute__((noinline)) int capture_iov_slot2_legacy(void *ctx, struct capture_call *call,
-							      struct legacy_capture_state *state)
-{
-	if (!call->iter)
-		return 0;
-	if (state->captured >= call->total_len || state->total_captured >= state->capture_limit)
-		return 0;
-	if (load_iter_segment(call->iter, 2, &state->base, &state->seg_len) < 0)
-		return 0;
-	if (!state->base || state->seg_len == 0)
-		return 0;
-
-	if (state->seg_len > call->total_len - state->captured)
-		state->seg_len = call->total_len - state->captured;
-	if (state->seg_len > state->capture_limit - state->total_captured)
-		state->seg_len = state->capture_limit - state->total_captured;
-
-	EMIT_CHUNK_LEGACY_8();
-	return 0;
-}
+DEFINE_CAPTURE_IOV_SLOT_LEGACY(capture_iov_slot1_legacy, 1)
+DEFINE_CAPTURE_IOV_SLOT_LEGACY(capture_iov_slot2_legacy, 2)
+DEFINE_CAPTURE_IOV_SLOT_LEGACY(capture_iov_slot3_legacy, 3)
+DEFINE_CAPTURE_IOV_SLOT_LEGACY(capture_iov_slot4_legacy, 4)
+DEFINE_CAPTURE_IOV_SLOT_LEGACY(capture_iov_slot5_legacy, 5)
+DEFINE_CAPTURE_IOV_SLOT_LEGACY(capture_iov_slot6_legacy, 6)
+DEFINE_CAPTURE_IOV_SLOT_LEGACY(capture_iov_slot7_legacy, 7)
 
 /* 4.19 verifier 不接受 capture_message_from_iter 里编译器残留的回边。
  * legacy 对象把 iov/chunk 展开成固定分支，专门换取“稳定可加载”。
@@ -1535,6 +1532,16 @@ static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct
 			if (capture_iov_slot1_legacy(ctx, call, &state) < 0)
 				return -1;
 			if (capture_iov_slot2_legacy(ctx, call, &state) < 0)
+				return -1;
+			if (capture_iov_slot3_legacy(ctx, call, &state) < 0)
+				return -1;
+			if (capture_iov_slot4_legacy(ctx, call, &state) < 0)
+				return -1;
+			if (capture_iov_slot5_legacy(ctx, call, &state) < 0)
+				return -1;
+			if (capture_iov_slot6_legacy(ctx, call, &state) < 0)
+				return -1;
+			if (capture_iov_slot7_legacy(ctx, call, &state) < 0)
 				return -1;
 			captured = state.captured;
 			total_captured = state.total_captured;
@@ -1892,7 +1899,7 @@ static __attribute__((noinline)) __u64 select_response_chain(struct flow_state *
  * - 新请求命中请求行时，分配新的 chain_id。
  * - 同一请求的后续 recvmsg 调用沿用同一个 chain_id，并继续累计 fragment 索引。
  */
-static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgid, __s64 ret)
+static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgid, __s32 ret)
 {
 	struct recv_args *meta = NULL;
 	struct recv_args emit_meta = {};
@@ -2348,7 +2355,15 @@ int BPF_KRETPROBE(kretprobe_sock_recvmsg)
 {
 #ifdef LEGACY_VERIFIER
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	__s64 ret = PT_REGS_RC(ctx);
+	/* 4.x vendor kernel 上 sock_recvmsg/tcp_recvmsg 的返回类型本质是 int。
+	 * 直接按 64-bit 读取时，负错误码偶发会以“低 32 位为负值、高 32 位为 0”的形式出现，
+	 * 例如 -11 被读成 0x00000000fffffff5 (= 4294967285)。
+	 * 这会绕过 ret<=0 的保护，继续把一次失败 recv 当成超大正向读取处理，
+	 * 最终在用户态表现成脏 request / observed_message_bytes 异常大。
+	 *
+	 * 因此这里明确先收窄到 __s32，再交给统一的返回路径。
+	 */
+	__s32 ret = (__s32)PT_REGS_RC(ctx);
 	return handle_recv_return(ctx, pid_tgid, ret);
 #else
 	/* modern 对象上优先依赖 tcp_recvmsg 这条更稳定的 hook 完成实际读取。 */
@@ -2360,7 +2375,7 @@ SEC("kretprobe/tcp_recvmsg")
 int BPF_KRETPROBE(kretprobe_tcp_recvmsg)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	__s64 ret = PT_REGS_RC(ctx);
+	__s32 ret = (__s32)PT_REGS_RC(ctx);
 	return handle_recv_return(ctx, pid_tgid, ret);
 }
 

@@ -7,5 +7,5 @@
     delaycompress
     copytruncate
     dateext
-    create 0644 root root
+    dateformat -%Y%m%d-%s
 }

@@ -126,14 +126,24 @@ func (s *RedisStore) syncBodyLimitsOnce() {
 // 同步redis到内存
 func (s *RedisStore) syncRedisToMemory(ctx context.Context) error {
 	requestLimit, err := s.readBodyLimitBytes(ctx, requestKey)
+	requestMaxValueLock.RLock()
+	oldRequestLimit := currentRequestMaxValue
+	requestMaxValueLock.RUnlock()
 	requestMaxValueLock.Lock()
+	// 换算成字节
 	currentRequestMaxValue = requestLimit
 	requestMaxValueLock.Unlock()
 
 	responseLimit, respErr := s.readBodyLimitBytes(ctx, responseKey)
+	responseMaxValueLock.RLock()
+	oldResponseLimit := currentResponseMaxValue
+	responseMaxValueLock.RUnlock()
 	responseMaxValueLock.Lock()
 	currentResponseMaxValue = responseLimit
 	responseMaxValueLock.Unlock()
+	if requestLimit != oldRequestLimit || responseLimit != oldResponseLimit {
+		log.Printf("redis body limit synced request=%dB response=%dB", requestLimit, responseLimit)
+	}
 
 	if err != nil {
 		return err
