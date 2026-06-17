@@ -38,14 +38,26 @@ generate:
 	rm -f internal/bpfgen/httptrace_arm64_bpfel.go internal/bpfgen/httptrace_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracecompact_x86_bpfel.go internal/bpfgen/httptracecompact_x86_bpfel.o
 	rm -f internal/bpfgen/httptracecompact_arm64_bpfel.go internal/bpfgen/httptracecompact_arm64_bpfel.o
+	rm -f internal/bpfgen/httptracetcponly_x86_bpfel.go internal/bpfgen/httptracetcponly_x86_bpfel.o
+	rm -f internal/bpfgen/httptracetcponly_arm64_bpfel.go internal/bpfgen/httptracetcponly_arm64_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlycompact_x86_bpfel.go internal/bpfgen/httptracetcponlycompact_x86_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlycompact_arm64_bpfel.go internal/bpfgen/httptracetcponlycompact_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracev66_x86_bpfel.go internal/bpfgen/httptracev66_x86_bpfel.o
 	rm -f internal/bpfgen/httptracev66_arm64_bpfel.go internal/bpfgen/httptracev66_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracev6_x86_bpfel.go internal/bpfgen/httptracev6_x86_bpfel.o
 	rm -f internal/bpfgen/httptracev6_arm64_bpfel.go internal/bpfgen/httptracev6_arm64_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv66_x86_bpfel.go internal/bpfgen/httptracetcponlyv66_x86_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv66_arm64_bpfel.go internal/bpfgen/httptracetcponlyv66_arm64_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv6_x86_bpfel.go internal/bpfgen/httptracetcponlyv6_x86_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv6_arm64_bpfel.go internal/bpfgen/httptracetcponlyv6_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracev66compact_x86_bpfel.go internal/bpfgen/httptracev66compact_x86_bpfel.o
 	rm -f internal/bpfgen/httptracev66compact_arm64_bpfel.go internal/bpfgen/httptracev66compact_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracev6compact_x86_bpfel.go internal/bpfgen/httptracev6compact_x86_bpfel.o
 	rm -f internal/bpfgen/httptracev6compact_arm64_bpfel.go internal/bpfgen/httptracev6compact_arm64_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv66compact_x86_bpfel.go internal/bpfgen/httptracetcponlyv66compact_x86_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv66compact_arm64_bpfel.go internal/bpfgen/httptracetcponlyv66compact_arm64_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv6compact_x86_bpfel.go internal/bpfgen/httptracetcponlyv6compact_x86_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv6compact_arm64_bpfel.go internal/bpfgen/httptracetcponlyv6compact_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracelegacy_x86_bpfel.go internal/bpfgen/httptracelegacy_x86_bpfel.o
 	rm -f internal/bpfgen/httptracelegacy_arm64_bpfel.go internal/bpfgen/httptracelegacy_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracelegacyuserread_x86_bpfel.go internal/bpfgen/httptracelegacyuserread_x86_bpfel.o
@@ -76,14 +88,26 @@ clean-generated:
 	rm -f internal/bpfgen/httptrace_arm64_bpfel.go internal/bpfgen/httptrace_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracecompact_x86_bpfel.go internal/bpfgen/httptracecompact_x86_bpfel.o
 	rm -f internal/bpfgen/httptracecompact_arm64_bpfel.go internal/bpfgen/httptracecompact_arm64_bpfel.o
+	rm -f internal/bpfgen/httptracetcponly_x86_bpfel.go internal/bpfgen/httptracetcponly_x86_bpfel.o
+	rm -f internal/bpfgen/httptracetcponly_arm64_bpfel.go internal/bpfgen/httptracetcponly_arm64_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlycompact_x86_bpfel.go internal/bpfgen/httptracetcponlycompact_x86_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlycompact_arm64_bpfel.go internal/bpfgen/httptracetcponlycompact_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracev66_x86_bpfel.go internal/bpfgen/httptracev66_x86_bpfel.o
 	rm -f internal/bpfgen/httptracev66_arm64_bpfel.go internal/bpfgen/httptracev66_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracev6_x86_bpfel.go internal/bpfgen/httptracev6_x86_bpfel.o
 	rm -f internal/bpfgen/httptracev6_arm64_bpfel.go internal/bpfgen/httptracev6_arm64_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv66_x86_bpfel.go internal/bpfgen/httptracetcponlyv66_x86_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv66_arm64_bpfel.go internal/bpfgen/httptracetcponlyv66_arm64_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv6_x86_bpfel.go internal/bpfgen/httptracetcponlyv6_x86_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv6_arm64_bpfel.go internal/bpfgen/httptracetcponlyv6_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracev66compact_x86_bpfel.go internal/bpfgen/httptracev66compact_x86_bpfel.o
 	rm -f internal/bpfgen/httptracev66compact_arm64_bpfel.go internal/bpfgen/httptracev66compact_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracev6compact_x86_bpfel.go internal/bpfgen/httptracev6compact_x86_bpfel.o
 	rm -f internal/bpfgen/httptracev6compact_arm64_bpfel.go internal/bpfgen/httptracev6compact_arm64_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv66compact_x86_bpfel.go internal/bpfgen/httptracetcponlyv66compact_x86_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv66compact_arm64_bpfel.go internal/bpfgen/httptracetcponlyv66compact_arm64_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv6compact_x86_bpfel.go internal/bpfgen/httptracetcponlyv6compact_x86_bpfel.o
+	rm -f internal/bpfgen/httptracetcponlyv6compact_arm64_bpfel.go internal/bpfgen/httptracetcponlyv6compact_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracelegacy_x86_bpfel.go internal/bpfgen/httptracelegacy_x86_bpfel.o
 	rm -f internal/bpfgen/httptracelegacy_arm64_bpfel.go internal/bpfgen/httptracelegacy_arm64_bpfel.o
 	rm -f internal/bpfgen/httptracelegacyuserread_x86_bpfel.go internal/bpfgen/httptracelegacyuserread_x86_bpfel.o

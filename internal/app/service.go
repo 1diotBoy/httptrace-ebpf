@@ -948,6 +948,7 @@ func (s *Service) resolveEvent(event httptrace.Event) (httptrace.Event, resolveS
 	if s.cfg.DisableUserTuple {
 		return event, resolveBypass
 	}
+	// 开启补偿解析
 	resolved, source := s.resolver.Resolve(event)
 	if source == resolveMiss {
 		return event, source

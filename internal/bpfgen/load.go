@@ -342,7 +342,7 @@ func loadLegacyTCPBothObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, err
 }
 
 func loadTCPOnlyObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
-	spec, err := LoadHttpTrace()
+	spec, err := LoadHttpTraceTCPOnly()
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +350,7 @@ func loadTCPOnlyObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
 }
 
 func loadTCPOnlyCompactObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
-	spec, err := LoadHttpTraceCompact()
+	spec, err := LoadHttpTraceTCPOnlyCompact()
 	if err != nil {
 		return nil, err
 	}
@@ -358,7 +358,7 @@ func loadTCPOnlyCompactObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, er
 }
 
 func loadTCPOnlyV6Objects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
-	spec, err := LoadHttpTraceV6()
+	spec, err := LoadHttpTraceTCPOnlyV6()
 	if err != nil {
 		return nil, err
 	}
@@ -366,7 +366,7 @@ func loadTCPOnlyV6Objects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) 
 }
 
 func loadTCPOnlyV66Objects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
-	spec, err := LoadHttpTraceV66()
+	spec, err := LoadHttpTraceTCPOnlyV66()
 	if err != nil {
 		return nil, err
 	}
@@ -374,7 +374,7 @@ func loadTCPOnlyV66Objects(opts *ebpf.CollectionOptions) (*LoadedObjects, error)
 }
 
 func loadTCPOnlyV6CompactObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
-	spec, err := LoadHttpTraceV6Compact()
+	spec, err := LoadHttpTraceTCPOnlyV6Compact()
 	if err != nil {
 		return nil, err
 	}
@@ -382,7 +382,7 @@ func loadTCPOnlyV6CompactObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, 
 }
 
 func loadTCPOnlyV66CompactObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
-	spec, err := LoadHttpTraceV66Compact()
+	spec, err := LoadHttpTraceTCPOnlyV66Compact()
 	if err != nil {
 		return nil, err
 	}

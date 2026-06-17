@@ -1,4 +1,4 @@
-./httptrace
-./power-httptrace.service
-./power-httptrace.sysconfig
-./power-httptrace.logrotate
+././sources/httptrace
+././sources/power-httptrace.service
+././sources/sysconfig/power-httptrace
+././sources/logrotate/power-httptrace

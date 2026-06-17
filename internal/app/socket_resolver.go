@@ -61,6 +61,7 @@ func missingTuple(event httptrace.Event) bool {
 
 // 解析五元组
 func (r *socketResolver) Resolve(event httptrace.Event) (httptrace.Event, resolveSource) {
+	// 如果 PID 为 0，或者 FD 小于 0，或者五元组不缺失，则直接返回
 	if event.PID == 0 || event.FD < 0 || !missingTuple(event) {
 		return event, resolveMiss
 	}
@@ -132,6 +133,7 @@ func resolveSocketTuple(pid uint32, fd int32) (cachedSocketTuple, bool) {
 	return lookupSocketTuple(pid, inode)
 }
 
+// 解析 socket 的 inode，通过 /proc/pid/fd/fd 文件获取
 func resolveSocketInode(pid uint32, fd int32) (string, bool) {
 	link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%d", pid, fd))
 	if err != nil {

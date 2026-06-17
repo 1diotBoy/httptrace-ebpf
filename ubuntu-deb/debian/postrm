@@ -4,6 +4,8 @@ set -e
 if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
     systemctl stop power-httptrace.service || true
     systemctl disable power-httptrace.service || true
+    systemctl daemon-reload || true # 重新加载systemd服务
+    systemctl reset-failed || true # 重置失败的服务
 fi
 
 exit 0

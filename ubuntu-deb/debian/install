@@ -1,8 +1,8 @@
 # 二进制文件
-httptrace  /app/soft/power-httptrace/bin/
+./sources/httptrace  /app/soft/power-httptrace/bin/
 # systemd 服务
-power-httptrace.service  /lib/systemd/system/
+./sources/power-httptrace.service  /lib/systemd/system/
 # sysconfig 配置
-power-httptrace.sysconfig  /etc/sysconfig/
+./sources/sysconfig/power-httptrace  /etc/sysconfig/
 # 日志轮转
-power-httptrace.logrotate  /etc/logrotate.d/
+./sources/logrotate/power-httptrace  /etc/logrotate.d/

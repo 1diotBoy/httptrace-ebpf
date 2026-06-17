@@ -307,6 +307,46 @@ func TestResolveEventBypassesUserTuplePipeline(t *testing.T) {
 	}
 }
 
+func TestDefaultConfigEnablesUserTuplePipeline(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.DisableUserTuple {
+		t.Fatalf("default config should enable user tuple compensation")
+	}
+}
+
+func TestResolveEventUsesResolverWhenTupleMissing(t *testing.T) {
+	resolver := newSocketResolver(time.Second)
+	key := socketKey{pid: 123, fd: 7, sockID: 88}
+	resolver.storeCache(key, cachedSocketTuple{
+		localIP:    "172.16.0.10",
+		remoteIP:   "172.16.0.20",
+		localPort:  8080,
+		remotePort: 55000,
+	})
+	svc := &Service{
+		cfg:      DefaultConfig(),
+		resolver: resolver,
+		stats:    &stats{},
+	}
+
+	event := httptrace.Event{
+		PID:       123,
+		FD:        7,
+		SockID:    88,
+		Direction: httptrace.DirectionRequest,
+		SrcIP:     "0.0.0.0",
+		DstIP:     "0.0.0.0",
+	}
+
+	got, source := svc.resolveEvent(event)
+	if source != resolveFromCache {
+		t.Fatalf("expected resolveFromCache, got %v", source)
+	}
+	if got.SrcIP != "172.16.0.20" || got.DstIP != "172.16.0.10" || got.SrcPort != 55000 || got.DstPort != 8080 {
+		t.Fatalf("resolver tuple mismatch: got=%#v", got)
+	}
+}
+
 func TestStartWorkersUsesResourceSizedQueue(t *testing.T) {
 	svc := &Service{
 		cfg:          Config{BatchSize: 100, WorkerCount: 2, WorkerQueueSize: 256, FlushInterval: time.Second},

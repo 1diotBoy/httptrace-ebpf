@@ -34,7 +34,7 @@ type Config struct {
 	TLSComm              string // uprobes 目标进程名，默认 nginx
 	SuppressSocketForTLS bool   // 是否在 TLS 开启时抑制同 comm 的传统 socket 事件，默认不抑制，允许同时采 HTTP+HTTPS
 	DisableKernelFilter  bool   // 是否禁用内核态过滤 ，默认不禁用
-	DisableUserTuple     bool   // 是否禁用用户态过滤 ，默认禁用
+	DisableUserTuple     bool   // 是否禁用用户态 tuple 反补偿/过滤，默认启用
 	CaptureBytes         int    // 内核侧每个请求/响应最大采集字节数，默认32KB
 	PerfPages            int    // perf buffer 页数，默认64页
 	BatchSize            int    // 批量大小 ，默认100
@@ -123,7 +123,7 @@ func DefaultConfig() Config {
 		SuppressSocketForTLS: false,
 		CaptureBytes:         32 * 1024,
 		DisableKernelFilter:  false,
-		DisableUserTuple:     true,
+		DisableUserTuple:     false,
 		PerfPages:            64,
 		BatchSize:            100,
 		WorkerCount:          min(runtime.NumCPU(), 8),

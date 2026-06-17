@@ -1,2 +1,2 @@
-/etc/logrotate.d/power-httptrace.logrotate
-/etc/sysconfig/power-httptrace.sysconfig
+/etc/logrotate.d/power-httptrace
+/etc/sysconfig/power-httptrace

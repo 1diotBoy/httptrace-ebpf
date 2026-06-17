@@ -149,31 +149,35 @@ static __always_inline int capture_enabled(void)
 	return (read_debug_flags() & DEBUG_FLAG_CAPTURE_DISABLED) == 0;
 }
 
-static __always_inline int legacy_send_primary_tcp(void)
+static __always_inline __attribute__((unused)) int legacy_send_primary_tcp(void)
 {
 	return (read_debug_flags() & DEBUG_FLAG_LEGACY_SEND_PRIMARY_TCP) != 0;
 }
 
-static __always_inline int legacy_recv_primary_tcp(void)
+static __always_inline __attribute__((unused)) int legacy_recv_primary_tcp(void)
 {
 	return (read_debug_flags() & DEBUG_FLAG_LEGACY_RECV_PRIMARY_TCP) != 0;
 }
 
-static __always_inline int source_is_tcp(__u8 source)
+static __always_inline __attribute__((unused)) int source_is_tcp(__u8 source)
 {
 	return source == SRC_TCP_SENDMSG || source == SRC_TCP_RECVMSG;
 }
 
-static __always_inline int source_is_send(__u8 source)
+static __always_inline __attribute__((unused)) int source_is_send(__u8 source)
 {
 	return source == SRC_SOCK_SENDMSG || source == SRC_TCP_SENDMSG;
 }
 
 static __always_inline int payload_primary_for_source(__u8 source)
 {
+#ifdef TCP_ONLY_LEAN
+	return 1;
+#else
 	if (!source_is_send(source))
 		return source_is_tcp(source) ? legacy_recv_primary_tcp() : !legacy_recv_primary_tcp();
 	return source_is_tcp(source) ? legacy_send_primary_tcp() : !legacy_send_primary_tcp();
+#endif
 }
 
 static __always_inline int extract_sk(void *sock_ptr, struct sock_compat **sk)
@@ -243,6 +247,7 @@ fail:
 	return -1;
 }
 
+// IPv4 映射到 IPv6 的地址
 static __always_inline __attribute__((unused)) int extract_ipv4_mapped_v6(const __u8 addr[16], __u32 *ip)
 {
 	if (addr[0] != 0 || addr[1] != 0 || addr[2] != 0 || addr[3] != 0 ||
@@ -254,6 +259,7 @@ static __always_inline __attribute__((unused)) int extract_ipv4_mapped_v6(const 
 	return 0;
 }
 
+// 存储五元组到缓存
 static __always_inline __attribute__((unused)) int store_tuple_cache(__u64 sock_id, const struct tuple_cache_entry *entry)
 {
 	struct kernel_stats *stats = stats_lookup();
@@ -814,7 +820,7 @@ static __always_inline __u32 trim_http_prefix_padding(const char *buf, __u32 len
 	return off;
 }
 
-#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER) || defined(TCP_ONLY_LEAN)
 static __always_inline __u32 read_prefix_legacy_bytes(const char *base, __u64 skip, __u64 available, char *buf, __u32 buf_len)
 {
 	__u32 copied = 0;
@@ -858,6 +864,27 @@ static __always_inline __u32 read_prefix_legacy_bytes(const char *base, __u64 sk
 }
 #endif
 
+#ifdef TCP_ONLY_LEAN
+static __attribute__((noinline)) int read_prefix_from_iter_lean(const struct iov_iter_compat *iter, char *buf, __u32 buf_len)
+{
+	struct kernel_stats *stats = stats_lookup();
+	const char *base = NULL;
+	__u64 seg_len = 0;
+	__u32 copied = 0;
+
+	if (!iter || !buf || !buf_len)
+		return 0;
+	if (load_iter_segment(iter, 0, &base, &seg_len) >= 0 && base && seg_len)
+		return read_prefix_legacy_bytes(base, 0, seg_len, buf, buf_len);
+	if (load_iter_segment(iter, 1, &base, &seg_len) < 0 || !base || !seg_len)
+		return 0;
+	copied = read_prefix_legacy_bytes(base, 0, seg_len, buf, buf_len);
+	if (copied > 0 && stats)
+		stats->prefix_second_iov += 1;
+	return copied;
+}
+#endif
+
 static __always_inline int read_prefix_from_iter(const struct iov_iter_compat *iter, char *buf, __u32 buf_len)
 {
 	struct kernel_stats *stats = stats_lookup();
@@ -867,6 +894,10 @@ static __always_inline int read_prefix_from_iter(const struct iov_iter_compat *i
 	__u64 seg_len1 = 0;
 	__u64 available = 0;
 	__u32 copied = 0;
+
+#ifdef TCP_ONLY_LEAN
+	return read_prefix_from_iter_lean(iter, buf, buf_len);
+#endif
 
 	if (load_iter_segment(iter, 0, &base0, &seg_len0) < 0 || !base0 || !seg_len0)
 		return 0;
@@ -1088,7 +1119,7 @@ static __attribute__((noinline)) int starts_with_http_response(const struct iov_
 	if (!iter)
 		return 0;
 	prefix_len = read_prefix_from_iter(iter, prefix, sizeof(prefix));
-#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER) || defined(TCP_ONLY_LEAN)
 	return looks_like_http_response(prefix, prefix_len);
 #else
 	struct kernel_stats *stats = stats_lookup();
@@ -1672,12 +1703,20 @@ static __always_inline int stash_fd(__u64 pid_tgid, __s32 fd, void *map)
 
 static __always_inline void clear_send_guard(__u64 pid_tgid)
 {
+#ifdef TCP_ONLY_LEAN
+	return;
+#else
 	bpf_map_delete_elem(&send_guard_map, &pid_tgid);
+#endif
 }
 
 static __always_inline void clear_recv_guard(__u64 pid_tgid)
 {
+#ifdef TCP_ONLY_LEAN
+	return;
+#else
 	bpf_map_delete_elem(&recv_guard_map, &pid_tgid);
+#endif
 }
 
 enum send_guard_result {
@@ -1701,6 +1740,9 @@ enum recv_guard_result {
  */
 static __always_inline int claim_send_guard(__u64 pid_tgid, struct msghdr_compat *msg, __u8 source)
 {
+#ifdef TCP_ONLY_LEAN
+	return SEND_GUARD_PAYLOAD_AND_COUNT;
+#else
 	struct send_guard guard = {};
 	struct send_guard *existing = NULL;
 	__u64 msg_ptr = (__u64)msg;
@@ -1735,10 +1777,14 @@ static __always_inline int claim_send_guard(__u64 pid_tgid, struct msghdr_compat
 	guard.observed_accounted = payload_primary ? 0 : 1;
 	bpf_map_update_elem(&send_guard_map, &pid_tgid, &guard, BPF_ANY);
 	return payload_primary ? SEND_GUARD_PAYLOAD_AND_COUNT : SEND_GUARD_META_AND_COUNT;
+#endif
 }
 
 static __always_inline int claim_recv_guard(__u64 pid_tgid, struct msghdr_compat *msg, __u8 source)
 {
+#ifdef TCP_ONLY_LEAN
+	return RECV_GUARD_STORE;
+#else
 	struct recv_guard guard = {};
 	struct recv_guard *existing = NULL;
 	__u64 msg_ptr = (__u64)msg;
@@ -1771,6 +1817,7 @@ static __always_inline int claim_recv_guard(__u64 pid_tgid, struct msghdr_compat
 	guard.metadata_only = payload_primary ? 0 : 1;
 	bpf_map_update_elem(&recv_guard_map, &pid_tgid, &guard, BPF_ANY);
 	return RECV_GUARD_STORE;
+#endif
 }
 
 static __always_inline __s32 consume_fd(__u64 pid_tgid, void *map)
@@ -1936,7 +1983,7 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 	seq_hint = state->rx_cursor;
 
 	prefix_len = read_prefix_from_iter(&meta->saved_iter, prefix, sizeof(prefix));
-#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
+#if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER) || defined(TCP_ONLY_LEAN)
 	direction = detect_http_direction(prefix, prefix_len);
 	if (direction == DIR_UNKNOWN && looks_like_http_request_prefix(prefix, prefix_len))
 		direction = DIR_REQUEST;
@@ -1972,9 +2019,19 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 	}
 
 	emit_meta.seq_hint = seq_hint;
-	if (meta->metadata_only || state->req_capture_stopped) {
+	if (
+#ifdef TCP_ONLY_LEAN
+	    state->req_capture_stopped
+#else
+	    meta->metadata_only || state->req_capture_stopped
+#endif
+	) {
+#ifdef TCP_ONLY_LEAN
+		goto cleanup;
+#else
 		emit_meta.observed_accounted = 1;
 		emit_size_progress_event(ctx, &emit_meta, chain_id, DIR_REQUEST, state->req_observed_bytes);
+#endif
 	} else {
 		struct capture_call call = {};
 
@@ -2050,7 +2107,13 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 
 	scratch->meta.seq_hint = state->tx_cursor;
 
-	if (guard_action == SEND_GUARD_META_AND_COUNT) {
+	if (
+#ifndef TCP_ONLY_LEAN
+	    guard_action == SEND_GUARD_META_AND_COUNT
+#else
+	    0
+#endif
+	) {
 		emit_size_progress_event(ctx, &scratch->meta, chain_id, DIR_RESPONSE, state->resp_observed_bytes);
 		snapshot_send_debug(sk, msg, &scratch->meta, &scratch->iter, state, chain_id, source,
 				    DEBUG_STAGE_CAPTURE_OK, started_new_response);
@@ -2058,10 +2121,14 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 	}
 
 	if (state->resp_capture_stopped) {
+#ifdef TCP_ONLY_LEAN
+		return 0;
+#else
 		emit_size_progress_event(ctx, &scratch->meta, chain_id, DIR_RESPONSE, state->resp_observed_bytes);
 		snapshot_send_debug(sk, msg, &scratch->meta, &scratch->iter, state, chain_id, source,
 				    DEBUG_STAGE_CAPTURE_OK, started_new_response);
 		return 0;
+#endif
 	}
 
 	if (capture_response_message(ctx, &scratch->iter, &scratch->meta, state, source) < 0)

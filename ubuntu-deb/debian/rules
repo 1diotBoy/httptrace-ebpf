@@ -10,5 +10,5 @@ override_dh_fixperms:
 	dh_fixperms
 	chmod 0755 debian/power-httptrace/app/soft/power-httptrace/bin/httptrace
 	chmod 0644 debian/power-httptrace/lib/systemd/system/power-httptrace.service
-	chmod 0644 debian/power-httptrace/etc/sysconfig/power-httptrace.sysconfig
-	chmod 0644 debian/power-httptrace/etc/logrotate.d/power-httptrace.logrotate
+	chmod 0644 debian/power-httptrace/etc/sysconfig/power-httptrace
+	chmod 0644 debian/power-httptrace/etc/logrotate.d/power-httptrace

@@ -98,7 +98,6 @@ Java 消费端伪代码:
 
 Redis Key 说明:
   POWER-HTTP-TRACE       → List 结构, 存储全部 HTTP Trace JSON
-  AAA-diaoge-trace       → List 结构, 测试调试用备份
 ```
 
 每条 JSON 的关键字段：
