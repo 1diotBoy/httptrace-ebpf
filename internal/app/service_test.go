@@ -384,6 +384,53 @@ func TestSanitizeTraceForOutputKeepsKernelTuple(t *testing.T) {
 	}
 }
 
+func TestSanitizeTraceForOutputMarksMissingSrcIPWhenUserTupleDisabled(t *testing.T) {
+	svc := &Service{cfg: Config{DisableUserTuple: true}}
+	trace := httptrace.TraceDocument{
+		ChainID: 1,
+		SrcIP:   "0.0.0.0",
+		DstIP:   "10.0.0.2",
+		SrcPort: 1234,
+		DstPort: 80,
+	}
+
+	got := svc.sanitizeTraceForOutput(trace)
+	if got.SrcIP != "missing:user_tuple_disabled" {
+		t.Fatalf("unexpected src_ip marker: %#v", got)
+	}
+}
+
+func TestSanitizeTraceForOutputMarksMissingSrcIPForTLS(t *testing.T) {
+	svc := &Service{cfg: DefaultConfig()}
+	trace := httptrace.TraceDocument{
+		ChainID:       2,
+		CaptureSource: "tls_ssl_read",
+		SrcIP:         "0.0.0.0",
+		DstIP:         "10.0.0.2",
+	}
+
+	got := svc.sanitizeTraceForOutput(trace)
+	if got.SrcIP != "missing:tls_no_tuple" {
+		t.Fatalf("unexpected tls src_ip marker: %#v", got)
+	}
+}
+
+func TestSanitizeTraceForOutputMarksMissingSrcIPForPortOnlyKernelTuple(t *testing.T) {
+	svc := &Service{cfg: DefaultConfig()}
+	trace := httptrace.TraceDocument{
+		ChainID: 3,
+		SrcIP:   "0.0.0.0",
+		DstIP:   "10.0.0.2",
+		SrcPort: 52344,
+		DstPort: 8080,
+	}
+
+	got := svc.sanitizeTraceForOutput(trace)
+	if got.SrcIP != "missing:kernel_port_only_or_resolver_miss" {
+		t.Fatalf("unexpected port-only src_ip marker: %#v", got)
+	}
+}
+
 func TestEnrichTraceTupleForOutputSwapsRequestTupleWithoutResolver(t *testing.T) {
 	svc := &Service{}
 	trace := httptrace.TraceDocument{
@@ -428,6 +475,32 @@ func TestEnrichTraceTupleForOutputUsesResolverDirection(t *testing.T) {
 	svc := &Service{resolver: resolver}
 
 	trace := httptrace.TraceDocument{
+		Kind:   "request",
+		PID:    1234,
+		FD:     9,
+		SockID: 77,
+		SrcIP:  "0.0.0.0",
+		DstIP:  "0.0.0.0",
+	}
+
+	got := svc.enrichTraceTupleForOutput(trace)
+	if got.SrcIP != "172.16.0.20" || got.DstIP != "172.16.0.10" || got.SrcPort != 55000 || got.DstPort != 8080 {
+		t.Fatalf("resolver-normalized tuple mismatch: got %#v", got)
+	}
+}
+
+func TestEnrichTraceTupleForOutputPrefersCompleteKernelTupleOverResolver(t *testing.T) {
+	resolver := newSocketResolver(time.Second)
+	key := socketKey{pid: 1234, fd: 9, sockID: 77}
+	resolver.storeCache(key, cachedSocketTuple{
+		localIP:    "127.0.0.1",
+		remoteIP:   "127.0.0.1",
+		localPort:  8080,
+		remotePort: 40000,
+	})
+	svc := &Service{resolver: resolver}
+
+	trace := httptrace.TraceDocument{
 		Kind:    "request",
 		PID:     1234,
 		FD:      9,
@@ -439,8 +512,27 @@ func TestEnrichTraceTupleForOutputUsesResolverDirection(t *testing.T) {
 	}
 
 	got := svc.enrichTraceTupleForOutput(trace)
-	if got.SrcIP != "172.16.0.20" || got.DstIP != "172.16.0.10" || got.SrcPort != 55000 || got.DstPort != 8080 {
-		t.Fatalf("resolver-normalized tuple mismatch: got %#v", got)
+	if got.SrcIP != "10.0.0.1" || got.DstIP != "10.0.0.2" || got.SrcPort != 52344 || got.DstPort != 8080 {
+		t.Fatalf("complete kernel tuple should win over resolver cache, got %#v", got)
+	}
+}
+
+func TestEnrichTraceTupleForOutputDoesNotLateResolveProcOnCacheMiss(t *testing.T) {
+	svc := &Service{resolver: newSocketResolver(time.Second)}
+	trace := httptrace.TraceDocument{
+		Kind:    "request",
+		PID:     1234,
+		FD:      9,
+		SockID:  77,
+		SrcIP:   "0.0.0.0",
+		DstIP:   "0.0.0.0",
+		SrcPort: 52344,
+		DstPort: 8080,
+	}
+
+	got := svc.enrichTraceTupleForOutput(trace)
+	if got.SrcIP != trace.SrcIP || got.DstIP != trace.DstIP || got.SrcPort != trace.SrcPort || got.DstPort != trace.DstPort {
+		t.Fatalf("cache miss should keep original tuple placeholders, got %#v want %#v", got, trace)
 	}
 }
 

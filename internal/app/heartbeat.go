@@ -122,7 +122,7 @@ func newHeartbeatRuntime(cfg Config, startTime time.Time) (*heartbeatRuntime, er
 	}
 	clientID, err := readMachineID()
 	if err != nil {
-		return nil, fmt.Errorf("read /etc/machine-id: %w", err)
+		return nil, fmt.Errorf("read /sys/class/dmi/id/product_uuid: %w", err)
 	}
 
 	info, infoErr := collectHeartbeatNodeInfo(cfg.IfName, startTime)
@@ -503,9 +503,10 @@ func normalizeHeartbeatEndpoint(raw string) (string, error) {
 
 // 获取客户端ID
 func readMachineID() (string, error) {
-	data, _ := os.ReadFile("/etc/machine-id")
+	// 克隆机器id重复
+	data, _ := os.ReadFile("/sys/class/dmi/id/product_uuid")
 	if string(data) == "" {
-		data, _ = os.ReadFile("/sys/class/dmi/id/product_uuid")
+		data, _ = os.ReadFile("/etc/machine-id")
 	}
 	if string(data) == "" {
 		return "", fmt.Errorf("machine-id is empty")

@@ -349,17 +349,19 @@ struct send_capture_scratch {
 
 struct send_guard {
 	__u64 msg_ptr;
+	__s32 fd;
 	__u8 source;
 	__u8 observed_accounted;
 	__u8 metadata_only;
-	__u8 pad0[5];
+	__u8 pad0;
 };
 
 struct recv_guard {
 	__u64 msg_ptr;
+	__s32 fd;
 	__u8 source;
 	__u8 metadata_only;
-	__u8 pad0[6];
+	__u8 pad0[2];
 };
 
 struct http_event {

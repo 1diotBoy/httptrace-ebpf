@@ -1738,7 +1738,7 @@ enum recv_guard_result {
  * - 后续同一 msg 的第二个 hook 直接跳过，避免重复上报和 tx_cursor/frag_idx 双重推进。
  * 常见路径下通常还是 sock_sendmsg 先命中，因此它天然是主路径，tcp_sendmsg 作为补充兜底。
  */
-static __always_inline int claim_send_guard(__u64 pid_tgid, struct msghdr_compat *msg, __u8 source)
+static __always_inline int claim_send_guard(__u64 pid_tgid, struct msghdr_compat *msg, __s32 fd, __u8 source)
 {
 #ifdef TCP_ONLY_LEAN
 	return SEND_GUARD_PAYLOAD_AND_COUNT;
@@ -1758,6 +1758,7 @@ static __always_inline int claim_send_guard(__u64 pid_tgid, struct msghdr_compat
 		}
 		if (payload_primary && existing->metadata_only) {
 			guard.msg_ptr = msg_ptr;
+			guard.fd = existing->fd >= 0 ? existing->fd : fd;
 			guard.source = source;
 			guard.observed_accounted = existing->observed_accounted;
 			guard.metadata_only = 0;
@@ -1772,6 +1773,7 @@ static __always_inline int claim_send_guard(__u64 pid_tgid, struct msghdr_compat
 	}
 
 	guard.msg_ptr = msg_ptr;
+	guard.fd = fd;
 	guard.source = source;
 	guard.metadata_only = payload_primary ? 0 : 1;
 	guard.observed_accounted = payload_primary ? 0 : 1;
@@ -1780,7 +1782,7 @@ static __always_inline int claim_send_guard(__u64 pid_tgid, struct msghdr_compat
 #endif
 }
 
-static __always_inline int claim_recv_guard(__u64 pid_tgid, struct msghdr_compat *msg, __u8 source)
+static __always_inline int claim_recv_guard(__u64 pid_tgid, struct msghdr_compat *msg, __s32 fd, __u8 source)
 {
 #ifdef TCP_ONLY_LEAN
 	return RECV_GUARD_STORE;
@@ -1800,6 +1802,7 @@ static __always_inline int claim_recv_guard(__u64 pid_tgid, struct msghdr_compat
 		}
 		if (payload_primary && existing->metadata_only) {
 			guard.msg_ptr = msg_ptr;
+			guard.fd = existing->fd >= 0 ? existing->fd : fd;
 			guard.source = source;
 			guard.metadata_only = 0;
 			bpf_map_update_elem(&recv_guard_map, &pid_tgid, &guard, BPF_ANY);
@@ -1813,11 +1816,30 @@ static __always_inline int claim_recv_guard(__u64 pid_tgid, struct msghdr_compat
 	}
 
 	guard.msg_ptr = msg_ptr;
+	guard.fd = fd;
 	guard.source = source;
 	guard.metadata_only = payload_primary ? 0 : 1;
 	bpf_map_update_elem(&recv_guard_map, &pid_tgid, &guard, BPF_ANY);
 	return RECV_GUARD_STORE;
 #endif
+}
+
+static __always_inline __s32 guard_fd_or_fallback(__u64 pid_tgid, void *map, __s32 fallback, int is_send)
+{
+	if (fallback >= 0)
+		return fallback;
+
+	if (is_send) {
+		struct send_guard *guard = bpf_map_lookup_elem(map, &pid_tgid);
+		if (guard && guard->fd >= 0)
+			return guard->fd;
+		return fallback;
+	}
+
+	struct recv_guard *guard = bpf_map_lookup_elem(map, &pid_tgid);
+	if (guard && guard->fd >= 0)
+		return guard->fd;
+	return fallback;
 }
 
 static __always_inline __s32 consume_fd(__u64 pid_tgid, void *map)
@@ -1841,8 +1863,9 @@ static __always_inline int store_recv_args(struct sock_compat *sk, struct msghdr
 
 	if (!capture_enabled())
 		return 0;
-	if (claim_recv_guard(pid_tgid, msg, source) == RECV_GUARD_SKIP)
+	if (claim_recv_guard(pid_tgid, msg, fd, source) == RECV_GUARD_SKIP)
 		return 0;
+	fd = guard_fd_or_fallback(pid_tgid, &recv_guard_map, fd, 0);
 
 	fill_common_meta(&meta, sk, fd, source);
 	if (load_best_effort_tuple(sk, &meta) == 0 && !matches_filter(&meta))
@@ -2092,12 +2115,13 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 				    DEBUG_STAGE_NO_CHAIN, started_new_response);
 		return 0;
 	}
-	guard_action = claim_send_guard(bpf_get_current_pid_tgid(), msg, source);
+	guard_action = claim_send_guard(bpf_get_current_pid_tgid(), msg, fd, source);
 	if (guard_action == SEND_GUARD_SKIP) {
 		snapshot_send_debug(sk, msg, &scratch->meta, &scratch->iter, state, chain_id, source,
 				    DEBUG_STAGE_GUARD_DUP, started_new_response);
 		return 0;
 	}
+	scratch->meta.fd = guard_fd_or_fallback(bpf_get_current_pid_tgid(), &send_guard_map, scratch->meta.fd, 1);
 
 	if (guard_action != SEND_GUARD_PAYLOAD_ONLY && started_new_response)
 		start_response_capture(state, chain_id);

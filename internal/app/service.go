@@ -814,26 +814,36 @@ func (s *Service) enrichTraceTupleForOutput(trace httptrace.TraceDocument) httpt
 		event.Direction = httptrace.DirectionResponse
 	}
 
+	// 内核 tuple 已经完整时，优先信任事件本身，再按方向做 request 的 src/dst 翻转。
+	// 这里不要再用 /proc 当前 fd 反查结果覆盖，否则高并发下 fd 复用会把旧请求误写成新的 loopback 连接。
+	if !missingTuple(event) {
+		if event.Direction == httptrace.DirectionRequest {
+			event.SrcIP, event.DstIP = event.DstIP, event.SrcIP
+			event.SrcPort, event.DstPort = event.DstPort, event.SrcPort
+		}
+		trace.SrcIP = event.SrcIP
+		trace.DstIP = event.DstIP
+		trace.SrcPort = event.SrcPort
+		trace.DstPort = event.DstPort
+		return trace
+	}
+
 	resolvedByResolver := false
 	if s != nil && s.resolver != nil && trace.PID != 0 && trace.FD >= 0 {
 		key := socketKey{pid: trace.PID, fd: trace.FD, sockID: trace.SockID}
 		if tuple, ok := s.resolver.lookupCache(key); ok {
 			event = applyResolvedTuple(event, tuple)
 			resolvedByResolver = true
-		} else if tuple, ok := resolveSocketTuple(trace.PID, trace.FD); ok {
-			s.resolver.storeCache(key, tuple)
-			event = applyResolvedTuple(event, tuple)
-			resolvedByResolver = true
 		}
+	}
+
+	if missingTuple(event) {
+		return trace
 	}
 
 	if !resolvedByResolver && event.Direction == httptrace.DirectionRequest && !missingTuple(event) {
 		event.SrcIP, event.DstIP = event.DstIP, event.SrcIP
 		event.SrcPort, event.DstPort = event.DstPort, event.SrcPort
-	}
-
-	if missingTuple(event) {
-		return trace
 	}
 	trace.SrcIP = event.SrcIP
 	trace.DstIP = event.DstIP
@@ -842,9 +852,37 @@ func (s *Service) enrichTraceTupleForOutput(trace httptrace.TraceDocument) httpt
 	return trace
 }
 
-// 关闭用户态 tuple 管线后，仍然保留内核侧已经采到的 src/dst ip/port。
-// 这样可以在不走 /proc 反解析的情况下，直接把 tuple cache 或 best-effort 内核 tuple 输出到控制台和 Redis。
+// 判断 IP 是否为空
+func isZeroTraceIP(ip string) bool {
+	ip = strings.TrimSpace(ip)
+	return ip == "" || ip == "0.0.0.0" || ip == "::"
+}
+
+// 定位来源ip没采集到的原因
+func (s *Service) missingSrcIPMarker(trace httptrace.TraceDocument) string {
+	switch {
+	case strings.HasPrefix(trace.CaptureSource, "tls_"):
+		return "missing:tls_no_tuple"
+	case s != nil && s.cfg.DisableUserTuple:
+		return "missing:user_tuple_disabled"
+	case trace.PID == 0 || trace.FD < 0:
+		return "missing:no_socket_identity"
+	case trace.SrcPort != 0 || trace.DstPort != 0:
+		return "missing:kernel_port_only_or_resolver_miss"
+	default:
+		return "missing:kernel_tuple_extract_failed"
+	}
+}
+
+// sanitizeTraceForOutput 只在最终输出到控制台/Redis前做最后修饰。
+// 如果来源 IP 仍然缺失，就给出一个可观测的原因标记，方便线上区分：
+// 1. 内核只拿到了端口，没有拿到 IP。
+// 2. 用户态 tuple 反查被关闭。
+// 3. TLS 路径本身没有 socket tuple。
 func (s *Service) sanitizeTraceForOutput(trace httptrace.TraceDocument) httptrace.TraceDocument {
+	if isZeroTraceIP(trace.SrcIP) {
+		trace.SrcIP = s.missingSrcIPMarker(trace)
+	}
 	return trace
 }
 
