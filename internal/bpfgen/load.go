@@ -87,6 +87,7 @@ type LoadedObjects struct {
 
 	Events           *ebpf.Map
 	FilterMap        *ebpf.Map
+	TupleCache       *ebpf.Map
 	KernelStatsMap   *ebpf.Map
 	DebugSnapshotMap *ebpf.Map
 
@@ -162,6 +163,7 @@ func loadModernObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
 		HookStrategy:                   HookStrategyTCPOnly,
 		Events:                         raw.Events,
 		FilterMap:                      raw.FilterMap,
+		TupleCache:                     raw.TupleCache,
 		KernelStatsMap:                 raw.KernelStatsMap,
 		DebugSnapshotMap:               raw.DebugSnapshotMap,
 		KprobeSockRecvmsg:              raw.KprobeSockRecvmsg,
@@ -200,6 +202,7 @@ func loadLegacyObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
 		HookStrategy:                   HookStrategyLegacySock,
 		Events:                         raw.Events,
 		FilterMap:                      raw.FilterMap,
+		TupleCache:                     raw.TupleCache,
 		KernelStatsMap:                 raw.KernelStatsMap,
 		DebugSnapshotMap:               raw.DebugSnapshotMap,
 		KprobeSockRecvmsg:              raw.KprobeSockRecvmsg,
@@ -238,6 +241,7 @@ func loadLegacyUserReadObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, er
 		HookStrategy:                   HookStrategyLegacySock,
 		Events:                         raw.Events,
 		FilterMap:                      raw.FilterMap,
+		TupleCache:                     raw.TupleCache,
 		KernelStatsMap:                 raw.KernelStatsMap,
 		DebugSnapshotMap:               raw.DebugSnapshotMap,
 		KprobeSockRecvmsg:              raw.KprobeSockRecvmsg,
@@ -276,6 +280,7 @@ func loadLegacyTCPSendObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, err
 		HookStrategy:                   HookStrategyLegacyTCPSend,
 		Events:                         raw.Events,
 		FilterMap:                      raw.FilterMap,
+		TupleCache:                     raw.TupleCache,
 		KernelStatsMap:                 raw.KernelStatsMap,
 		DebugSnapshotMap:               raw.DebugSnapshotMap,
 		KprobeSockRecvmsg:              raw.KprobeSockRecvmsg,
@@ -314,6 +319,7 @@ func loadLegacyTCPBothObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, err
 		HookStrategy:                   HookStrategyLegacyTCPBoth,
 		Events:                         raw.Events,
 		FilterMap:                      raw.FilterMap,
+		TupleCache:                     raw.TupleCache,
 		KernelStatsMap:                 raw.KernelStatsMap,
 		DebugSnapshotMap:               raw.DebugSnapshotMap,
 		KprobeSockRecvmsg:              raw.KprobeSockRecvmsg,
@@ -711,6 +717,7 @@ func loadedObjectsFromCollection(collection *ebpf.Collection, variant string, ho
 		HookStrategy:                   hookStrategy,
 		Events:                         events,
 		FilterMap:                      filterMap,
+		TupleCache:                     collection.Maps["tuple_cache"],
 		KernelStatsMap:                 kernelStatsMap,
 		DebugSnapshotMap:               debugSnapshotMap,
 		KprobeSockRecvmsg:              collection.Programs["kprobe_sock_recvmsg"],

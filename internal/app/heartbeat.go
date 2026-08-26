@@ -381,6 +381,7 @@ func (s *stats) resetDailyCounters() {
 	resetAtomicU64(
 		&s.perfReceived,
 		&s.perfLost,
+		&s.perfLostRecords,
 		&s.requests,
 		&s.responses,
 		&s.inputBytes,
@@ -425,11 +426,16 @@ func (s *stats) resetDailyCounters() {
 		&s.workerQueuePeak,
 		&s.shutdownFlushes,
 	)
+	s.perfLostLogLastNs.Store(0)
 
 	s.sourceMu.Lock()
 	s.rawBySource = nil
 	s.updatesBySource = nil
 	s.sourceMu.Unlock()
+
+	s.perfLostMu.Lock()
+	s.perfLostByCPU = nil
+	s.perfLostMu.Unlock()
 }
 
 func resetAtomicU64(fields ...*atomic.Uint64) {

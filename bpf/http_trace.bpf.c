@@ -15,7 +15,7 @@ struct bpf_map_def SEC("maps") filter_map = {
 };
 
 struct bpf_map_def SEC("maps") tuple_cache = {
-	.type = BPF_MAP_TYPE_HASH,
+	.type = BPF_MAP_TYPE_LRU_HASH,
 	.key_size = sizeof(__u64),
 	.value_size = sizeof(struct tuple_cache_entry),
 	.max_entries = 131072,
@@ -112,6 +112,11 @@ static __always_inline struct kernel_stats *stats_lookup(void)
 	__u32 key = 0;
 
 	return bpf_map_lookup_elem(&kernel_stats_map, &key);
+}
+
+static __always_inline __u32 http_event_size(__u32 payload_len)
+{
+	return (__u32)__builtin_offsetof(struct http_event, payload) + payload_len;
 }
 
 static __always_inline int read_filter(struct filter_config *cfg)
@@ -266,8 +271,11 @@ static __always_inline __attribute__((unused)) int store_tuple_cache(__u64 sock_
 
 	if (!sock_id || !entry)
 		return -1;
-	if (bpf_map_update_elem(&tuple_cache, &sock_id, entry, BPF_ANY) < 0)
+	if (bpf_map_update_elem(&tuple_cache, &sock_id, entry, BPF_ANY) < 0) {
+		if (stats)
+			stats->tuple_cache_update_failures += 1;
 		return -1;
+	}
 	if (stats)
 		stats->tuple_cache_updates += 1;
 	return 0;
@@ -299,11 +307,20 @@ static __always_inline __attribute__((unused)) int load_cached_tuple(__u64 sock_
 
 static __always_inline __attribute__((unused)) int load_best_effort_tuple(struct sock_compat *sk, struct recv_args *meta)
 {
+	int direct_rc = -1;
+
 	if (!meta)
 		return -1;
+	/* 事件主路径优先读取当前 sock 的 live tuple：
+	 * - IPv4 场景下，即使 tuple_cache 因长连接长期占位而开始淘汰，也尽量直接把来源/目的 IP 带进事件。
+	 * - AF_INET6 双栈监听仍然可能只拿到端口，此时再回退到 tuple_cache，继续复用 tracepoint 上更稳定的地址快照。
+	 */
+	direct_rc = extract_tuple(sk, meta);
+	if (direct_rc == 0 && meta->src_ip && meta->dst_ip)
+		return 0;
 	if (load_cached_tuple(meta->sock_id, meta) == 0)
 		return 0;
-	return extract_tuple(sk, meta);
+	return direct_rc;
 }
 
 static __always_inline void fill_common_meta(struct recv_args *meta, struct sock_compat *sk,
@@ -1196,9 +1213,11 @@ static __attribute__((noinline)) __attribute__((unused)) int emit_control_event(
 	if (meta)
 		__builtin_memcpy(event->comm, meta->comm, sizeof(event->comm));
 
-	if (bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, event, sizeof(*event)) < 0) {
-		if (stats)
+	if (bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, event, http_event_size(0)) < 0) {
+		if (stats) {
 			stats->perf_errors += 1;
+			stats->perf_output_errors += 1;
+		}
 		return -1;
 	}
 
@@ -1257,14 +1276,18 @@ static __attribute__((noinline)) int emit_data_event(void *ctx, const struct cap
 	event->family = call->meta->family;
 	__builtin_memcpy(event->comm, call->meta->comm, sizeof(event->comm));
 	if (safe_len > 0 && read_payload_bytes(event->payload, safe_len, src) < 0) {
-		if (stats)
+		if (stats) {
 			stats->perf_errors += 1;
+			stats->payload_read_errors += 1;
+		}
 		return -1;
 	}
 
-	if (bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, event, sizeof(*event)) < 0) {
-		if (stats)
+	if (bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, event, http_event_size(safe_len)) < 0) {
+		if (stats) {
 			stats->perf_errors += 1;
+			stats->perf_output_errors += 1;
+		}
 		return -1;
 	}
 
@@ -1314,9 +1337,11 @@ static __attribute__((noinline)) int emit_size_progress_event(void *ctx, const s
 	event->family = meta->family;
 	__builtin_memcpy(event->comm, meta->comm, sizeof(event->comm));
 
-	if (bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, event, sizeof(*event)) < 0) {
-		if (stats)
+	if (bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, event, http_event_size(0)) < 0) {
+		if (stats) {
 			stats->perf_errors += 1;
+			stats->perf_output_errors += 1;
+		}
 		return -1;
 	}
 
@@ -1368,9 +1393,11 @@ static __attribute__((noinline)) int emit_size_final_event(void *ctx, const stru
 	event->family = meta->family;
 	__builtin_memcpy(event->comm, meta->comm, sizeof(event->comm));
 
-	if (bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, event, sizeof(*event)) < 0) {
-		if (stats)
+	if (bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, event, http_event_size(0)) < 0) {
+		if (stats) {
 			stats->perf_errors += 1;
+			stats->perf_output_errors += 1;
+		}
 		return -1;
 	}
 
@@ -2019,6 +2046,7 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 	    looks_like_http_request_prefix_trimmed(prefix, prefix_len, NULL))
 		direction = DIR_REQUEST;
 #endif
+	// 处理请求链路，如果方向是请求，则分配新的 chain_id，并开始捕获请求
 	if (direction == DIR_REQUEST) {
 		if (stats)
 			stats->recv_dir_request += 1;
@@ -2026,6 +2054,7 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 		start_request_capture(state, chain_id);
 		state->req_observed_bytes += ret;
 	} else if (direction == DIR_RESPONSE) {
+		// 处理响应链路，如果方向是响应，则跳过处理
 		if (stats)
 			stats->recv_dir_response += 1;
 		goto cleanup;

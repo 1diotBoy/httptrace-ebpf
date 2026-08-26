@@ -5,6 +5,10 @@ import (
 	"log"
 	"testing"
 	"time"
+	"unsafe"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/rlimit"
 
 	"power-ebpf/internal/bpfgen"
 	"power-ebpf/internal/httptrace"
@@ -368,6 +372,30 @@ func TestStartWorkersUsesResourceSizedQueue(t *testing.T) {
 	wg.Wait()
 }
 
+func TestWorkerIndexForEventKeepsSocketAffinityAndSpreadsSockets(t *testing.T) {
+	const workerCount = 4
+
+	first := workerIndexForEvent(httptrace.Event{SockID: 1001, ChainID: 1}, 0, workerCount)
+	second := workerIndexForEvent(httptrace.Event{SockID: 1001, ChainID: 2}, 3, workerCount)
+	if first != second {
+		t.Fatalf("same socket routed to different workers: %d and %d", first, second)
+	}
+
+	seen := make(map[int]bool, workerCount)
+	for sockID := uint64(1); sockID <= 256; sockID++ {
+		seen[workerIndexForEvent(httptrace.Event{SockID: sockID}, 0, workerCount)] = true
+	}
+	if len(seen) != workerCount {
+		t.Fatalf("socket routing did not use every worker: %#v", seen)
+	}
+}
+
+func TestWorkerIndexForEventFallsBackToCPU(t *testing.T) {
+	if got := workerIndexForEvent(httptrace.Event{}, 5, 4); got != 1 {
+		t.Fatalf("cpu fallback = %d, want 1", got)
+	}
+}
+
 func TestSanitizeTraceForOutputKeepsKernelTuple(t *testing.T) {
 	svc := &Service{cfg: Config{DisableUserTuple: true}}
 	trace := httptrace.TraceDocument{
@@ -419,6 +447,8 @@ func TestSanitizeTraceForOutputMarksMissingSrcIPForPortOnlyKernelTuple(t *testin
 	svc := &Service{cfg: DefaultConfig()}
 	trace := httptrace.TraceDocument{
 		ChainID: 3,
+		PID:     1234,
+		FD:      8,
 		SrcIP:   "0.0.0.0",
 		DstIP:   "10.0.0.2",
 		SrcPort: 52344,
@@ -533,6 +563,58 @@ func TestEnrichTraceTupleForOutputDoesNotLateResolveProcOnCacheMiss(t *testing.T
 	got := svc.enrichTraceTupleForOutput(trace)
 	if got.SrcIP != trace.SrcIP || got.DstIP != trace.DstIP || got.SrcPort != trace.SrcPort || got.DstPort != trace.DstPort {
 		t.Fatalf("cache miss should keep original tuple placeholders, got %#v want %#v", got, trace)
+	}
+}
+
+func TestResolveEventUsesKernelTupleCacheBeforeProc(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("remove memlock: %v", err)
+	}
+
+	m, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    8,
+		ValueSize:  uint32(unsafe.Sizeof(kernelTupleCacheEntry{})),
+		MaxEntries: 16,
+	})
+	if err != nil {
+		t.Fatalf("new map: %v", err)
+	}
+	defer m.Close()
+
+	key := uint64(77)
+	value := kernelTupleCacheEntry{
+		SrcIP:   0x0100000A,
+		DstIP:   0x0200000A,
+		SrcPort: 8080,
+		DstPort: 52344,
+		Family:  2,
+	}
+	if err := m.Update(&key, &value, ebpf.UpdateAny); err != nil {
+		t.Fatalf("update map: %v", err)
+	}
+
+	svc := &Service{
+		cfg:           DefaultConfig(),
+		resolver:      newSocketResolver(time.Second),
+		tupleCacheMap: m,
+		stats:         &stats{},
+	}
+	event := httptrace.Event{
+		PID:       1234,
+		FD:        9,
+		SockID:    77,
+		Direction: httptrace.DirectionRequest,
+		SrcIP:     "0.0.0.0",
+		DstIP:     "0.0.0.0",
+	}
+
+	got, source := svc.resolveEvent(event)
+	if source != resolveFromKernelCache {
+		t.Fatalf("expected resolveFromKernelCache, got %v", source)
+	}
+	if got.SrcIP != "10.0.0.2" || got.DstIP != "10.0.0.1" || got.SrcPort != 52344 || got.DstPort != 8080 {
+		t.Fatalf("kernel tuple cache mismatch: got %#v", got)
 	}
 }
 

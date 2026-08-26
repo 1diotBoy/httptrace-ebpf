@@ -24,6 +24,7 @@ type resolveSource uint8
 
 const (
 	resolveMiss resolveSource = iota
+	resolveFromKernelCache
 	resolveFromCache
 	resolveFromProc
 	resolveBypass

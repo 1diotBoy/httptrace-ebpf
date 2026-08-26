@@ -124,7 +124,7 @@ func DefaultConfig() Config {
 		CaptureBytes:         32 * 1024,
 		DisableKernelFilter:  false,
 		DisableUserTuple:     false,
-		PerfPages:            64,
+		PerfPages:            128,
 		BatchSize:            100,
 		WorkerCount:          min(runtime.NumCPU(), 8),
 		WorkerQueueSize:      0,
@@ -179,6 +179,7 @@ func normalizeRuntimeConfig(c Config, cpuCount int, memAvailable uint64, memKnow
 
 	tier := pickResourceTier(memAvailable, memKnown)
 
+	// 工作线程数
 	workerCount := c.WorkerCount
 	if workerCount <= 0 {
 		workerCount = min(cpuCount, 8)
@@ -194,6 +195,7 @@ func normalizeRuntimeConfig(c Config, cpuCount int, memAvailable uint64, memKnow
 	perfPages = clampInt(perfPages, tier.minPerfPages, maxPerfPages)
 	c.PerfPages = perfPages
 
+	// 工作队列大小，根据批量大小计算，默认是批量大小的2倍
 	queueFloor := max(c.BatchSize*2, 128)
 	if tier.maxWorkerQueueSize > 0 && queueFloor > tier.maxWorkerQueueSize {
 		queueFloor = tier.maxWorkerQueueSize
@@ -208,6 +210,7 @@ func normalizeRuntimeConfig(c Config, cpuCount int, memAvailable uint64, memKnow
 	}
 	eventBytes := int(unsafe.Sizeof(httptrace.Event{}))
 	maxWorkerQueue := maxWorkerQueueSizeForBudget(workerCount, eventBytes, tier.workerQueueBudget, queueFloor, tier.maxWorkerQueueSize)
+	// 工作队列大小，根据预算和最大值限制，BatchSize=100，eventBytes=128，最大值为256，默认是128，
 	workerQueueSize = clampInt(workerQueueSize, queueFloor, maxWorkerQueue)
 	c.WorkerQueueSize = workerQueueSize
 

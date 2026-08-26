@@ -430,6 +430,8 @@ struct kernel_stats {
 	__u64 recv_events;
 	__u64 filtered;
 	__u64 perf_errors;
+	__u64 perf_output_errors;
+	__u64 payload_read_errors;
 	__u64 truncations;
 	__u64 close_events;
 	__u64 sock_send_hits;
@@ -454,6 +456,7 @@ struct kernel_stats {
 	__u64 tuple_ipv6_portonly;
 	__u64 tuple_extract_fail;
 	__u64 tuple_cache_updates;
+	__u64 tuple_cache_update_failures;
 	__u64 tuple_cache_deletes;
 	__u64 tuple_cache_hits;
 	__u64 tuple_cache_misses;

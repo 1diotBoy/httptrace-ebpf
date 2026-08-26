@@ -46,6 +46,7 @@ type Service struct {
 	assembler                *httptrace.Assembler
 	store                    *storage.RedisStore
 	resolver                 *socketResolver
+	tupleCacheMap            *ebpf.Map
 	stats                    *stats
 	heartbeat                *heartbeatRuntime
 	resourcePlan             runtimeResourcePlan
@@ -59,11 +60,14 @@ type Service struct {
 	currentStatsDay          string
 	collectEnabled           atomic.Bool
 	dailyMu                  sync.Mutex
+	perfDiag                 perfDiagCounters
 }
 
 type stats struct {
 	perfReceived       atomic.Uint64
 	perfLost           atomic.Uint64
+	perfLostRecords    atomic.Uint64
+	perfLostLogLastNs  atomic.Int64
 	requests           atomic.Uint64
 	responses          atomic.Uint64
 	inputBytes         atomic.Uint64
@@ -113,6 +117,17 @@ type stats struct {
 	rawChainsByKey     map[string]map[uint64]struct{}
 	updateChainsByKey  map[string]map[uint64]struct{}
 	rawChainDetails    map[string]rawChainDetail
+	perfLostMu         sync.Mutex
+	perfLostByCPU      map[int]uint64
+}
+
+type kernelTupleCacheEntry struct {
+	SrcIP   uint32
+	DstIP   uint32
+	SrcPort uint16
+	DstPort uint16
+	Family  uint16
+	Pad0    uint16
 }
 
 type sourceDirectionCounts struct {
@@ -135,6 +150,23 @@ type rawChainDetail struct {
 	FD        int32
 	Comm      string
 	Prefix    string
+}
+
+type perfDiagCounters struct {
+	RecordsRead             uint64
+	PerfReceived            uint64
+	PerfLost                uint64
+	PerfLostRecords         uint64
+	KernelPerfErrors        uint64
+	KernelPerfOutputErrors  uint64
+	KernelPayloadReadErrors uint64
+	DispatchBlocked         uint64
+	WorkerBackpressure      uint64
+	ParseFailures           uint64
+	RetryQueued             uint64
+	RetryOverflow           uint64
+	TupleResolved           uint64
+	TupleMiss               uint64
 }
 
 type resolveRetryItem struct {
@@ -287,6 +319,7 @@ func (s *Service) Run(ctx context.Context) error {
 	defer objs.Close()
 	log.Printf("bpf objects loaded (variant=%s hook_strategy=%s)", objs.Variant, objs.HookStrategy)
 	s.hookStrategy = objs.HookStrategy
+	s.tupleCacheMap = objs.TupleCache
 
 	if err := s.installFilter(objs); err != nil {
 		return err
@@ -368,7 +401,7 @@ func (s *Service) Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := s.readLoop(ctx, reader, workers, retrySem, &retryWG); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, perf.ErrClosed) {
+		if err := s.readLoop(ctx, "http", reader, workers, retrySem, &retryWG); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, perf.ErrClosed) {
 			errCh <- err
 		}
 	}()
@@ -377,7 +410,7 @@ func (s *Service) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := s.readLoop(ctx, tlsReader, workers, retrySem, &retryWG); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, perf.ErrClosed) {
+			if err := s.readLoop(ctx, "tls", tlsReader, workers, retrySem, &retryWG); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, perf.ErrClosed) {
 				errCh <- err
 			}
 		}()
@@ -829,11 +862,20 @@ func (s *Service) enrichTraceTupleForOutput(trace httptrace.TraceDocument) httpt
 	}
 
 	resolvedByResolver := false
+	if tuple, ok := s.lookupKernelTupleBySockID(trace.SockID); ok {
+		event = applyResolvedTuple(event, tuple)
+		resolvedByResolver = true
+		if s != nil && s.resolver != nil && trace.PID != 0 && trace.FD >= 0 {
+			s.resolver.storeCache(socketKey{pid: trace.PID, fd: trace.FD, sockID: trace.SockID}, tuple)
+		}
+	}
 	if s != nil && s.resolver != nil && trace.PID != 0 && trace.FD >= 0 {
-		key := socketKey{pid: trace.PID, fd: trace.FD, sockID: trace.SockID}
-		if tuple, ok := s.resolver.lookupCache(key); ok {
-			event = applyResolvedTuple(event, tuple)
-			resolvedByResolver = true
+		if !resolvedByResolver {
+			key := socketKey{pid: trace.PID, fd: trace.FD, sockID: trace.SockID}
+			if tuple, ok := s.resolver.lookupCache(key); ok {
+				event = applyResolvedTuple(event, tuple)
+				resolvedByResolver = true
+			}
 		}
 	}
 
@@ -850,6 +892,33 @@ func (s *Service) enrichTraceTupleForOutput(trace httptrace.TraceDocument) httpt
 	trace.SrcPort = event.SrcPort
 	trace.DstPort = event.DstPort
 	return trace
+}
+
+func (s *Service) lookupKernelTupleBySockID(sockID uint64) (cachedSocketTuple, bool) {
+	if s == nil || s.tupleCacheMap == nil || sockID == 0 {
+		return cachedSocketTuple{}, false
+	}
+
+	var entry kernelTupleCacheEntry
+	if err := s.tupleCacheMap.Lookup(&sockID, &entry); err != nil {
+		return cachedSocketTuple{}, false
+	}
+	if entry.SrcPort == 0 || entry.DstPort == 0 {
+		return cachedSocketTuple{}, false
+	}
+
+	localIP := formatIPv4(entry.SrcIP)
+	remoteIP := formatIPv4(entry.DstIP)
+	if localIP == "0.0.0.0" || remoteIP == "0.0.0.0" {
+		return cachedSocketTuple{}, false
+	}
+
+	return cachedSocketTuple{
+		localIP:    localIP,
+		remoteIP:   remoteIP,
+		localPort:  entry.SrcPort,
+		remotePort: entry.DstPort,
+	}, true
 }
 
 // 判断 IP 是否为空
@@ -985,6 +1054,18 @@ func messageBodySize(msg *httptrace.ParsedMessage) int {
 func (s *Service) resolveEvent(event httptrace.Event) (httptrace.Event, resolveSource) {
 	if s.cfg.DisableUserTuple {
 		return event, resolveBypass
+	}
+	if missingTuple(event) {
+		if tuple, ok := s.lookupKernelTupleBySockID(event.SockID); ok {
+			resolved := applyResolvedTuple(event, tuple)
+			if !missingTuple(resolved) {
+				if s.resolver != nil && event.PID != 0 && event.FD >= 0 {
+					s.resolver.storeCache(socketKey{pid: event.PID, fd: event.FD, sockID: event.SockID}, tuple)
+				}
+				s.stats.tupleResolved.Add(1)
+				return resolved, resolveFromKernelCache
+			}
+		}
 	}
 	// 开启补偿解析
 	resolved, source := s.resolver.Resolve(event)
@@ -1532,7 +1613,7 @@ func (s *Service) resolveWithRetry(ctx context.Context, item resolveRetryItem, w
 
 // readLoop 从 perf buffer 拉取原始事件，解码后做 tuple 补全、过滤和分发。
 // 这里尽量保持主循环轻量：少量第一次反查失败的关键事件会进入短暂重试队列，避免把 request/response 起始 fragment 过早丢掉。
-func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []chan httptrace.Event, retrySem chan struct{}, retryWG *sync.WaitGroup) error {
+func (s *Service) readLoop(ctx context.Context, stream string, reader *perf.Reader, workers []chan httptrace.Event, retrySem chan struct{}, retryWG *sync.WaitGroup) error {
 	// 循环读取 perf buffer 中的事件
 	for {
 		record, err := reader.Read()
@@ -1543,7 +1624,7 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 			return fmt.Errorf("read perf buffer: %w", err)
 		}
 		if record.LostSamples != 0 {
-			s.stats.perfLost.Add(record.LostSamples)
+			s.recordPerfLost(stream, record.CPU, record.LostSamples)
 			continue
 		}
 		s.stats.recordsRead.Add(1)
@@ -1582,7 +1663,7 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 				}
 			}
 		}
-		workerID := record.CPU % len(workers)
+		workerID := workerIndexForEvent(event, record.CPU, len(workers))
 
 		if source == resolveMiss && s.enqueueRetry(ctx, retrySem, retryWG, workers, event, workerID) {
 			continue
@@ -1594,6 +1675,110 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 			return err
 		}
 	}
+}
+
+// workerIndexForEvent keeps events from one socket on one worker while avoiding
+// concentrating all traffic from a busy producer CPU on the same worker.
+func workerIndexForEvent(event httptrace.Event, cpu, workerCount int) int {
+	if workerCount <= 1 {
+		return 0
+	}
+
+	key := event.SockID
+	if key == 0 {
+		key = event.ChainID
+	}
+	if key == 0 {
+		if cpu < 0 {
+			return 0
+		}
+		return cpu % workerCount
+	}
+
+	// Mix pointer-like socket IDs before modulo: their low bits are often
+	// aligned and would otherwise skew power-of-two worker counts.
+	key ^= key >> 33
+	key *= 0xff51afd7ed558ccd
+	key ^= key >> 33
+	key *= 0xc4ceb9fe1a85ec53
+	key ^= key >> 33
+	return int(key % uint64(workerCount))
+}
+
+// 记录 perf buffer 丢失的样本数
+func (s *Service) recordPerfLost(stream string, cpu int, samples uint64) {
+	if s == nil || s.stats == nil || samples == 0 {
+		return
+	}
+
+	total := s.stats.perfLost.Add(samples)
+	lostRecords := s.stats.perfLostRecords.Add(1)
+	s.stats.perfLostMu.Lock()
+	if s.stats.perfLostByCPU == nil {
+		s.stats.perfLostByCPU = make(map[int]uint64)
+	}
+	s.stats.perfLostByCPU[cpu] += samples
+	s.stats.perfLostMu.Unlock()
+
+	now := time.Now()
+	nowNs := now.UnixNano()
+	lastNs := s.stats.perfLostLogLastNs.Load()
+	if lastNs != 0 && nowNs-lastNs < int64(time.Second) {
+		return
+	}
+	if !s.stats.perfLostLogLastNs.CompareAndSwap(lastNs, nowNs) {
+		return
+	}
+
+	log.Printf(
+		"perf lost detected stream=%s cpu=%d lost_samples=%d total_lost=%d lost_records=%d perf_pages=%d perf_per_cpu=%s records_read=%d perf_received=%d worker_backpressure=%d dispatch_blocked=%d worker_queue_peak=%d worker_queue_size=%d",
+		stream,
+		cpu,
+		samples,
+		total,
+		lostRecords,
+		s.cfg.PerfPages,
+		formatBytesIEC(uint64(s.cfg.PerfBufferBytes())),
+		s.stats.recordsRead.Load(),
+		s.stats.perfReceived.Load(),
+		s.stats.workerBackpressure.Load(),
+		s.stats.dispatchBlocked.Load(),
+		s.stats.workerQueuePeak.Load(),
+		s.cfg.WorkerQueueSize,
+	)
+}
+
+func (s *stats) perfLostCPUSummary(limit int) string {
+	if s == nil {
+		return "none"
+	}
+	s.perfLostMu.Lock()
+	defer s.perfLostMu.Unlock()
+	if len(s.perfLostByCPU) == 0 {
+		return "none"
+	}
+	type cpuLost struct {
+		CPU  int
+		Lost uint64
+	}
+	items := make([]cpuLost, 0, len(s.perfLostByCPU))
+	for cpu, lost := range s.perfLostByCPU {
+		items = append(items, cpuLost{CPU: cpu, Lost: lost})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Lost == items[j].Lost {
+			return items[i].CPU < items[j].CPU
+		}
+		return items[i].Lost > items[j].Lost
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		parts = append(parts, fmt.Sprintf("cpu%d=%d", item.CPU, item.Lost))
+	}
+	return strings.Join(parts, " ")
 }
 
 func (s *Service) logKernelFragment(cpu int, raw bpfgen.HttpTraceHttpEvent, event httptrace.Event) {
@@ -1746,7 +1931,7 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 	}
 	asmStats := s.assembler.Snapshot()
 	log.Printf(
-		"%s stats kernel(send_calls=%d recv_calls=%d request_fragments=%d response_fragments=%d filtered=%d perf_errors=%d truncations=%d) user(perf_received=%d lost=%d requests=%d responses=%d redis=%d redis_failures=%d parse_failures=%d evicted=%d user_filtered=%d tuple_resolved=%d tuple_miss=%d pending_req=%d pending_resp=%d pending_no_resp=%d req_buf_states=%d resp_buf_states=%d stalled_flush=%d evict_flush=%d orphan_resp=%d promoted_req=%d deferred_resp=%d)",
+		"%s stats kernel(send_calls=%d recv_calls=%d request_fragments=%d response_fragments=%d filtered=%d perf_errors=%d perf_output_errors=%d payload_read_errors=%d truncations=%d) user(perf_received=%d lost=%d requests=%d responses=%d redis=%d redis_failures=%d parse_failures=%d evicted=%d user_filtered=%d tuple_resolved=%d tuple_miss=%d pending_req=%d pending_resp=%d pending_no_resp=%d req_buf_states=%d resp_buf_states=%d stalled_flush=%d evict_flush=%d orphan_resp=%d promoted_req=%d deferred_resp=%d)",
 		label,
 		kstats.SendCalls,
 		kstats.RecvCalls,
@@ -1754,6 +1939,8 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 		kstats.RecvEvents,
 		kstats.Filtered,
 		kstats.PerfErrors,
+		kstats.PerfOutputErrors,
+		kstats.PayloadReadErrors,
 		kstats.Truncations,
 		s.stats.perfReceived.Load(),
 		s.stats.perfLost.Load(),
@@ -1803,6 +1990,7 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 		s.stats.updateRespEvicted.Load(),
 		s.stats.shutdownFlushes.Load(),
 	)
+	s.logPerfPipelineDiagnostics(label, kstats)
 	log.Printf("%s source raw(%s)", label, s.stats.rawSourceSummary())
 	log.Printf("%s source update(%s)", label, s.stats.updateSourceSummary())
 	// raw/update chain 统计用于对比：
@@ -1845,7 +2033,7 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 			s.stats.workerQueuePeak.Load(),
 		)
 		log.Printf(
-			"%s kernel debug(sock_send_hits=%d tcp_send_hits=%d sock_recv_hits=%d tcp_recv_hits=%d recv_store_ok=%d recv_store_no_iter=%d recv_store_meta_fail=%d recv_ret_no_meta=%d recv_dir_request=%d recv_dir_response=%d recv_dir_unknown=%d recv_fallback_local=%d recv_fallback_keepalive=%d send_no_req_chain=%d send_resp_start=%d send_resp_continue=%d send_resp_reqactive=%d send_iter_empty=%d tuple_ipv4_ok=%d tuple_ipv6_portonly=%d tuple_extract_fail=%d prefix_second_iov=%d prefix_trimmed=%d send_size_only=%d recv_size_only=%d send_guard_dups=%d send_guard_upgrades=%d recv_guard_dups=%d recv_guard_upgrades=%d iter_ubuf=%d iter_iovec=%d iter_kvec=%d iter_bvec=%d iter_unsupported=%d iter_load_fail=%d)",
+			"%s kernel debug(sock_send_hits=%d tcp_send_hits=%d sock_recv_hits=%d tcp_recv_hits=%d recv_store_ok=%d recv_store_no_iter=%d recv_store_meta_fail=%d recv_ret_no_meta=%d recv_dir_request=%d recv_dir_response=%d recv_dir_unknown=%d recv_fallback_local=%d recv_fallback_keepalive=%d send_no_req_chain=%d send_resp_start=%d send_resp_continue=%d send_resp_reqactive=%d send_iter_empty=%d tuple_ipv4_ok=%d tuple_ipv6_portonly=%d tuple_extract_fail=%d tuple_cache_update_failures=%d prefix_second_iov=%d prefix_trimmed=%d send_size_only=%d recv_size_only=%d send_guard_dups=%d send_guard_upgrades=%d recv_guard_dups=%d recv_guard_upgrades=%d iter_ubuf=%d iter_iovec=%d iter_kvec=%d iter_bvec=%d iter_unsupported=%d iter_load_fail=%d)",
 			label,
 			kstats.SockSendHits,
 			kstats.TcpSendHits,
@@ -1868,6 +2056,7 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 			kstats.TupleIpv4Ok,
 			kstats.TupleIpv6Portonly,
 			kstats.TupleExtractFail,
+			kstats.TupleCacheUpdateFailures,
 			kstats.PrefixSecondIov,
 			kstats.PrefixTrimmed,
 			kstats.SendSizeOnlyEvents,
@@ -1884,14 +2073,108 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 			kstats.IterLoadFail,
 		)
 		log.Printf(
-			"%s kernel tuple-cache(updates=%d deletes=%d hits=%d misses=%d)",
+			"%s kernel tuple-cache(updates=%d update_failures=%d deletes=%d hits=%d misses=%d)",
 			label,
 			kstats.TupleCacheUpdates,
+			kstats.TupleCacheUpdateFailures,
 			kstats.TupleCacheDeletes,
 			kstats.TupleCacheHits,
 			kstats.TupleCacheMisses,
 		)
 	}
+}
+
+func (s *Service) logPerfPipelineDiagnostics(label string, kstats bpfgen.HttpTraceKernelStats) {
+	if s == nil || s.stats == nil {
+		return
+	}
+
+	current := perfDiagCounters{
+		RecordsRead:             s.stats.recordsRead.Load(),
+		PerfReceived:            s.stats.perfReceived.Load(),
+		PerfLost:                s.stats.perfLost.Load(),
+		PerfLostRecords:         s.stats.perfLostRecords.Load(),
+		KernelPerfErrors:        kstats.PerfErrors,
+		KernelPerfOutputErrors:  kstats.PerfOutputErrors,
+		KernelPayloadReadErrors: kstats.PayloadReadErrors,
+		DispatchBlocked:         s.stats.dispatchBlocked.Load(),
+		WorkerBackpressure:      s.stats.workerBackpressure.Load(),
+		ParseFailures:           s.stats.parseFailures.Load(),
+		RetryQueued:             s.stats.retryQueued.Load(),
+		RetryOverflow:           s.stats.retryOverflow.Load(),
+		TupleResolved:           s.stats.tupleResolved.Load(),
+		TupleMiss:               s.stats.tupleMiss.Load(),
+	}
+	previous := s.perfDiag
+	s.perfDiag = current
+
+	delta := perfDiagCounters{
+		RecordsRead:             counterDelta(current.RecordsRead, previous.RecordsRead),
+		PerfReceived:            counterDelta(current.PerfReceived, previous.PerfReceived),
+		PerfLost:                counterDelta(current.PerfLost, previous.PerfLost),
+		PerfLostRecords:         counterDelta(current.PerfLostRecords, previous.PerfLostRecords),
+		KernelPerfErrors:        counterDelta(current.KernelPerfErrors, previous.KernelPerfErrors),
+		KernelPerfOutputErrors:  counterDelta(current.KernelPerfOutputErrors, previous.KernelPerfOutputErrors),
+		KernelPayloadReadErrors: counterDelta(current.KernelPayloadReadErrors, previous.KernelPayloadReadErrors),
+		DispatchBlocked:         counterDelta(current.DispatchBlocked, previous.DispatchBlocked),
+		WorkerBackpressure:      counterDelta(current.WorkerBackpressure, previous.WorkerBackpressure),
+		ParseFailures:           counterDelta(current.ParseFailures, previous.ParseFailures),
+		RetryQueued:             counterDelta(current.RetryQueued, previous.RetryQueued),
+		RetryOverflow:           counterDelta(current.RetryOverflow, previous.RetryOverflow),
+		TupleResolved:           counterDelta(current.TupleResolved, previous.TupleResolved),
+		TupleMiss:               counterDelta(current.TupleMiss, previous.TupleMiss),
+	}
+
+	likely := "healthy"
+	switch {
+	case delta.KernelPerfOutputErrors > 0:
+		likely = "kernel_perf_output_error"
+	case delta.KernelPayloadReadErrors > 0:
+		likely = "kernel_payload_read_error"
+	case delta.PerfLost > 0 && delta.DispatchBlocked > 0:
+		likely = "user_worker_backpressure"
+	case delta.PerfLost > 0 && delta.RetryQueued > 0:
+		likely = "user_resolve_retry_pressure"
+	case delta.PerfLost > 0:
+		likely = "perf_buffer_not_drained_fast_enough"
+	case delta.DispatchBlocked > 0:
+		likely = "worker_queue_pressure_no_perf_loss"
+	}
+
+	if delta.PerfLost == 0 && delta.KernelPerfErrors == 0 && delta.DispatchBlocked == 0 && !s.cfg.DebugKernel {
+		return
+	}
+
+	log.Printf(
+		"%s perf pipeline(delta_records_read=%d delta_perf_received=%d delta_lost_samples=%d delta_lost_records=%d delta_kernel_perf_errors=%d delta_kernel_perf_output_errors=%d delta_kernel_payload_read_errors=%d delta_dispatch_blocked=%d delta_worker_backpressure=%d delta_retry_queued=%d delta_retry_overflow=%d delta_tuple_resolved=%d delta_tuple_miss=%d worker_queue_peak=%d worker_queue_size=%d perf_pages=%d perf_per_cpu=%s lost_by_cpu=%s likely=%s)",
+		label,
+		delta.RecordsRead,
+		delta.PerfReceived,
+		delta.PerfLost,
+		delta.PerfLostRecords,
+		delta.KernelPerfErrors,
+		delta.KernelPerfOutputErrors,
+		delta.KernelPayloadReadErrors,
+		delta.DispatchBlocked,
+		delta.WorkerBackpressure,
+		delta.RetryQueued,
+		delta.RetryOverflow,
+		delta.TupleResolved,
+		delta.TupleMiss,
+		s.stats.workerQueuePeak.Load(),
+		s.cfg.WorkerQueueSize,
+		s.cfg.PerfPages,
+		formatBytesIEC(uint64(s.cfg.PerfBufferBytes())),
+		s.stats.perfLostCPUSummary(8),
+		likely,
+	)
+}
+
+func counterDelta(current, previous uint64) uint64 {
+	if current < previous {
+		return current
+	}
+	return current - previous
 }
 
 // attachAll 统一挂载 kprobe/kretprobe/tracepoint，并打印挂载成功信息。
@@ -2275,12 +2558,31 @@ func startPhaseWatch(ctx context.Context, phase string, interval time.Duration) 
 // decodeRawEvent 按内核 struct http_event 的内存布局把 perf 样本解码成 Go 结构体。
 func decodeRawEvent(sample []byte) (bpfgen.HttpTraceHttpEvent, error) {
 	var event bpfgen.HttpTraceHttpEvent
-	size := int(unsafe.Sizeof(event))
-	if len(sample) < size {
-		return event, fmt.Errorf("sample too small: got %d want %d", len(sample), size)
+	headerSize := int(unsafe.Offsetof(event.Payload))
+	if len(sample) < headerSize {
+		return event, fmt.Errorf("sample too small: got %d want at least %d", len(sample), headerSize)
 	}
-	buf := unsafe.Slice((*byte)(unsafe.Pointer(&event)), size)
-	copy(buf, sample[:size])
+	maxSize := int(unsafe.Sizeof(event))
+	// perf.Reader may expose up to seven alignment bytes after a sample.
+	const maxTrailingBytes = 7
+	if len(sample) > maxSize+maxTrailingBytes {
+		return event, fmt.Errorf(
+			"sample too large: got %d want at most %d (+ up to %d perf alignment bytes)",
+			len(sample),
+			maxSize,
+			maxTrailingBytes,
+		)
+	}
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(&event)), maxSize)
+	sampleSize := min(len(sample), maxSize)
+	copy(buf, sample[:sampleSize])
+	if int(event.PayloadLen) > sampleSize-headerSize {
+		return event, fmt.Errorf(
+			"sample payload too small: got %d want %d",
+			sampleSize-headerSize,
+			event.PayloadLen,
+		)
+	}
 	return event, nil
 }
 
@@ -2417,6 +2719,8 @@ func readKernelStats(m *ebpf.Map) (bpfgen.HttpTraceKernelStats, error) {
 		total.RecvEvents += v.RecvEvents
 		total.Filtered += v.Filtered
 		total.PerfErrors += v.PerfErrors
+		total.PerfOutputErrors += v.PerfOutputErrors
+		total.PayloadReadErrors += v.PayloadReadErrors
 		total.Truncations += v.Truncations
 		total.CloseEvents += v.CloseEvents
 		total.SockSendHits += v.SockSendHits
@@ -2441,6 +2745,7 @@ func readKernelStats(m *ebpf.Map) (bpfgen.HttpTraceKernelStats, error) {
 		total.TupleIpv6Portonly += v.TupleIpv6Portonly
 		total.TupleExtractFail += v.TupleExtractFail
 		total.TupleCacheUpdates += v.TupleCacheUpdates
+		total.TupleCacheUpdateFailures += v.TupleCacheUpdateFailures
 		total.TupleCacheDeletes += v.TupleCacheDeletes
 		total.TupleCacheHits += v.TupleCacheHits
 		total.TupleCacheMisses += v.TupleCacheMisses
