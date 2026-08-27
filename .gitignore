@@ -1,3 +1,4 @@
 ./qnhtest
 qnhtest
-./bin
+bin/
+./bin/
