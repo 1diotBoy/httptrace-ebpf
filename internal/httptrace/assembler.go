@@ -15,11 +15,13 @@ const minChunkedResponseStallTimeout = 5 * time.Second
 const minConservativeResponseStallTimeout = 5 * time.Second
 
 const (
-	eventFlagEnd          = 1 << 1
-	eventFlagCaptureTrunc = 1 << 2
-	eventFlagControl      = 1 << 4
-	eventFlagClose        = 1 << 5
-	eventFlagSizeOnly     = 1 << 6
+	eventFlagEnd             = 1 << 1
+	eventFlagCaptureTrunc    = 1 << 2
+	eventFlagControl         = 1 << 4
+	eventFlagClose           = 1 << 5
+	eventFlagSizeOnly        = 1 << 6
+	eventFlagCaptureBoundary = 1 << 7
+	defaultMaxActiveStates   = 65536
 )
 
 // 事件结构体
@@ -87,6 +89,12 @@ type Assembler struct {
 	orphanResponses   atomic.Uint64
 	promotedRequests  atomic.Uint64
 	deferredResponses atomic.Uint64
+	maxRetainedBytes  atomic.Int64
+	retainedBytes     atomic.Int64
+	bufferDrops       atomic.Uint64
+	maxActiveStates   atomic.Int64
+	activeStates      atomic.Int64
+	stateDrops        atomic.Uint64
 }
 
 type stateShard struct {
@@ -125,23 +133,27 @@ type traceState struct {
 }
 
 type fragmentStream struct {
-	received      map[uint16][]byte
-	nextFrag      uint16
-	buffer        []byte
-	observedBytes uint64
-	truncated     bool
-	finalReady    bool
-	firstTS       *time.Time
+	received        map[uint16][]byte
+	release         func(int)
+	nextFrag        uint16
+	buffer          []byte
+	observedBytes   uint64
+	truncated       bool
+	captureBoundary bool
+	finalReady      bool
+	firstTS         *time.Time
 }
 
 type pendingRequest struct {
-	chainID          uint64
-	requestTS        *time.Time
-	request          *ParsedMessage
-	requestTruncated bool
-	emitted          bool
-	requestSource    string
-	requestBase      TraceDocument
+	chainID           uint64
+	requestTS         *time.Time
+	request           *ParsedMessage
+	requestMethod     string
+	retainedBodyBytes int
+	requestTruncated  bool
+	emitted           bool
+	requestSource     string
+	requestBase       TraceDocument
 }
 
 type Snapshot struct {
@@ -155,6 +167,12 @@ type Snapshot struct {
 	OrphanResponses        uint64
 	PromotedRequests       uint64
 	DeferredResponses      uint64
+	RetainedBytes          uint64
+	MaxRetainedBytes       uint64
+	BufferDrops            uint64
+	ActiveTraceStates      uint64
+	MaxActiveTraceStates   uint64
+	StateDrops             uint64
 }
 
 // NewAssembler 创建请求/响应聚合器。
@@ -179,7 +197,71 @@ func NewAssembler(maxMessageBytes int, maxIdle, responseStall time.Duration) *As
 		responseStall: responseStall,
 	}
 	asm.SetMaxMessageBytes(maxMessageBytes)
+	asm.SetMaxRetainedBytes(defaultRetainedBufferBudget(maxMessageBytes))
+	asm.SetMaxActiveStates(defaultMaxActiveStates)
 	return asm
+}
+
+func defaultRetainedBufferBudget(messageLimit int) int {
+	if messageLimit <= 0 {
+		messageLimit = 32 * 1024
+	}
+	// 请求和响应可能同时处于缓冲状态。为 32 组此类交互预留空间，
+	// 同时限制因丢失事件导致的聚合器内存保留量。
+	budget := messageLimit * 64
+	if budget < 16<<20 {
+		budget = 16 << 20
+	}
+	if budget > 64<<20 {
+		budget = 64 << 20
+	}
+	return budget
+}
+
+// SetMaxRetainedBytes 限制所有未完成流保留的字节数。否则 perf 丢失事件可能导致
+// 大量未完成的大消息一直存活到事务 TTL 到期。
+func (a *Assembler) SetMaxRetainedBytes(limit int) {
+	if a == nil {
+		return
+	}
+	if limit <= 0 {
+		limit = defaultRetainedBufferBudget(a.MaxMessageBytes())
+	}
+	a.maxRetainedBytes.Store(int64(limit))
+}
+
+func (a *Assembler) MaxRetainedBytes() int {
+	if a == nil {
+		return 0
+	}
+	return int(a.maxRetainedBytes.Load())
+}
+
+func (a *Assembler) reserveStreamBytes(size int) bool {
+	if a == nil || size <= 0 {
+		return true
+	}
+	limit := a.maxRetainedBytes.Load()
+	for {
+		current := a.retainedBytes.Load()
+		if limit > 0 && current > limit-int64(size) {
+			a.bufferDrops.Add(1)
+			return false
+		}
+		if a.retainedBytes.CompareAndSwap(current, current+int64(size)) {
+			return true
+		}
+	}
+}
+
+func (a *Assembler) releaseStreamBytes(size int) {
+	if a == nil || size <= 0 {
+		return
+	}
+	remaining := a.retainedBytes.Add(-int64(size))
+	if remaining < 0 {
+		a.retainedBytes.Store(0)
+	}
 }
 
 func (a *Assembler) MaxMessageBytes() int {
@@ -254,7 +336,7 @@ func (a *Assembler) logResponseDecision(path string, state *traceState, msg *Par
 	}
 	buf := state.responseStream.buffer
 	log.Printf(
-		"response parse path=%s chain=%d sock=%d src=%s status=%d cl=%d te=%q conn=%q chunked=%t body_partial=%t truncated=%t stream_trunc=%t final_ready=%t observed=%d buf_len=%d consumed=%d body_bytes=%d raw_prefix=%q raw_suffix=%q body_preview=%q",
+		"响应解析路径：path=%s chain=%d sock=%d src=%s status=%d cl=%d te=%q conn=%q chunked=%t body_partial=%t truncated=%t stream_trunc=%t final_ready=%t observed=%d buf_len=%d consumed=%d body_bytes=%d raw_prefix=%q raw_suffix=%q body_preview=%q",
 		path,
 		state.base.ChainID,
 		state.base.SockID,
@@ -300,7 +382,7 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 		}
 	}
 	if isTLSSource(event.Source) {
-		// TLS raw chain 的首片段如果根本不像 HTTP request line，
+		// TLS raw chain 的首片段如果根本不像 HTTP 请求起始行，
 		// 说明这更像是被内核态误起出来的噪声 chain（常见前缀是 JS/CSS/body 碎片）。
 		// 这类 chain 后续即便再来同 chain 的 response，也不应该参与真实业务配对，
 		// 否则会把请求/响应数抬高，并污染最终落库结果。
@@ -320,6 +402,14 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 	}
 
 	if state == nil {
+		// 仅大小事件不包含可采集正文。在高 QPS 下，为已经丢失的链路创建状态，
+		// 会让映射元数据一直保留到 TTL 到期。
+		if event.Flags&eventFlagSizeOnly != 0 || !a.reserveTraceState() {
+			if event.Flags&eventFlagSizeOnly == 0 {
+				a.stateDrops.Add(1)
+			}
+			return nil, nil
+		}
 		state = &traceState{
 			base: TraceDocument{
 				ChainID:       event.ChainID,
@@ -335,14 +425,18 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 				SrcPort:       event.SrcPort,
 				DstPort:       event.DstPort,
 			},
-			requestStream:  fragmentStream{received: make(map[uint16][]byte)},
-			responseStream: fragmentStream{received: make(map[uint16][]byte)},
+			requestStream:  fragmentStream{received: make(map[uint16][]byte), release: a.releaseStreamBytes},
+			responseStream: fragmentStream{received: make(map[uint16][]byte), release: a.releaseStreamBytes},
 			requestSource:  event.Source,
 			responseSource: event.Source,
 		}
 		shard.traces[event.ChainID] = state
 	}
-	refreshBaseTuple(&state.base, event)
+	// 请求/响应的最终大小事件可能从相反的 socket 方向产生。它们只用于统计，
+	// 不能替换从正文事件中获取的五元组。
+	if event.Flags&eventFlagSizeOnly == 0 {
+		refreshBaseTuple(&state.base, event)
+	}
 	state.lastUpdated = time.Now()
 	switch event.Direction {
 	case DirectionRequest:
@@ -356,16 +450,14 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 		state.responseUpdated = state.lastUpdated
 	}
 
-	// TLS plaintext is tracked one logical exchange per kernel chain_id. Once a
-	// request has been emitted for this TLS chain, any later SSL_read fragments
-	// on the same chain are stale follow-ons from the same request and must not
-	// produce a second logical request.
+	// TLS 明文按每个内核 chain_id 跟踪一组逻辑交互。该 TLS 链路的请求一旦输出，
+	// 同一链路后续的 SSL_read 分片就属于同一请求的过期后续片段，不能再次生成逻辑请求。
 	if event.Direction == DirectionRequest && isTLSSource(event.Source) {
 		if state.requestEmitted {
 			return nil, nil
 		}
-		// Before the first request update is emitted, still ignore obvious body-only
-		// follow-on chunks after a truncated request head so they don't park forever.
+		// 在首次请求更新输出前，截断的请求头之后如果出现明显只有正文的后续分片，
+		// 仍然忽略它们，避免这些分片永久停留在队列中。
 		if len(state.pendingRequests) > 0 && !looksLikeTLSRequestStart(event.Payload) {
 			return nil, nil
 		}
@@ -381,7 +473,7 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 		return nil, nil
 	}
 
-	if stream.firstTS == nil {
+	if stream.firstTS == nil && event.Flags&eventFlagSizeOnly == 0 {
 		ts := event.Timestamp
 		stream.firstTS = &ts
 	}
@@ -392,6 +484,9 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 		stream.observedBytes = event.ObservedMessageBytes
 	}
 	if event.Flags&eventFlagSizeOnly != 0 {
+		if stream.captureBoundary && event.ObservedMessageBytes > uint64(len(stream.buffer)) {
+			stream.truncated = true
+		}
 		if event.Flags&eventFlagEnd != 0 {
 			stream.finalReady = true
 			return a.tryEmitUpdates(state, shard, event.ChainID, false)
@@ -400,17 +495,29 @@ func (a *Assembler) Process(event Event) ([]Update, error) {
 	}
 	if len(event.Payload) > 0 {
 		if _, exists := stream.received[event.FragIdx]; !exists {
-			stream.received[event.FragIdx] = append([]byte(nil), event.Payload...)
+			if a.reserveStreamBytes(len(event.Payload)) {
+				stream.received[event.FragIdx] = append([]byte(nil), event.Payload...)
+			} else {
+				// 保持统计事件继续流动，但当进程已经承受聚合器内存压力时，
+				// 绝不继续无上限地保留正文。
+				stream.truncated = true
+				stream.captureBoundary = true
+				stream.finalReady = true
+			}
 		}
 	}
 	if event.Flags&eventFlagCaptureTrunc != 0 {
 		stream.truncated = true
+	}
+	if event.Flags&eventFlagCaptureBoundary != 0 {
+		stream.captureBoundary = true
 	}
 	if !stream.truncated {
 		stream.drain(a.MaxMessageBytes())
 	} else {
 		for frag := range stream.received {
 			if frag < stream.nextFrag {
+				stream.releaseBytes(len(stream.received[frag]))
 				delete(stream.received, frag)
 			}
 		}
@@ -473,8 +580,7 @@ func (a *Assembler) FlushStalled(now time.Time) []Update {
 				a.stalledFlushes.Add(uint64(len(flushed)))
 			}
 			if state.canDelete() {
-				delete(shard.traces, chainID)
-				markClosedTLSChain(shard, chainID, state)
+				a.deleteTraceState(shard, chainID, state)
 			}
 		}
 		shard.mu.Unlock()
@@ -484,7 +590,7 @@ func (a *Assembler) FlushStalled(now time.Time) []Update {
 }
 
 // EvictExpired 是周期性 idle eviction 的核心：
-// 1. 根据 last_updated 时间戳，移除超过 maxIdle 的 state。
+	// 1. 根据 last_updated 时间戳，移除超过 maxIdle 的状态。
 // 2. 尝试解析完整 HTTP。
 // 3. 请求一旦完整就立即返回 update，响应完整后再返回完整链路 update。
 func (a *Assembler) EvictExpired(now time.Time) ([]Update, int) {
@@ -507,16 +613,17 @@ func (a *Assembler) EvictExpired(now time.Time) ([]Update, int) {
 				updates = append(updates, flushed...)
 				a.evictedFlushes.Add(uint64(len(flushed)))
 			}
-			delete(shard.traces, chainID)
-			markClosedTLSChain(shard, chainID, state)
+			a.deleteTraceState(shard, chainID, state)
 			evicted++
 		}
 		shard.mu.Unlock()
 	}
-	// TLS delayed requests 不能在周期性 idle eviction 里直接移除。
-	// 它们和 response 通过 tls session FIFO 关联；如果这里先删掉 request，
-	// 后面晚到的 response 就会永久失配，表现成 response 样本数偏少。
-	// TLS pending 只在 shutdown 收尾时统一 flush。
+	// TLS 待处理请求也必须遵守空闲时间上限。否则没有响应的请求会一直把已采集正文
+	// 保留在会话 FIFO 中，直到进程退出。移除前会先输出请求；超过 maxIdle 后到达的响应
+	// 会按孤立响应处理，避免无限制保留内存。
+	tlsUpdates, tlsEvicted := a.evictExpiredTLSPending(now)
+	updates = append(updates, tlsUpdates...)
+	evicted += tlsEvicted
 	return updates, evicted
 }
 
@@ -535,8 +642,7 @@ func (a *Assembler) FlushAll() ([]Update, int) {
 			if len(flushed) > 0 {
 				updates = append(updates, flushed...)
 			}
-			delete(shard.traces, chainID)
-			markClosedTLSChain(shard, chainID, state)
+			a.deleteTraceState(shard, chainID, state)
 			flushedStates++
 		}
 		clear(shard.closedTLS)
@@ -585,8 +691,9 @@ func (a *Assembler) evictExpiredTLSPending(now time.Time) ([]Update, int) {
 		shard := &a.tlsShards[i]
 		shard.mu.Lock()
 		for sockID, session := range shard.sessions {
-			keep := session.pending[:0]
-			for _, pending := range session.pending {
+			original := session.pending
+			keep := original[:0]
+			for _, pending := range original {
 				if pending.requestTS == nil || now.Sub(*pending.requestTS) <= a.maxIdle {
 					keep = append(keep, pending)
 					continue
@@ -595,6 +702,9 @@ func (a *Assembler) evictExpiredTLSPending(now time.Time) ([]Update, int) {
 					updates = append(updates, update)
 				}
 				evicted++
+			}
+			for idx := len(keep); idx < len(original); idx++ {
+				original[idx] = pendingRequest{}
 			}
 			if len(keep) == 0 {
 				delete(shard.sessions, sockID)
@@ -668,6 +778,12 @@ func (a *Assembler) Snapshot() Snapshot {
 	snap.OrphanResponses = a.orphanResponses.Load()
 	snap.PromotedRequests = a.promotedRequests.Load()
 	snap.DeferredResponses = a.deferredResponses.Load()
+	snap.RetainedBytes = uint64(maxInt64(a.retainedBytes.Load(), 0))
+	snap.MaxRetainedBytes = uint64(maxInt64(a.maxRetainedBytes.Load(), 0))
+	snap.BufferDrops = a.bufferDrops.Load()
+	snap.ActiveTraceStates = uint64(maxInt64(a.activeStates.Load(), 0))
+	snap.MaxActiveTraceStates = uint64(maxInt64(a.maxActiveStates.Load(), 0))
+	snap.StateDrops = a.stateDrops.Load()
 	return snap
 }
 
@@ -857,7 +973,7 @@ func (a *Assembler) enqueueTLSPending(sockID uint64, pending pendingRequest) {
 			// 最终表现成 raw request 已经到了用户态，但 update 数偏少。
 			if tlsPendingShouldSuppress(existing) && tlsPendingQuality(pending) > tlsPendingQuality(existing) {
 				if a.debugTLSQueue {
-					log.Printf("tls queue replace sock=%d old_chain=%d new_chain=%d sig=%q old_quality=%d new_quality=%d",
+					log.Printf("TLS 队列替换：sock=%d old_chain=%d new_chain=%d sig=%q old_quality=%d new_quality=%d",
 						sockID, existing.chainID, pending.chainID, sig, tlsPendingQuality(existing), tlsPendingQuality(pending))
 				}
 				session.pending = append(session.pending[:idx], session.pending[idx+1:]...)
@@ -865,7 +981,7 @@ func (a *Assembler) enqueueTLSPending(sockID uint64, pending pendingRequest) {
 			}
 			if tlsPendingShouldSuppress(pending) && tlsPendingQuality(existing) >= tlsPendingQuality(pending) {
 				if a.debugTLSQueue {
-					log.Printf("tls queue drop-duplicate sock=%d chain=%d existing_chain=%d sig=%q existing_quality=%d new_quality=%d",
+					log.Printf("TLS 队列丢弃重复请求：sock=%d chain=%d existing_chain=%d sig=%q existing_quality=%d new_quality=%d",
 						sockID, pending.chainID, existing.chainID, sig, tlsPendingQuality(existing), tlsPendingQuality(pending))
 				}
 				shard.mu.Unlock()
@@ -881,7 +997,7 @@ func (a *Assembler) enqueueTLSPending(sockID uint64, pending pendingRequest) {
 	// 这样既能处理 phantom duplicate，又不会凭空少记 request。
 	if lowConfidence && sig == "" {
 		if a.debugTLSQueue {
-			log.Printf("tls queue suppress sock=%d chain=%d source=%s sig=%q quality=%d observed=%d content_length=%d truncated=%t body_partial=%t",
+			log.Printf("TLS 队列抑制请求：sock=%d chain=%d source=%s sig=%q quality=%d observed=%d content_length=%d truncated=%t body_partial=%t",
 				sockID, pending.chainID, pending.requestSource, sig, tlsPendingQuality(pending),
 				pendingObserved(pending), pendingContentLength(pending), pending.requestTruncated, pendingBodyPartial(pending))
 		}
@@ -894,7 +1010,7 @@ func (a *Assembler) enqueueTLSPending(sockID uint64, pending pendingRequest) {
 		if lowConfidence {
 			action = "enqueue-low-confidence"
 		}
-		log.Printf("tls queue %s sock=%d chain=%d source=%s sig=%q quality=%d size=%d",
+		log.Printf("TLS 队列%s：sock=%d chain=%d source=%s sig=%q quality=%d size=%d",
 			action, sockID, pending.chainID, pending.requestSource, sig, tlsPendingQuality(pending), len(session.pending))
 	}
 	shard.mu.Unlock()
@@ -926,12 +1042,13 @@ func (a *Assembler) popTLSPending(sockID uint64) (pendingRequest, bool) {
 		return pendingRequest{}, false
 	}
 	pending := session.pending[0]
+	session.pending[0] = pendingRequest{}
 	session.pending = session.pending[1:]
 	if len(session.pending) == 0 {
 		delete(shard.sessions, sockID)
 	}
 	if a.debugTLSQueue {
-		log.Printf("tls queue pop sock=%d chain=%d source=%s sig=%q remain=%d",
+		log.Printf("TLS 队列取出：sock=%d chain=%d source=%s sig=%q remain=%d",
 			sockID, pending.chainID, pending.requestSource, tlsPendingSignature(pending), len(session.pending))
 	}
 	return pending, true
@@ -947,7 +1064,7 @@ func (a *Assembler) assignTLSPending(state *traceState) bool {
 	}
 	state.tlsAssigned = &pending
 	if a.debugTLSQueue {
-		log.Printf("tls queue assign sock=%d response_chain=%d request_chain=%d response_source=%s request_source=%s sig=%q",
+		log.Printf("TLS 队列分配：sock=%d response_chain=%d request_chain=%d response_source=%s request_source=%s sig=%q",
 			state.base.SockID, state.base.ChainID, pending.chainID, state.responseSource, pending.requestSource, tlsPendingSignature(pending))
 	}
 	return true
@@ -961,14 +1078,14 @@ func (a *Assembler) consumeTLSPendingForState(state *traceState) (pendingRequest
 		pending := *state.tlsAssigned
 		state.tlsAssigned = nil
 		if a.debugTLSQueue {
-			log.Printf("tls queue consume-assigned sock=%d response_chain=%d request_chain=%d sig=%q",
+			log.Printf("TLS 队列消费已分配请求：sock=%d response_chain=%d request_chain=%d sig=%q",
 				state.base.SockID, state.base.ChainID, pending.chainID, tlsPendingSignature(pending))
 		}
 		return pending, true
 	}
 	pending, ok := a.popTLSPending(state.base.SockID)
 	if ok && a.debugTLSQueue {
-		log.Printf("tls queue consume-direct sock=%d response_chain=%d request_chain=%d sig=%q",
+		log.Printf("TLS 队列直接消费请求：sock=%d response_chain=%d request_chain=%d sig=%q",
 			state.base.SockID, state.base.ChainID, pending.chainID, tlsPendingSignature(pending))
 	}
 	return pending, ok
@@ -1118,6 +1235,7 @@ func (a *Assembler) ResetCounters() {
 	a.orphanResponses.Swap(0)
 	a.promotedRequests.Swap(0)
 	a.deferredResponses.Swap(0)
+	a.bufferDrops.Swap(0)
 }
 
 func (a *Assembler) HasState(chainID uint64) bool {
@@ -1137,8 +1255,7 @@ func (a *Assembler) finalizeOnClose(state *traceState, shard *stateShard, chainI
 		return nil, err
 	}
 	if state.canDelete() {
-		delete(shard.traces, chainID)
-		markClosedTLSChain(shard, chainID, state)
+		a.deleteTraceState(shard, chainID, state)
 	}
 	return updates, nil
 }
@@ -1159,8 +1276,7 @@ func (a *Assembler) tryEmitUpdates(state *traceState, shard *stateShard, chainID
 	updates = append(updates, responseUpdates...)
 
 	if state.canDelete() {
-		delete(shard.traces, chainID)
-		markClosedTLSChain(shard, chainID, state)
+		a.deleteTraceState(shard, chainID, state)
 	}
 	return updates, nil
 }
@@ -1197,11 +1313,9 @@ func (a *Assembler) emitRequests(state *traceState, eof bool) ([]Update, error) 
 			continue
 		}
 
-		// TLS plaintext capture currently emits verifier-friendly short fragments.
-		// Once request capture is marked truncated, favor preserving the parsed
-		// request head immediately instead of waiting for a full body that may
-		// never be captured into user space.
-		if state.requestStream.truncated {
+		// 当前 TLS 明文采集会输出便于 verifier 处理的短分片。请求采集一旦标记为截断，
+		// 应立即保留已解析的请求头，而不是等待可能永远无法进入用户态的完整正文。
+		if state.requestStream.truncated && (isTLSSource(state.requestSource) || state.requestStream.finalReady || eof) {
 			msg, ok, err := TryParseMessageHead(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: false})
 			if err == nil && ok {
 				annotateParsedMessage(msg, &state.requestStream)
@@ -1346,8 +1460,8 @@ func (a *Assembler) emitResponses(state *traceState, eof bool) ([]Update, error)
 
 	for len(state.responseStream.buffer) > 0 {
 		opts := ParseOptions{EOF: eof}
-		if !tlsSource && len(state.pendingRequests) > 0 && state.pendingRequests[0].request != nil {
-			opts.RequestMethod = state.pendingRequests[0].request.Method
+		if !tlsSource && len(state.pendingRequests) > 0 {
+			opts.RequestMethod = pendingRequestMethod(state.pendingRequests[0])
 		}
 
 		msg, complete, err := TryParseMessage(DirectionResponse, state.responseStream.buffer, opts)
@@ -1548,6 +1662,11 @@ func (a *Assembler) promoteRequestForResponse(state *traceState) ([]Update, erro
 	if len(state.pendingRequests) > 0 || len(state.requestStream.buffer) == 0 || len(state.responseStream.buffer) == 0 {
 		return nil, nil
 	}
+	// 被截断采集的请求会保留前缀，直到内核在第一个非 1xx 响应时上报最终观测大小。
+	// 如果过早提升它，计数会停留在超过采集上限的那个 syscall 时刻。
+	if state.requestStream.truncated && !state.requestStream.finalReady {
+		return nil, nil
+	}
 
 	msg, complete, err := TryParseMessage(DirectionRequest, state.requestStream.buffer, ParseOptions{EOF: false})
 	if err == nil && complete {
@@ -1613,8 +1732,8 @@ func (a *Assembler) flushPartialResponse(state *traceState) []Update {
 	}
 
 	opts := ParseOptions{}
-	if !tlsSource && state.pendingRequests[0].request != nil {
-		opts.RequestMethod = state.pendingRequests[0].request.Method
+	if !tlsSource {
+		opts.RequestMethod = pendingRequestMethod(state.pendingRequests[0])
 	}
 
 	if msg, complete, err := TryParseMessage(DirectionResponse, state.responseStream.buffer, opts); err == nil && complete {
@@ -1717,9 +1836,11 @@ func (t *traceState) buildRequestUpdate(chainID uint64, msg *ParsedMessage, ts *
 	})
 	t.requestEmitted = true
 	t.pendingRequests = append(t.pendingRequests, pendingRequest{
-		chainID:          chainID,
-		requestTS:        cloneTimePtr(ts),
-		request:          msg,
+		chainID:   chainID,
+		requestTS: cloneTimePtr(ts),
+		// 非 TLS 响应只需要请求方法来判断是否允许正文。将 msg 保存在这里会在响应到达前
+		// 额外复制一份可能达到数 MiB 的采集正文。
+		requestMethod:    msg.Method,
 		requestTruncated: truncated,
 		emitted:          true,
 		requestSource:    t.requestSource,
@@ -1759,6 +1880,7 @@ func (t *traceState) buildResponseUpdate(msg *ParsedMessage, ts *time.Time, trun
 	// 否则使用 base 的 chainID
 	if len(t.pendingRequests) > 0 {
 		pending := t.pendingRequests[0]
+		t.pendingRequests[0] = pendingRequest{}
 		t.pendingRequests = t.pendingRequests[1:]
 		doc.ChainID = pending.chainID
 		if pending.requestTS != nil && ts != nil {
@@ -1798,11 +1920,22 @@ func (t *traceState) queuePendingRequest(chainID uint64, msg *ParsedMessage, ts 
 		chainID:          chainID,
 		requestTS:        cloneTimePtr(ts),
 		request:          msg,
+		requestMethod:    pendingRequestMethod(pendingRequest{request: msg}),
 		requestTruncated: truncated,
 		emitted:          emitted,
 		requestSource:    t.requestSource,
 		requestBase:      t.base,
 	})
+}
+
+func pendingRequestMethod(pending pendingRequest) string {
+	if pending.requestMethod != "" {
+		return pending.requestMethod
+	}
+	if pending.request != nil {
+		return pending.request.Method
+	}
+	return ""
 }
 
 func (t *traceState) makeRequestUpdate(pending pendingRequest) Update {
@@ -1968,6 +2101,79 @@ func maybePromoteStalledChunkedResponse(stream *fragmentStream, msg *ParsedMessa
 	msg.BodyPartial = false
 }
 
+func (a *Assembler) deleteTraceState(shard *stateShard, chainID uint64, state *traceState) {
+	if state == nil {
+		delete(shard.traces, chainID)
+		return
+	}
+	state.requestStream.consumeAll()
+	state.responseStream.consumeAll()
+	state.pendingRequests = nil
+	if state.tlsAssigned != nil {
+		a.releasePendingBody(state.tlsAssigned)
+	}
+	state.tlsAssigned = nil
+	delete(shard.traces, chainID)
+	a.activeStates.Add(-1)
+	markClosedTLSChain(shard, chainID, state)
+}
+
+// SetMaxActiveStates 独立于分片字节数限制追踪元数据。仅大小事件的正文长度可能为零，
+// 但追踪状态仍会持有映射、时间戳和待处理请求元数据。
+func (a *Assembler) SetMaxActiveStates(limit int) {
+	if a == nil {
+		return
+	}
+	if limit <= 0 {
+		limit = defaultMaxActiveStates
+	}
+	a.maxActiveStates.Store(int64(limit))
+}
+
+func (a *Assembler) reserveTraceState() bool {
+	if a == nil {
+		return false
+	}
+	limit := a.maxActiveStates.Load()
+	for {
+		current := a.activeStates.Load()
+		if limit > 0 && current >= limit {
+			return false
+		}
+		if a.activeStates.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+// retainPendingBody 让会话 FIFO 中等待响应的 TLS 请求与未完成分片共用进程级上限。
+// 已经输出的请求会进入拥有独立队列预算的控制台/Redis 管道，因此这里只统计 FIFO 副本。
+func (a *Assembler) retainPendingBody(pending *pendingRequest) {
+	if a == nil || pending == nil || pending.request == nil || pending.retainedBodyBytes > 0 {
+		return
+	}
+	size := len(pending.request.Body)
+	if size == 0 {
+		return
+	}
+	if a.reserveStreamBytes(size) {
+		pending.retainedBodyBytes = size
+		return
+	}
+	// 保留已解析元数据和原始正文大小，但不保留会使聚合器超过配置预算的正文。
+	pending.request.Body = ""
+	pending.request.BodyPartial = true
+	pending.requestTruncated = true
+}
+
+func (a *Assembler) releasePendingBody(pending *pendingRequest) {
+	if a == nil || pending == nil || pending.retainedBodyBytes <= 0 {
+		return
+	}
+	a.releaseStreamBytes(pending.retainedBodyBytes)
+	pending.retainedBodyBytes = 0
+}
+
 func (s *fragmentStream) drain(maxMessageBytes int) {
 	for {
 		part, ok := s.received[s.nextFrag]
@@ -1981,6 +2187,7 @@ func (s *fragmentStream) drain(maxMessageBytes int) {
 			if remain > 0 {
 				s.buffer = append(s.buffer, part[:remain]...)
 			}
+			s.releaseBytes(len(part) - max(remain, 0))
 			s.truncated = true
 			continue
 		}
@@ -1996,6 +2203,7 @@ func (s *fragmentStream) consume(n int) {
 		s.consumeAll()
 		return
 	}
+	s.releaseBytes(n)
 	s.buffer = append([]byte(nil), s.buffer[n:]...)
 	if s.observedBytes > uint64(n) {
 		s.observedBytes -= uint64(n)
@@ -2006,6 +2214,11 @@ func (s *fragmentStream) consume(n int) {
 }
 
 func (s *fragmentStream) consumeAll() {
+	released := len(s.buffer)
+	for _, part := range s.received {
+		released += len(part)
+	}
+	s.releaseBytes(released)
 	s.buffer = nil
 	if s.received != nil {
 		for k := range s.received {
@@ -2015,7 +2228,21 @@ func (s *fragmentStream) consumeAll() {
 	s.firstTS = nil
 	s.observedBytes = 0
 	s.truncated = false
+	s.captureBoundary = false
 	s.finalReady = false
+}
+
+func (s *fragmentStream) releaseBytes(n int) {
+	if n > 0 && s.release != nil {
+		s.release(n)
+	}
+}
+
+func maxInt64(v, floor int64) int64 {
+	if v < floor {
+		return floor
+	}
+	return v
 }
 
 func summarizeDebugPrefix(payload []byte, limit int) string {
@@ -2048,16 +2275,16 @@ func summarizeDebugPrefix(payload []byte, limit int) string {
 func (d TraceDocument) SummaryLine() string {
 	switch {
 	case d.Request != nil && d.Response == nil:
-		return fmt.Sprintf("request chain=%d pid=%d fd=%d source=%s %s %s", d.ChainID, d.PID, d.FD, d.CaptureSource, d.Request.Method, d.Request.URL)
+		return fmt.Sprintf("请求 chain=%d pid=%d fd=%d source=%s %s %s", d.ChainID, d.PID, d.FD, d.CaptureSource, d.Request.Method, d.Request.URL)
 	case d.Request != nil && d.Response != nil:
 		latency := 0.0
 		if d.ResponseLatency != nil {
 			latency = *d.ResponseLatency
 		}
-		return fmt.Sprintf("response chain=%d pid=%d fd=%d source=%s %d %.2fms", d.ChainID, d.PID, d.FD, d.CaptureSource, d.Response.StatusCode, latency)
+		return fmt.Sprintf("响应 chain=%d pid=%d fd=%d source=%s %d %.2fms", d.ChainID, d.PID, d.FD, d.CaptureSource, d.Response.StatusCode, latency)
 	case d.Request == nil && d.Response != nil:
-		return fmt.Sprintf("response chain=%d pid=%d fd=%d source=%s %d", d.ChainID, d.PID, d.FD, d.CaptureSource, d.Response.StatusCode)
+		return fmt.Sprintf("响应 chain=%d pid=%d fd=%d source=%s %d", d.ChainID, d.PID, d.FD, d.CaptureSource, d.Response.StatusCode)
 	default:
-		return fmt.Sprintf("trace chain=%d pid=%d fd=%d source=%s", d.ChainID, d.PID, d.FD, d.CaptureSource)
+		return fmt.Sprintf("追踪 chain=%d pid=%d fd=%d source=%s", d.ChainID, d.PID, d.FD, d.CaptureSource)
 	}
 }

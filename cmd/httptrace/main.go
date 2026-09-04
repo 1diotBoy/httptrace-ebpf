@@ -23,50 +23,52 @@ func main() {
 	sm4encryptStr := flag.String("sm4encryptStr", "", "传入密码，使用SM4加密后输出（不启动服务）")
 
 	// 过滤规则配置
-	flag.StringVar(&cfg.IfName, "ifname", cfg.IfName, "filter by interface name")
-	flag.StringVar(&cfg.SrcIP, "src-ip", cfg.SrcIP, "filter by IPv4 endpoint; if dst-ip is empty, matches either endpoint")
-	flag.StringVar(&cfg.DstIP, "dst-ip", cfg.DstIP, "filter by IPv4 endpoint; if src-ip is empty, matches either endpoint")
-	flag.UintVar(&cfg.SrcPort, "src-port", cfg.SrcPort, "filter by port endpoint; if dst-port is empty, matches either endpoint")
-	flag.UintVar(&cfg.DstPort, "dst-port", cfg.DstPort, "filter by port endpoint; if src-port is empty, matches either endpoint")
-	flag.StringVar(&cfg.HeartbeatServer, "heartbeat-server", cfg.HeartbeatServer, "heartbeat server base address; POSTs to /v2/dataCollectClient/heartbeat when set")
-	flag.BoolVar(&cfg.EnableTLS, "enable-tls", cfg.EnableTLS, "enable HTTPS plaintext capture through OpenSSL uprobes; disabled by default")
-	flag.StringVar(&cfg.TLSLibPath, "tls-lib-path", cfg.TLSLibPath, "comma-separated libssl paths override; empty auto-discovers nginx mapped libssl")
-	flag.StringVar(&cfg.TLSComm, "tls-comm", cfg.TLSComm, "process comm name used by TLS uprobes, default nginx")
-	flag.BoolVar(&cfg.SuppressSocketForTLS, "tls-suppress-socket", cfg.SuppressSocketForTLS, "when TLS capture is enabled, suppress legacy socket HTTP events for the same comm; default false so HTTP and HTTPS can be collected together")
-	flag.BoolVar(&cfg.DisableKernelFilter, "disable-kernel-filter", cfg.DisableKernelFilter, "disable kernel-side IP/port filtering for isolation; all filtering is skipped before perf output")
-	flag.BoolVar(&cfg.DisableUserTuple, "disable-user-tuple", cfg.DisableUserTuple, "disable /proc tuple resolve and user-space tuple filter; keep kernel tuple in output when available")
+	flag.StringVar(&cfg.IfName, "ifname", cfg.IfName, "按网络接口名称过滤")
+	flag.StringVar(&cfg.SrcIP, "src-ip", cfg.SrcIP, "按 IPv4 端点过滤；dst-ip 为空时匹配任一端点")
+	flag.StringVar(&cfg.DstIP, "dst-ip", cfg.DstIP, "按 IPv4 端点过滤；src-ip 为空时匹配任一端点")
+	flag.UintVar(&cfg.SrcPort, "src-port", cfg.SrcPort, "按端口端点过滤；dst-port 为空时匹配任一端点")
+	flag.UintVar(&cfg.DstPort, "dst-port", cfg.DstPort, "按端口端点过滤；src-port 为空时匹配任一端点")
+	flag.StringVar(&cfg.HeartbeatServer, "heartbeat-server", cfg.HeartbeatServer, "心跳服务器基础地址；设置后向 /v2/dataCollectClient/heartbeat 发送 POST 请求")
+	flag.BoolVar(&cfg.EnableTLS, "enable-tls", cfg.EnableTLS, "通过 OpenSSL uprobe 开启 HTTPS 明文采集；默认关闭")
+	flag.StringVar(&cfg.TLSLibPath, "tls-lib-path", cfg.TLSLibPath, "以逗号分隔的 libssl 路径覆盖项；为空时自动发现 nginx 映射的 libssl")
+	flag.StringVar(&cfg.TLSComm, "tls-comm", cfg.TLSComm, "TLS uprobe 使用的进程 comm 名称，默认 nginx")
+	flag.BoolVar(&cfg.SuppressSocketForTLS, "tls-suppress-socket", cfg.SuppressSocketForTLS, "启用 TLS 采集时，抑制同一 comm 的旧 socket HTTP 事件；默认关闭，以便同时采集 HTTP 和 HTTPS")
+	flag.BoolVar(&cfg.DisableKernelFilter, "disable-kernel-filter", cfg.DisableKernelFilter, "关闭内核侧 IP/端口过滤以便隔离排查；perf 输出前跳过全部过滤")
+	flag.BoolVar(&cfg.DisableUserTuple, "disable-user-tuple", cfg.DisableUserTuple, "关闭 /proc 五元组解析和用户态五元组过滤；可用时仍在输出中保留内核五元组")
 
 	// 采集规则配置
-	flag.IntVar(&cfg.CaptureBytes, "capture-bytes", cfg.CaptureBytes, "maximum payload bytes captured per request/response in kernel, values above 32KB are truncated")
-	flag.IntVar(&cfg.PerfPages, "perf-pages", cfg.PerfPages, "perf buffer pages per CPU")
-	flag.IntVar(&cfg.BatchSize, "batch-size", cfg.BatchSize, "events parsed per worker batch")
-	flag.IntVar(&cfg.WorkerCount, "workers", cfg.WorkerCount, "number of parser workers")
-	flag.IntVar(&cfg.WorkerQueueSize, "worker-queue-size", cfg.WorkerQueueSize, "buffered parser events per worker, 0 auto-tunes for available memory")
-	flag.DurationVar(&cfg.TransactionTTL, "txn-ttl", cfg.TransactionTTL, "idle transaction eviction TTL")
-	flag.IntVar(&cfg.MaxMessageBytes, "max-message-bytes", cfg.MaxMessageBytes, "maximum reassembled bytes kept per request/response; should stay aligned with kernel capture limit")
+	flag.IntVar(&cfg.CaptureBytes, "capture-bytes", cfg.CaptureBytes, "内核中每个请求/响应最多采集的负载字节数")
+	flag.IntVar(&cfg.PerfPages, "perf-pages", cfg.PerfPages, "每个 CPU 的 perf 缓冲区页数")
+	flag.IntVar(&cfg.BatchSize, "batch-size", cfg.BatchSize, "每个 worker 批量解析的事件数")
+	flag.IntVar(&cfg.WorkerCount, "workers", cfg.WorkerCount, "解析 worker 数量")
+	flag.IntVar(&cfg.WorkerQueueSize, "worker-queue-size", cfg.WorkerQueueSize, "每个 worker 缓存的解析事件数；0 表示按可用内存自动调整")
+	flag.DurationVar(&cfg.TransactionTTL, "txn-ttl", cfg.TransactionTTL, "空闲事务淘汰 TTL")
+	flag.IntVar(&cfg.MaxMessageBytes, "max-message-bytes", cfg.MaxMessageBytes, "每个请求/响应最多保留的重组字节数；应与内核采集上限保持一致")
+	flag.IntVar(&cfg.AssemblerBufferBytes, "assembler-buffer-bytes", cfg.AssemblerBufferBytes, "进程范围内为不完整请求/响应片段保留的字节数")
 
 	// 用户态日志配置
-	flag.DurationVar(&cfg.FlushInterval, "flush-interval", cfg.FlushInterval, "batch flush interval")
-	flag.DurationVar(&cfg.LogInterval, "log-interval", cfg.LogInterval, "stats log interval")
-	flag.BoolVar(&cfg.PrintHTTP, "print-http", cfg.PrintHTTP, "print parsed HTTP request/response to console")
-	flag.BoolVar(&cfg.PrintSummary, "print-summary", cfg.PrintSummary, "print one-line request/response summary to console")
-	flag.BoolVar(&cfg.DebugKernel, "debug-kernel", cfg.DebugKernel, "print extended kernel hook/branch diagnostics")
+	flag.DurationVar(&cfg.FlushInterval, "flush-interval", cfg.FlushInterval, "批量刷新间隔")
+	flag.DurationVar(&cfg.LogInterval, "log-interval", cfg.LogInterval, "统计日志间隔")
+	flag.BoolVar(&cfg.PrintHTTP, "print-http", cfg.PrintHTTP, "将解析后的 HTTP 请求/响应打印到控制台")
+	flag.BoolVar(&cfg.PrintSummary, "print-summary", cfg.PrintSummary, "将请求/响应单行摘要打印到控制台")
+	flag.BoolVar(&cfg.DebugKernel, "debug-kernel", cfg.DebugKernel, "打印扩展的内核 hook/分支诊断信息")
 
 	// nginx 响应等待
-	flag.DurationVar(&cfg.ResponseStallTimeout, "response-stall-timeout", cfg.ResponseStallTimeout, "flush incomplete responses after this idle timeout, useful for nginx/sendfile-style response paths")
+	flag.DurationVar(&cfg.ResponseStallTimeout, "response-stall-timeout", cfg.ResponseStallTimeout, "超过此空闲时间后刷新不完整响应，适用于 nginx/sendfile 类型响应路径")
 
 	// redis 相关配置
-	flag.IntVar(&cfg.RedisWorkers, "redis-workers", cfg.RedisWorkers, "number of async redis writer workers")
-	flag.IntVar(&cfg.RedisQueueSize, "redis-queue-size", cfg.RedisQueueSize, "buffered redis write queue size")
-	flag.IntVar(&cfg.RetryQueueSize, "retry-queue-size", cfg.RetryQueueSize, "buffered tuple retry queue size, 0 auto-tunes for available memory")
-	flag.StringVar(&cfg.RedisAddr, "redis-addr", cfg.RedisAddr, "redis address, empty disables redis write")
-	flag.StringVar(&cfg.RedisPassword, "redis-password", cfg.RedisPassword, "redis password")
-	flag.IntVar(&cfg.RedisDB, "redis-db", cfg.RedisDB, "redis DB index")
-	flag.StringVar(&cfg.RedisKeyPrefix, "redis-prefix", cfg.RedisKeyPrefix, "redis key prefix")
-	flag.DurationVar(&cfg.RedisTTL, "redis-ttl", cfg.RedisTTL, "redis key ttl")
+	flag.IntVar(&cfg.RedisWorkers, "redis-workers", cfg.RedisWorkers, "异步 Redis 写入 worker 数量")
+	flag.IntVar(&cfg.RedisQueueSize, "redis-queue-size", cfg.RedisQueueSize, "缓存的 Redis 写入队列记录数")
+	flag.IntVar(&cfg.RedisQueueBytes, "redis-queue-bytes", cfg.RedisQueueBytes, "排队或执行中的 Redis 写入最多保留的字节数")
+	flag.IntVar(&cfg.RetryQueueSize, "retry-queue-size", cfg.RetryQueueSize, "缓存的五元组重试队列大小；0 表示按可用内存自动调整")
+	flag.StringVar(&cfg.RedisAddr, "redis-addr", cfg.RedisAddr, "Redis 地址；为空时关闭 Redis 写入")
+	flag.StringVar(&cfg.RedisPassword, "redis-password", cfg.RedisPassword, "Redis 密码")
+	flag.IntVar(&cfg.RedisDB, "redis-db", cfg.RedisDB, "Redis 数据库索引")
+	flag.StringVar(&cfg.RedisKeyPrefix, "redis-prefix", cfg.RedisKeyPrefix, "Redis 键前缀")
+	flag.DurationVar(&cfg.RedisTTL, "redis-ttl", cfg.RedisTTL, "Redis 键 TTL")
 
 	flag.Usage = func() {
-		fmt.Println("power-httptrace Usage: ")
+		fmt.Println("power-httptrace 用法：")
 		// fmt.Println("=====================================")
 		// fmt.Println("固定 SM4 密钥 (key):", app.SM4Key)
 		// fmt.Println("固定 SM4 偏移量 (iv):", app.SM4IV)
@@ -86,7 +88,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	log.Printf("starting httptrace pid=%d", os.Getpid())
+	log.Printf("正在启动 httptrace，pid=%d", os.Getpid())
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -110,14 +112,14 @@ func main() {
 	case <-ctx.Done():
 		// 启动阶段如果卡在 BPF 加载里，主 goroutine 不能再同步阻塞等待；
 		// 否则用户按 Ctrl+C 时会感觉“程序完全退不掉”。
-		log.Printf("received interrupt, stopping httptrace...")
+		log.Printf("收到中断信号，正在停止 httptrace...")
 		select {
 		case err := <-runErrCh:
 			if err != nil && !errors.Is(err, context.Canceled) {
 				log.Fatal(err)
 			}
 		case <-time.After(2 * time.Second):
-			log.Printf("startup/shutdown is still busy, force exiting")
+			log.Printf("启动或停止仍在处理中，强制退出")
 		}
 	}
 }

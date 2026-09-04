@@ -11,7 +11,7 @@ import (
 	"power-ebpf/internal/bpfgen"
 )
 
-// AttachAll wires TLS uprobes to the provided libssl shared objects.
+// AttachAll 将 TLS uprobe 挂载到指定的 libssl 共享对象。
 func AttachAll(objs *bpfgen.LoadedTLSObjects, libPaths []string) ([]link.Link, error) {
 	if objs == nil {
 		return nil, fmt.Errorf("tls objects are nil")
@@ -85,7 +85,7 @@ func attachLibrary(objs *bpfgen.LoadedTLSObjects, path string) ([]link.Link, err
 		l, err := attachSymbol(exe, path, item.symbol, item.ret, item.prog)
 		if err != nil {
 			if errors.Is(err, link.ErrNoSymbol) {
-				log.Printf("skip optional tls uprobe %s on %s: %v", item.symbol, path, err)
+				log.Printf("跳过可选 TLS uprobe：symbol=%s path=%s err=%v", item.symbol, path, err)
 				continue
 			}
 			closeLinks(attached)
@@ -94,7 +94,7 @@ func attachLibrary(objs *bpfgen.LoadedTLSObjects, path string) ([]link.Link, err
 		attached = append(attached, l)
 	}
 
-	log.Printf("attached tls uprobes on %s", path)
+	log.Printf("已在 %s 挂载 TLS uprobe", path)
 	return attached, nil
 }
 

@@ -99,6 +99,7 @@ func (s *RedisStore) Save(ctx context.Context, trace httptrace.TraceDocument) er
 	return nil
 }
 
+// 启动body限制值同步线程，每30秒同步一次
 func (s *RedisStore) startBodyLimitSync() {
 	if s == nil || s.client == nil {
 		return
@@ -115,11 +116,12 @@ func (s *RedisStore) startBodyLimitSync() {
 	})
 }
 
+// 同步redis中的body限制值到内存，每30秒同步一次
 func (s *RedisStore) syncBodyLimitsOnce() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := s.syncRedisToMemory(ctx); err != nil {
-		log.Printf("redis body limit sync error: %v", err)
+		log.Printf("同步 Redis 正文上限失败：%v", err)
 	}
 }
 
@@ -142,7 +144,7 @@ func (s *RedisStore) syncRedisToMemory(ctx context.Context) error {
 	currentResponseMaxValue = responseLimit
 	responseMaxValueLock.Unlock()
 	if requestLimit != oldRequestLimit || responseLimit != oldResponseLimit {
-		log.Printf("redis body limit synced request=%dB response=%dB", requestLimit, responseLimit)
+		log.Printf("Redis 正文上限已同步：request=%dB response=%dB", requestLimit, responseLimit)
 	}
 
 	if err != nil {
@@ -151,6 +153,7 @@ func (s *RedisStore) syncRedisToMemory(ctx context.Context) error {
 	return respErr
 }
 
+// redis读取操作
 func (s *RedisStore) readBodyLimitBytes(ctx context.Context, key string) (int64, error) {
 	if s == nil || s.client == nil {
 		return redisBodyLimitBytes, nil
@@ -170,21 +173,59 @@ func (s *RedisStore) readBodyLimitBytes(ctx context.Context, key string) (int64,
 	return limit, nil
 }
 
+// 解析redis中的body限制值，单位为kb、mb、gb。
+// 默认不传单位按kb算，20MB以内按kb算，否则按实际单位算
+// 超过256kb的值，改成默认值 256kb
 func parseBodyLimitBytes(raw string) (int64, error) {
-	value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	text := strings.ToLower(strings.TrimSpace(raw))
+	if text == "" {
+		return redisBodyLimitBytes, fmt.Errorf("empty limit")
+	}
+
+	multiplier := int64(1)
+	number := text
+	switch {
+	case strings.HasSuffix(text, "kib"):
+		number, multiplier = strings.TrimSpace(strings.TrimSuffix(text, "kib")), 1024
+	case strings.HasSuffix(text, "kb"):
+		number, multiplier = strings.TrimSpace(strings.TrimSuffix(text, "kb")), 1024
+	case strings.HasSuffix(text, "k"):
+		number, multiplier = strings.TrimSpace(strings.TrimSuffix(text, "k")), 1024
+	case strings.HasSuffix(text, "mib"):
+		number, multiplier = strings.TrimSpace(strings.TrimSuffix(text, "mib")), 1024*1024
+	case strings.HasSuffix(text, "mb"):
+		number, multiplier = strings.TrimSpace(strings.TrimSuffix(text, "mb")), 1024*1024
+	case strings.HasSuffix(text, "m"):
+		number, multiplier = strings.TrimSpace(strings.TrimSuffix(text, "m")), 1024*1024
+	case strings.HasSuffix(text, "gib"):
+		number, multiplier = strings.TrimSpace(strings.TrimSuffix(text, "gib")), 1024*1024*1024
+	case strings.HasSuffix(text, "gb"):
+		number, multiplier = strings.TrimSpace(strings.TrimSuffix(text, "gb")), 1024*1024*1024
+	case strings.HasSuffix(text, "g"):
+		number, multiplier = strings.TrimSpace(strings.TrimSuffix(text, "g")), 1024*1024*1024
+	}
+
+	value, err := strconv.ParseInt(number, 10, 64)
 	if err != nil {
 		return redisBodyLimitBytes, err
 	}
 	if value <= 0 {
 		return redisBodyLimitBytes, nil
 	}
-	if value <= 512 {
+	// 20MB 以内不带单位按 KB 算，带单位按实际单位算
+	if multiplier == 1 && value <= 20480 {
 		value *= 1024
 	}
-	if value > redisBodyLimitBytes {
-		value = redisBodyLimitBytes
+
+	// 后续强行限制：为了防止采集参数值过大，导致内存溢出，值大于256kb ，改成默认值 256kb
+	if value >= 256*1024 {
+		return 256 * 1024, nil
 	}
-	return value, nil
+
+	if value > (int64(^uint32(0)) / multiplier) {
+		return redisBodyLimitBytes, fmt.Errorf("limit exceeds uint32 maximum")
+	}
+	return value * multiplier, nil
 }
 
 // 用户态截断（已弃用）

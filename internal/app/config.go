@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"runtime"
@@ -19,6 +20,7 @@ import (
 	"power-ebpf/internal/bpfgen"
 	"power-ebpf/internal/httptrace"
 
+	"github.com/cilium/ebpf"
 	"github.com/tjfoc/gmsm/sm4"
 )
 
@@ -33,7 +35,7 @@ type Config struct {
 	TLSLibPath           string // 逗号分隔的 libssl 路径覆盖项，空时自动发现
 	TLSComm              string // uprobes 目标进程名，默认 nginx
 	SuppressSocketForTLS bool   // 是否在 TLS 开启时抑制同 comm 的传统 socket 事件，默认不抑制，允许同时采 HTTP+HTTPS
-	DisableKernelFilter  bool   // 是否禁用内核态过滤 ，默认不禁用
+	DisableKernelFilter  bool   // 是否禁用内核态过滤 ，默认禁用
 	DisableUserTuple     bool   // 是否禁用用户态 tuple 反补偿/过滤，默认启用
 	CaptureBytes         int    // 内核侧每个请求/响应最大采集字节数，默认32KB
 	PerfPages            int    // perf buffer 页数，默认64页
@@ -41,7 +43,8 @@ type Config struct {
 	WorkerCount          int    // 工作线程数 ，默认最多8个
 	WorkerQueueSize      int    // 每个解析 worker 的缓冲队列深度，0 表示自动调优
 	RedisWorkers         int
-	RedisQueueSize       int           // Redis 队列大小 ，默认4096
+	RedisQueueSize       int           // Redis 队列记录数上限，默认4096
+	RedisQueueBytes      int           // Redis 队列及写入中消息的字节预算，默认64MiB
 	RetryQueueSize       int           // tuple 重试队列大小，0 表示自动调优
 	FlushInterval        time.Duration // 刷新间隔 ，默认200毫秒
 	LogInterval          time.Duration // 日志间隔 ，默认5秒
@@ -51,6 +54,7 @@ type Config struct {
 	ResponseStallTimeout time.Duration
 	TransactionTTL       time.Duration // 事务超时时间 ，默认2分钟
 	MaxMessageBytes      int
+	AssemblerBufferBytes int    // all incomplete request/response fragments retained in userspace
 	RedisAddr            string // Redis地址 ，默认空
 	RedisPassword        string
 	RedisDB              int           // RedisDB ，默认0
@@ -86,21 +90,25 @@ const (
 )
 
 type runtimeResourcePlan struct {
-	CPUCount          int
-	MemAvailableBytes uint64
-	MemAvailableKnown bool
-	EventBytes        uintptr
-	PerfPages         int
-	PerfBufferBytes   int
-	PerfTotalBytes    uint64
-	WorkerCount       int
-	WorkerQueueSize   int
-	WorkerQueueBytes  uint64
-	RedisWorkers      int
-	RedisQueueSize    int
-	RetryQueueSize    int
+	CPUCount             int
+	RuntimeCPUCount      int
+	MemAvailableBytes    uint64
+	MemAvailableKnown    bool
+	EventBytes           uintptr
+	PerfPages            int
+	PerfBufferBytes      int
+	PerfTotalBytes       uint64
+	WorkerCount          int
+	WorkerQueueSize      int
+	WorkerQueueBytes     uint64
+	RedisWorkers         int
+	RedisQueueSize       int
+	RedisQueueBytes      int
+	AssemblerBufferBytes int
+	RetryQueueSize       int
 }
 
+// 根据机器的MemAvailableBytes，自动选择一组资源上限，避免高并发或低内存机器因为默认参数导致内存爆涨
 type resourceTier struct {
 	maxWorkers         int
 	maxRedisWorkers    int
@@ -124,12 +132,13 @@ func DefaultConfig() Config {
 		CaptureBytes:         32 * 1024,
 		DisableKernelFilter:  false,
 		DisableUserTuple:     false,
-		PerfPages:            64,
+		PerfPages:            256,
 		BatchSize:            100,
 		WorkerCount:          min(runtime.NumCPU(), 8),
 		WorkerQueueSize:      0,
 		RedisWorkers:         min(max(1, runtime.NumCPU()/2), 4),
 		RedisQueueSize:       4096,
+		RedisQueueBytes:      64 << 20,
 		RetryQueueSize:       0,
 		FlushInterval:        200 * time.Millisecond,
 		LogInterval:          5 * time.Second,
@@ -139,6 +148,7 @@ func DefaultConfig() Config {
 		ResponseStallTimeout: 500 * time.Millisecond,
 		TransactionTTL:       10 * time.Minute,
 		MaxMessageBytes:      32 * 1024,
+		AssemblerBufferBytes: 64 << 20,
 		RedisKeyPrefix:       "http-trace",
 		RedisTTL:             24 * time.Hour,
 	}
@@ -154,12 +164,30 @@ func (c Config) PerfBufferBytes() int {
 
 func (c Config) normalizedForHost() (Config, runtimeResourcePlan) {
 	memAvailable, known := readMemAvailableBytes()
-	return normalizeRuntimeConfig(c, runtime.NumCPU(), memAvailable, known)
+	runtimeCPUs := runtime.NumCPU()
+	possibleCPUs, err := ebpf.PossibleCPU()
+	if err != nil || possibleCPUs <= 0 {
+		possibleCPUs = runtimeCPUs
+		log.Printf("获取 perf 预算可用 CPU 数失败：%v；回退到运行时 CPU 数=%d", err, runtimeCPUs)
+	}
+	return normalizeRuntimeConfigForCPUs(c, runtimeCPUs, possibleCPUs, memAvailable, known)
 }
 
 func normalizeRuntimeConfig(c Config, cpuCount int, memAvailable uint64, memKnown bool) (Config, runtimeResourcePlan) {
-	if cpuCount <= 0 {
-		cpuCount = 1
+	return normalizeRuntimeConfigForCPUs(c, cpuCount, cpuCount, memAvailable, memKnown)
+}
+
+// 规范化运行时配置，根据可用内存和CPU数量，自动选择一组资源上限，避免高并发或低内存机器因为默认参数导致内存爆涨
+// runtimeCPUCount：运行时CPU数量
+// perfCPUCount：perf CPU数量
+// memAvailable：可用内存
+// memKnown：可用内存是否已知
+func normalizeRuntimeConfigForCPUs(c Config, runtimeCPUCount, perfCPUCount int, memAvailable uint64, memKnown bool) (Config, runtimeResourcePlan) {
+	if runtimeCPUCount <= 0 {
+		runtimeCPUCount = 1
+	}
+	if perfCPUCount <= 0 {
+		perfCPUCount = runtimeCPUCount
 	}
 	if c.CaptureBytes <= 0 {
 		c.CaptureBytes = 32 * 1024
@@ -176,22 +204,36 @@ func normalizeRuntimeConfig(c Config, cpuCount int, memAvailable uint64, memKnow
 	if c.TransactionTTL <= 0 {
 		c.TransactionTTL = 10 * time.Minute
 	}
+	if c.AssemblerBufferBytes <= 0 {
+		c.AssemblerBufferBytes = 64 << 20
+	}
+	// 为常规大型请求预留充足空间，同时确保性能损失不会
+	// 将事务TTL转换为无界堆保留。
+	c.AssemblerBufferBytes = clampInt(c.AssemblerBufferBytes, 4<<20, 256<<20)
 
 	tier := pickResourceTier(memAvailable, memKnown)
 
 	workerCount := c.WorkerCount
 	if workerCount <= 0 {
-		workerCount = min(cpuCount, 8)
+		workerCount = min(runtimeCPUCount, 8)
 	}
-	workerCount = clampInt(workerCount, 1, min(cpuCount, tier.maxWorkers))
+	workerCount = clampInt(workerCount, 1, min(runtimeCPUCount, tier.maxWorkers))
 	c.WorkerCount = workerCount
 
 	perfPages := c.PerfPages
 	if perfPages <= 0 {
 		perfPages = tier.defaultPerfPages
 	}
-	maxPerfPages := maxPerfPagesForBudget(cpuCount, os.Getpagesize(), tier.perfBudgetBytes, tier.minPerfPages)
-	perfPages = clampInt(perfPages, tier.minPerfPages, maxPerfPages)
+	// 最大页数 ，计算公式为：当传入值大于2048时，取2048，否则取传入值
+	maxPerfPages := maxPerfPagesForBudget(perfCPUCount, os.Getpagesize(), tier.perfBudgetBytes, tier.minPerfPages)
+	if maxPerfPages < tier.minPerfPages {
+		// 主机可以暴露多个可用CPU，而此进程仅运行于其中一个
+		// 小型CPU集。性能数组仍会分配所有可能的CPU，因此
+		//   内存预算优先于常规低水位标记。
+		perfPages = maxPerfPages
+	} else {
+		perfPages = clampInt(perfPages, tier.minPerfPages, maxPerfPages)
+	}
 	c.PerfPages = perfPages
 
 	queueFloor := max(c.BatchSize*2, 128)
@@ -213,7 +255,7 @@ func normalizeRuntimeConfig(c Config, cpuCount int, memAvailable uint64, memKnow
 
 	redisWorkers := c.RedisWorkers
 	if redisWorkers <= 0 {
-		redisWorkers = min(max(1, cpuCount/2), 4)
+		redisWorkers = min(max(1, runtimeCPUCount/2), 4)
 	}
 	redisWorkers = clampInt(redisWorkers, 1, tier.maxRedisWorkers)
 	c.RedisWorkers = redisWorkers
@@ -224,6 +266,12 @@ func normalizeRuntimeConfig(c Config, cpuCount int, memAvailable uint64, memKnow
 	}
 	redisQueueSize = clampInt(redisQueueSize, 256, tier.maxRedisQueue)
 	c.RedisQueueSize = redisQueueSize
+	if c.RedisQueueBytes <= 0 {
+		c.RedisQueueBytes = 64 << 20
+	}
+	// 记录数只能限制 channel 槽位。较大的采集正文需要独立的字节预算，
+	// 避免 Redis 较慢时保留数 GB 数据。
+	c.RedisQueueBytes = clampInt(c.RedisQueueBytes, 4<<20, 256<<20)
 
 	retryQueueSize := c.RetryQueueSize
 	if retryQueueSize <= 0 {
@@ -233,19 +281,22 @@ func normalizeRuntimeConfig(c Config, cpuCount int, memAvailable uint64, memKnow
 	c.RetryQueueSize = retryQueueSize
 
 	plan := runtimeResourcePlan{
-		CPUCount:          cpuCount,
-		MemAvailableBytes: memAvailable,
-		MemAvailableKnown: memKnown,
-		EventBytes:        uintptr(eventBytes),
-		PerfPages:         c.PerfPages,
-		PerfBufferBytes:   c.PerfBufferBytes(),
-		PerfTotalBytes:    uint64(c.PerfBufferBytes()) * uint64(cpuCount),
-		WorkerCount:       c.WorkerCount,
-		WorkerQueueSize:   c.WorkerQueueSize,
-		WorkerQueueBytes:  uint64(c.WorkerCount) * uint64(c.WorkerQueueSize) * uint64(eventBytes),
-		RedisWorkers:      c.RedisWorkers,
-		RedisQueueSize:    c.RedisQueueSize,
-		RetryQueueSize:    c.RetryQueueSize,
+		CPUCount:             perfCPUCount,
+		RuntimeCPUCount:      runtimeCPUCount,
+		MemAvailableBytes:    memAvailable,
+		MemAvailableKnown:    memKnown,
+		EventBytes:           uintptr(eventBytes),
+		PerfPages:            c.PerfPages,
+		PerfBufferBytes:      c.PerfBufferBytes(),
+		PerfTotalBytes:       uint64(c.PerfBufferBytes()) * uint64(perfCPUCount),
+		WorkerCount:          c.WorkerCount,
+		WorkerQueueSize:      c.WorkerQueueSize,
+		WorkerQueueBytes:     uint64(c.WorkerCount) * uint64(c.WorkerQueueSize) * uint64(eventBytes),
+		RedisWorkers:         c.RedisWorkers,
+		RedisQueueSize:       c.RedisQueueSize,
+		RedisQueueBytes:      c.RedisQueueBytes,
+		AssemblerBufferBytes: c.AssemblerBufferBytes,
+		RetryQueueSize:       c.RetryQueueSize,
 	}
 	return c, plan
 }
@@ -317,10 +368,21 @@ func maxPerfPagesForBudget(cpuCount, pageSize int, budget uint64, floor int) int
 	}
 	perCPUBytes := uint64(cpuCount) * uint64(pageSize)
 	pages := int(budget / perCPUBytes)
-	if pages < floor {
-		return floor
+	if pages < 1 {
+		return 1
 	}
-	return pages
+	return floorPowerOfTwo(pages)
+}
+
+func floorPowerOfTwo(v int) int {
+	if v <= 1 {
+		return 1
+	}
+	result := 1
+	for result <= v/2 {
+		result <<= 1
+	}
+	return result
 }
 
 func maxWorkerQueueSizeForBudget(workerCount, eventBytes int, budget uint64, floor, hardCap int) int {
@@ -382,7 +444,8 @@ func (p runtimeResourcePlan) Summary() string {
 		mem = formatBytesIEC(p.MemAvailableBytes)
 	}
 	return fmt.Sprintf(
-		"cpus=%d mem_available=%s perf_pages=%d perf_per_cpu=%s perf_total=%s workers=%d worker_queue=%d worker_queue_mem=%s redis_workers=%d redis_queue=%d retry_queue=%d event_size=%d",
+		"runtime_cpus=%d possible_cpus=%d mem_available=%s perf_pages=%d perf_per_cpu=%s perf_total=%s workers=%d worker_queue=%d worker_queue_mem=%s redis_workers=%d redis_queue=%d redis_queue_budget=%s assembler_buffer_budget=%s retry_queue=%d event_size=%d",
+		p.RuntimeCPUCount,
 		p.CPUCount,
 		mem,
 		p.PerfPages,
@@ -393,6 +456,8 @@ func (p runtimeResourcePlan) Summary() string {
 		formatBytesIEC(p.WorkerQueueBytes),
 		p.RedisWorkers,
 		p.RedisQueueSize,
+		formatBytesIEC(uint64(p.RedisQueueBytes)),
+		formatBytesIEC(uint64(p.AssemblerBufferBytes)),
 		p.RetryQueueSize,
 		p.EventBytes,
 	)
@@ -411,7 +476,7 @@ func formatBytesIEC(v uint64) string {
 	return fmt.Sprintf("%.1f%ciB", float64(v)/float64(div), "KMGTPE"[exp])
 }
 
-// 配置内核态过滤
+// 配置内核态过滤，挂载点不能稳定获取，暂未开启内核态过滤
 func (c Config) BuildFilter() (bpfgen.HttpTraceFilterConfig, error) {
 	var filter bpfgen.HttpTraceFilterConfig
 
@@ -487,7 +552,7 @@ func (c Config) ResolveFilter() (ResolvedFilter, error) {
 	return filter, nil
 }
 
-// Match 是用户态兜底过滤：
+// Match 是用户态兜底过滤：目前关闭了过滤功能
 // - src/dst 同时给出时按“链路对称”处理，允许请求/响应方向翻转。
 // - 只给一边时，按“任意一端命中这个值”处理，更符合端口/IP 过滤直觉。
 // - src/dst 给成同一个值时，也按“任意一端命中这个值”处理，适合服务端口过滤。

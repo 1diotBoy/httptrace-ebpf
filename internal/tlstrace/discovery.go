@@ -11,16 +11,15 @@ import (
 	"strings"
 )
 
-// DiscoveryOptions controls how libssl paths are resolved for TLS uprobes.
+// DiscoveryOptions 控制 TLS uprobe 的 libssl 路径解析方式。
 //
-// Uprobes must attach to the exact shared object inode that the target process
-// mapped. Shipping a private libssl copy inside our own binary doesn't help for
-// nginx, because nginx won't execute code from that private inode.
+// uprobe 必须挂载到目标进程实际映射的共享对象 inode。即使在当前二进制中附带一份
+// 私有 libssl 副本也没有帮助，因为 nginx 不会执行该私有 inode 中的代码。
 //
-// The best-effort strategy is:
-// 1. honor explicit --tls-lib-path overrides when provided;
-// 2. inspect running target processes and reuse the libssl path they mapped;
-// 3. fall back to common system library directories.
+// 尽力解析策略如下：
+// 1. 如果提供 --tls-lib-path，则优先使用显式路径；
+// 2. 检查运行中的目标进程，复用其已映射的 libssl 路径；
+// 3. 最后回退到常见系统库目录。
 type DiscoveryOptions struct {
 	ExplicitPaths []string
 	ProcessComm   string
@@ -28,8 +27,7 @@ type DiscoveryOptions struct {
 	SearchDirs    []string
 }
 
-// ResolveLibraryPaths returns de-duplicated libssl paths suitable for uprobe
-// attachment.
+// ResolveLibraryPaths 返回适合挂载 uprobe 且已去重的 libssl 路径。
 /*
 1.首选 --tls-lib-path，
 2.不填时自动从 nginx 的 /proc/<pid>/maps 里找它真正加载的 libssl.so，
@@ -61,7 +59,7 @@ func ResolveLibraryPaths(opts DiscoveryOptions) ([]string, error) {
 	return paths, nil
 }
 
-// SplitCSVPaths parses comma-separated CLI values such as --tls-lib-path.
+// SplitCSVPaths 解析 --tls-lib-path 等以逗号分隔的命令行参数值。
 func SplitCSVPaths(raw string) []string {
 	if strings.TrimSpace(raw) == "" {
 		return nil
@@ -78,8 +76,8 @@ func SplitCSVPaths(raw string) []string {
 	return out
 }
 
-// ResolveTargetComm keeps TLS uprobes intentionally conservative. We support a
-// single exact comm match for the first implementation, defaulting to nginx.
+// ResolveTargetComm 有意保持 TLS uprobe 的匹配策略保守。首版只支持单个精确 comm 匹配，
+// 默认值为 nginx。
 func ResolveTargetComm(raw string) string {
 	for _, part := range strings.Split(raw, ",") {
 		part = strings.TrimSpace(part)
@@ -230,6 +228,6 @@ func isSupportedTLSLibrary(path string) bool {
 	if strings.HasPrefix(base, "libssl.so") {
 		return true
 	}
-	// Debian / Ubuntu can ship libssl3.so as the real ELF SONAME.
+	// Debian / Ubuntu 可能将 libssl3.so 作为实际的 ELF SONAME。
 	return base == "libssl3.so"
 }

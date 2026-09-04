@@ -59,10 +59,10 @@ func TestRedisPasswordSM4Decrypt(t *testing.T) {
 	password := "Powersi@redis202312"
 	// 加密
 	encryptStr, _ := SM4Encrypt(password)
-	fmt.Println(encryptStr)
+	fmt.Println("加密结果：", encryptStr)
 	// 解密
 	decryptStr, _ := SM4Decrypt(encryptStr)
-	fmt.Println(decryptStr)
+	fmt.Println("解密结果：", decryptStr)
 }
 
 func TestNormalizeRuntimeConfigClampsAggressiveDefaults(t *testing.T) {
@@ -129,5 +129,21 @@ func TestNormalizeRuntimeConfigFillsAutoSizes(t *testing.T) {
 	}
 	if got.RetryQueueSize != 2048 {
 		t.Fatalf("auto retry queue mismatch: got %d want %d", got.RetryQueueSize, 2048)
+	}
+}
+
+func TestNormalizeRuntimeConfigUsesPossibleCPUsForPerfBudget(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PerfPages = 512
+
+	got, plan := normalizeRuntimeConfigForCPUs(cfg, 16, 1024, 3<<30, true)
+	if got.PerfPages != 16 {
+		t.Fatalf("perf pages must be limited by possible CPUs: got %d want 16", got.PerfPages)
+	}
+	if plan.RuntimeCPUCount != 16 || plan.CPUCount != 1024 {
+		t.Fatalf("unexpected cpu plan: %#v", plan)
+	}
+	if got, want := plan.PerfTotalBytes, uint64(64<<20); got != want {
+		t.Fatalf("perf buffer budget: got %d want %d", got, want)
 	}
 }

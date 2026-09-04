@@ -15,10 +15,14 @@ import (
 )
 
 type socketResolver struct {
-	ttl   time.Duration
-	mu    sync.RWMutex
-	cache map[socketKey]cachedSocketTuple
+	ttl         time.Duration
+	maxEntries  int
+	mu          sync.RWMutex
+	cache       map[socketKey]cachedSocketTuple
+	lastSweepAt time.Time
 }
+
+const defaultSocketResolverMaxEntries = 16384
 
 type resolveSource uint8
 
@@ -48,11 +52,13 @@ func newSocketResolver(ttl time.Duration) *socketResolver {
 		ttl = 15 * time.Second
 	}
 	return &socketResolver{
-		ttl:   ttl,
-		cache: make(map[socketKey]cachedSocketTuple),
+		ttl:        ttl,
+		maxEntries: defaultSocketResolverMaxEntries,
+		cache:      make(map[socketKey]cachedSocketTuple),
 	}
 }
 
+// 判断五元组是否缺失
 func missingTuple(event httptrace.Event) bool {
 	srcMissing := event.SrcIP == "" || event.SrcIP == "0.0.0.0" || event.SrcPort == 0
 	dstMissing := event.DstIP == "" || event.DstIP == "0.0.0.0" || event.DstPort == 0
@@ -98,10 +104,51 @@ func (r *socketResolver) lookupCache(key socketKey) (cachedSocketTuple, bool) {
 }
 
 func (r *socketResolver) storeCache(key socketKey, tuple cachedSocketTuple) {
-	tuple.expiresAt = time.Now().Add(r.ttl)
+	now := time.Now()
+	tuple.expiresAt = now.Add(r.ttl)
 	r.mu.Lock()
+	// socket key 包含 SockID，因此短连接会让每个请求产生新 key。仅在查询时过期清理，
+	// 会泄漏那些之后不再查询的 key。这里定期扫描并强制执行容量上限。
+	_, exists := r.cache[key]
+	if !exists && r.maxEntries > 0 && len(r.cache) >= r.maxEntries {
+		if r.lastSweepAt.IsZero() || now.Sub(r.lastSweepAt) >= time.Second {
+			r.sweepExpiredLocked(now)
+			r.lastSweepAt = now
+		}
+		if len(r.cache) >= r.maxEntries {
+			var oldestKey socketKey
+			var oldest time.Time
+			for candidate, value := range r.cache {
+				if oldestKey == (socketKey{}) || value.expiresAt.Before(oldest) {
+					oldestKey = candidate
+					oldest = value.expiresAt
+				}
+			}
+			if oldestKey != (socketKey{}) {
+				delete(r.cache, oldestKey)
+			}
+		}
+	}
 	r.cache[key] = tuple
 	r.mu.Unlock()
+}
+
+func (r *socketResolver) sweepExpiredLocked(now time.Time) {
+	for key, value := range r.cache {
+		if !now.Before(value.expiresAt) {
+			delete(r.cache, key)
+		}
+	}
+}
+
+func (r *socketResolver) cacheEntries() int {
+	if r == nil {
+		return 0
+	}
+	r.mu.RLock()
+	n := len(r.cache)
+	r.mu.RUnlock()
+	return n
 }
 
 func applyResolvedTuple(event httptrace.Event, tuple cachedSocketTuple) httptrace.Event {

@@ -1130,6 +1130,29 @@ static __attribute__((noinline)) int starts_with_http_response(const struct iov_
 #endif
 }
 
+/* 100 Continue / 102 / 103 只是同一请求的临时响应，不能把 req_active 切到
+ * response，更不能弹出 pending request。101 Switching Protocols 是最终握手，
+ * 保持原有响应链语义。 */
+static __attribute__((noinline)) int starts_with_http_informational_response(const struct iov_iter_compat *iter)
+{
+	char prefix[16] = {};
+	int prefix_len = 0;
+
+	if (!iter)
+		return 0;
+	prefix_len = read_prefix_from_iter(iter, prefix, sizeof(prefix));
+	if (prefix_len < 12)
+		return 0;
+	if (prefix[0] != 'H' || prefix[1] != 'T' || prefix[2] != 'T' ||
+	    prefix[3] != 'P' || prefix[4] != '/' || prefix[8] != ' ' ||
+	    prefix[9] != '1' || prefix[10] < '0' || prefix[10] > '9' ||
+	    prefix[11] < '0' || prefix[11] > '9')
+		return 0;
+	if (prefix[10] == '0' && prefix[11] == '1')
+		return 0;
+	return 1;
+}
+
 static __always_inline __u8 detect_http_direction(const char *buf, __u32 len)
 {
 	if (looks_like_http_request(buf, len))
@@ -1143,10 +1166,9 @@ static __always_inline __u32 clamp_capture_limit(__u32 limit)
 {
 	if (!limit)
 		limit = DEFAULT_MESSAGE_LIMIT;
-	if (limit > DEFAULT_MESSAGE_LIMIT)
-		limit = DEFAULT_MESSAGE_LIMIT;
-	if (limit > MAX_CAPTURE_BYTES_PER_CALL)
-		return MAX_CAPTURE_BYTES_PER_CALL;
+	/* The per-call expansion limit is a verifier/perf constraint, not the
+	 * logical message capture limit.  A message may span many send/recv calls;
+	 * keep accumulating fragments until the configured value is reached. */
 	return limit;
 }
 
@@ -1330,7 +1352,6 @@ static __attribute__((noinline)) int emit_size_progress_event(void *ctx, const s
 	return 0;
 }
 
-#ifndef LEGACY_VERIFIER
 static __attribute__((noinline)) int emit_size_final_event(void *ctx, const struct recv_args *meta,
 							   __u64 chain_id, __u8 direction,
 							   __u64 observed_bytes)
@@ -1399,7 +1420,6 @@ static __always_inline int emit_final_size_if_needed(void *ctx, const struct rec
 		*reported_bytes = observed_bytes;
 	return 0;
 }
-#endif
 
 /* capture_message 负责把一个 sendmsg/recvmsg 调用切成多个 fragment 事件。
  * 每个 fragment 都带相同的 chain_id，用户态按 frag_idx 重组即可。
@@ -1422,6 +1442,10 @@ static __always_inline int emit_chunk_once(void *ctx, const struct capture_call 
 		flags += EVT_FLAG_START;
 	if (*captured + chunk >= call->total_len || *total_captured + chunk >= capture_limit)
 		flags += EVT_FLAG_END;
+	/* 只有真正到达当前动态采集上限的最后一片，才表示用户态已经拿到了
+	 * 完整的连续前缀。此时未必已经能判断 HTTP 消息是否还有后续字节。 */
+	if (*total_captured + chunk >= capture_limit)
+		flags |= EVT_FLAG_CAPTURE_BOUNDARY;
 	frag_meta = ((__u32)flags << 16) | *frag_idx;
 	if (emit_data_event(ctx, call, *base, chunk, frag_meta) < 0)
 		return -1;
@@ -1434,15 +1458,28 @@ static __always_inline int emit_chunk_once(void *ctx, const struct capture_call 
 	return 0;
 }
 
+/* iov 覆盖范围或单段展开次数不足时，已经输出的只是连续前缀。用一个零
+ * payload event 明确终止该前缀，后续调用只上报 observed_message_bytes。 */
+// static __attribute__((noinline)) int emit_capture_boundary_event(void *ctx,
+// 							 const struct capture_call *call,
+// 							 __u16 frag_idx)
+// {
+// 	__u16 flags = EVT_FLAG_CAPTURE_TRUNC | EVT_FLAG_CAPTURE_BOUNDARY | EVT_FLAG_END;
+// 	__u32 frag_meta = ((__u32)flags << 16) | frag_idx;
+
+// 	return emit_data_event(ctx, call, NULL, 0, frag_meta);
+// }
+
 #if defined(LEGACY_VERIFIER) || defined(COMPACT_VERIFIER)
 #define EMIT_CHUNK_LEGACY_ONCE()                      \
 	do {                                          \
 		if (emit_chunk_once_legacy(ctx, call, state) < 0) \
 			return -1;                        \
 	} while (0)
-#define EMIT_CHUNK_LEGACY_8() \
+#define EMIT_CHUNK_LEGACY_9() \
 	EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE(); \
-	EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE()
+	EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE(); EMIT_CHUNK_LEGACY_ONCE(); \
+	EMIT_CHUNK_LEGACY_ONCE()
 
 struct legacy_capture_state {
 	const char *base;
@@ -1490,7 +1527,7 @@ static __attribute__((noinline)) int fn_name(void *ctx, struct capture_call *cal
 		state->seg_len = call->total_len - state->captured;                           \
 	if (state->seg_len > state->capture_limit - state->total_captured)                    \
 		state->seg_len = state->capture_limit - state->total_captured;                \
-	EMIT_CHUNK_LEGACY_8();                                                                  \
+	EMIT_CHUNK_LEGACY_9();                                                                  \
 	return 0;                                                                              \
 }
 
@@ -1511,7 +1548,7 @@ static __attribute__((noinline)) int capture_iov_slot0_legacy(void *ctx, struct 
 	if (state->seg_len > state->capture_limit - state->total_captured)
 		state->seg_len = state->capture_limit - state->total_captured;
 
-	EMIT_CHUNK_LEGACY_8();
+	EMIT_CHUNK_LEGACY_9();
 	return 0;
 }
 
@@ -1584,6 +1621,14 @@ static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct
 		*call->message_captured = total_captured;
 	if (call->capture_stopped && total_captured >= capture_limit)
 		*call->capture_stopped = 1;
+	// else if (captured < call->total_len) {
+	// 	if (stats && !(common_flags & EVT_FLAG_CAPTURE_TRUNC))
+	// 		stats->truncations += 1;
+	// 	if (call->capture_stopped)
+	// 		*call->capture_stopped = 1;
+	// 	if (emit_capture_boundary_event(ctx, call, frag_idx) < 0)
+	// 		return -1;
+	// }
 	return 0;
 }
 #else
@@ -1642,6 +1687,14 @@ static __attribute__((noinline)) int capture_message_from_iter(void *ctx, struct
 		*call->message_captured = total_captured;
 	if (call->capture_stopped && total_captured >= capture_limit)
 		*call->capture_stopped = 1;
+	// else if (captured < call->total_len) {
+	// 	if (stats && !(common_flags & EVT_FLAG_CAPTURE_TRUNC))
+	// 		stats->truncations += 1;
+	// 	if (call->capture_stopped)
+	// 		*call->capture_stopped = 1;
+	// 	if (emit_capture_boundary_event(ctx, call, frag_idx) < 0)
+	// 		return -1;
+	// }
 	return 0;
 }
 #endif
@@ -2022,6 +2075,15 @@ static __attribute__((noinline)) int handle_recv_return(void *ctx, __u64 pid_tgi
 	if (direction == DIR_REQUEST) {
 		if (stats)
 			stats->recv_dir_request += 1;
+		/* 下一条 HTTP request 已开始，上一条被截断的 response 不会再有
+		 * payload 采集；先把它累计到当前 recv 前的最终 observed 值上报。 */
+		if (state->resp_active && state->resp_chain_id && state->resp_capture_stopped) {
+			if (emit_final_size_if_needed(ctx, &emit_meta, state->resp_chain_id, DIR_RESPONSE,
+						     state->resp_observed_bytes,
+						     &state->resp_reported_bytes,
+						     state->resp_capture_stopped) < 0)
+				goto cleanup;
+		}
 		chain_id = next_chain_id(state);
 		start_request_capture(state, chain_id);
 		state->req_observed_bytes += ret;
@@ -2109,6 +2171,20 @@ static __attribute__((noinline)) int handle_send_entry(void *ctx, struct sock_co
 
 	state->tx_cursor += scratch->iter.count;
 	scratch->meta.seq_hint = state->tx_cursor;
+	/* 1xx（除 101）并不完成请求；尤其是 100 Continue 后面的 body 仍必须
+	 * 继续累计到同一个 request chain。 */
+	if (starts_with_http_informational_response(&scratch->iter))
+		return 0;
+
+	/* 最终响应开始意味着请求侧已经不会再读取该 HTTP 消息。对已经达到
+	 * 用户态动态上限的请求，在这里发送最终 observed_message_bytes。 */
+	if (state->req_active && state->last_req_chain_id && state->req_capture_stopped) {
+		if (emit_final_size_if_needed(ctx, &scratch->meta, state->last_req_chain_id, DIR_REQUEST,
+					     state->req_observed_bytes,
+					     &state->req_reported_bytes,
+					     state->req_capture_stopped) < 0)
+			return 0;
+	}
 	chain_id = select_response_chain(state, &scratch->iter, &started_new_response);
 	if (!chain_id) {
 		snapshot_send_debug(sk, msg, &scratch->meta, &scratch->iter, state, 0, source,

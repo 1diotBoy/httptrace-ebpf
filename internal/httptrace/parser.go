@@ -625,9 +625,8 @@ func decodeChunkedBody(data []byte) ([]byte, int, bool, error) {
 	}
 }
 
-// decodeChunkedBodyPreview best-effort strips chunk-size lines from a partial
-// chunked body. It returns already-decoded body bytes collected before the
-// first incomplete or malformed chunk boundary.
+// decodeChunkedBodyPreview 尽力从不完整的 chunked 正文中去除 chunk 大小行。
+// 它返回第一个不完整或格式错误的 chunk 边界之前已经解码出的正文。
 func decodeChunkedBodyPreview(data []byte) ([]byte, bool) {
 	var out bytes.Buffer
 	cursor := 0

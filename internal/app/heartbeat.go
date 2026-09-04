@@ -30,7 +30,7 @@ import (
 const (
 	collectModeBypass = "BYPASS"
 	heartbeatPath     = "/v2/dataCollectClient/heartbeat.shtml"
-	// heartbeatInterval      = 30 * time.Second
+	// 心跳间隔      = 30 * time.Second
 	previousDayReportTTL   = 5 * time.Minute
 	heartbeatTimeLayout    = "2006-01-02 15:04:05"
 	dataCollectDisabledBit = 1 << 10
@@ -127,7 +127,7 @@ func newHeartbeatRuntime(cfg Config, startTime time.Time) (*heartbeatRuntime, er
 
 	info, infoErr := collectHeartbeatNodeInfo(cfg.IfName, startTime)
 	if infoErr != nil {
-		log.Printf("collect initial heartbeat node info error: %v", infoErr)
+		log.Printf("采集初始心跳节点信息失败：%v", infoErr)
 	}
 
 	return &heartbeatRuntime{
@@ -157,7 +157,7 @@ func (s *Service) heartbeatLoop(ctx context.Context, filterMap *ebpf.Map, tlsCon
 			return ctx.Err()
 		case <-timer.C:
 			if err := s.sendHeartbeat(ctx, filterMap, tlsConfigMap); err != nil {
-				log.Printf("heartbeat error: %v", err)
+				log.Printf("心跳上报失败：%v", err)
 				errorCount++
 				// 失败4次2分钟，退化到60秒上报间隔
 				if errorCount >= 4 {
@@ -191,20 +191,20 @@ func (s *Service) sendHeartbeat(ctx context.Context, filterMap *ebpf.Map, tlsCon
 
 	enabled := resp.Data.DataCollectEnabled != 0
 	if previous := s.collectEnabled.Swap(enabled); previous != enabled {
-		log.Printf("heartbeat updated dataCollectEnabled=%d", boolToInt(enabled))
+		log.Printf("心跳更新采集状态：dataCollectEnabled=%d", boolToInt(enabled))
 	}
 	if err := s.syncCaptureLimitsToKernel(filterMap); err != nil {
-		log.Printf("heartbeat sync kernel collect state error: %v", err)
+		log.Printf("心跳同步内核采集状态失败：%v", err)
 	}
 	if tlsConfigMap != nil {
 		if err := s.installTLSConfig(tlsConfigMap); err != nil {
-			log.Printf("heartbeat sync tls collect state error: %v", err)
+			log.Printf("心跳同步 TLS 采集状态失败：%v", err)
 		}
 	}
-	// 重新获取硬件信息  NeedRefresh=true
+	// NeedRefresh=true 时重新获取硬件信息。
 	if resp.Data.NeedRefresh {
 		if err := s.heartbeat.refreshNodeInfo(); err != nil {
-			log.Printf("refresh heartbeat node info error: %v", err)
+			log.Printf("刷新心跳节点信息失败：%v", err)
 		}
 	}
 	s.heartbeat.markSuccess(now, fullReport)
@@ -260,7 +260,7 @@ func (h *heartbeatRuntime) post(ctx context.Context, payload heartbeatRequest) (
 	if err != nil {
 		return response, fmt.Errorf("marshal heartbeat payload: %w", err)
 	}
-	log.Printf("heartbeat request endpoint=%s body=%s", h.endpoint, string(body))
+	log.Printf("心跳请求：endpoint=%s body=%s", h.endpoint, string(body))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return response, fmt.Errorf("build heartbeat request: %w", err)
@@ -269,16 +269,16 @@ func (h *heartbeatRuntime) post(ctx context.Context, payload heartbeatRequest) (
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		log.Printf("heartbeat request failed endpoint=%s err=%v", h.endpoint, err)
+		log.Printf("心跳请求失败：endpoint=%s err=%v", h.endpoint, err)
 		return response, fmt.Errorf("post heartbeat: %w", err)
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("heartbeat read response failed endpoint=%s status=%d err=%v", h.endpoint, resp.StatusCode, err)
+		log.Printf("读取心跳响应失败：endpoint=%s status=%d err=%v", h.endpoint, resp.StatusCode, err)
 		return response, fmt.Errorf("read heartbeat response: %w", err)
 	}
-	log.Printf("heartbeat response endpoint=%s status=%d body=%s", h.endpoint, resp.StatusCode, string(respBody))
+	log.Printf("心跳响应：endpoint=%s status=%d body=%s", h.endpoint, resp.StatusCode, string(respBody))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return response, fmt.Errorf("heartbeat http status=%d", resp.StatusCode)
 	}
@@ -326,8 +326,8 @@ func (h *heartbeatRuntime) setPreviousDayTraffic(stat heartbeatTrafficStat, now 
 	h.previousDayDeadline = now.Add(previousDayReportTTL)
 }
 
-// 0点重置，flushTicker 最快是 250ms 一次
-// 逻辑：采集的日期和当前日期不一致，则换天了
+// 零点重置；flushTicker 最快每 250ms 触发一次。
+// 当采集日期与当前日期不一致时，表示已跨天。
 func (s *Service) RolloverDaily(now time.Time, objs *bpfgen.LoadedObjects) {
 	if s == nil || objs == nil {
 		return
@@ -337,7 +337,7 @@ func (s *Service) RolloverDaily(now time.Time, objs *bpfgen.LoadedObjects) {
 	if currentDay == s.currentStatsDay {
 		return
 	}
-	// 加 dailyMu 锁和二次判断，所以即使多个 ticker 同时撞上，也只会真正执行一次
+	// 加 dailyMu 锁并二次判断，因此多个 ticker 同时触发时也只会实际执行一次。
 	s.dailyMu.Lock()
 	defer s.dailyMu.Unlock()
 	if currentDay == s.currentStatsDay {
@@ -348,7 +348,7 @@ func (s *Service) RolloverDaily(now time.Time, objs *bpfgen.LoadedObjects) {
 	previousTraffic := s.stats.trafficStatSnapshot()
 	s.logStatsSnapshot(fmt.Sprintf("daily-total[%s]", previousDay), objs)
 	if err := resetKernelStats(objs.KernelStatsMap); err != nil {
-		log.Printf("reset kernel stats error: %v", err)
+		log.Printf("重置内核统计失败：%v", err)
 	}
 	s.stats.resetDailyCounters()
 	if s.assembler != nil {
@@ -358,7 +358,7 @@ func (s *Service) RolloverDaily(now time.Time, objs *bpfgen.LoadedObjects) {
 		s.heartbeat.setPreviousDayTraffic(previousTraffic, now)
 	}
 	s.currentStatsDay = currentDay
-	log.Printf("daily stats rollover complete previous_day=%s current_day=%s", previousDay, currentDay)
+	log.Printf("每日统计切换完成：previous_day=%s current_day=%s", previousDay, currentDay)
 }
 
 func (s *stats) trafficStatSnapshot() heartbeatTrafficStat {
@@ -429,6 +429,11 @@ func (s *stats) resetDailyCounters() {
 	s.sourceMu.Lock()
 	s.rawBySource = nil
 	s.updatesBySource = nil
+	// 这些映射按链路各保存一项；虽然计数器属于每日统计，但若不清理，
+	// 映射会在整个进程生命周期内持续增长。
+	s.rawChainsByKey = nil
+	s.updateChainsByKey = nil
+	s.rawChainDetails = nil
 	s.sourceMu.Unlock()
 }
 
@@ -461,7 +466,7 @@ func localDayStamp(t time.Time) string {
 	return t.In(time.Local).Format("2006-01-02")
 }
 
-// 1 true 0 false
+// 1 表示 true，0 表示 false。
 func boolToInt(v bool) int {
 	if v {
 		return 1

@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"errors"
 	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,10 +12,86 @@ import (
 	"power-ebpf/internal/httptrace"
 )
 
+func TestRedisWriteQueueBoundsRetainedBytes(t *testing.T) {
+	queue := newRedisWriteQueue(4, redisQueuePermitBytes)
+	update := httptrace.Update{Trace: httptrace.TraceDocument{
+		Request: &httptrace.ParsedMessage{Body: strings.Repeat("x", 8<<10)},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := queue.enqueue(ctx, update); err != nil {
+		t.Fatalf("enqueue first update: %v", err)
+	}
+
+	if err := queue.enqueue(ctx, update); !errors.Is(err, errRedisWriteQueueFull) {
+		t.Fatalf("second update should be dropped at byte budget, got %v", err)
+	}
+
+	first := <-queue.ch
+	queue.release(first.permits)
+	if got := queue.bytes.Load(); got != 0 {
+		t.Fatalf("retained bytes after writer release: got %d want 0", got)
+	}
+	if got := queue.peak.Load(); got != redisQueuePermitBytes {
+		t.Fatalf("queue peak: got %d want %d", got, redisQueuePermitBytes)
+	}
+}
+
+func TestSocketResolverBoundsCacheEntries(t *testing.T) {
+	resolver := newSocketResolver(time.Minute)
+	resolver.maxEntries = 2
+	tuple := cachedSocketTuple{localIP: "127.0.0.1", remoteIP: "127.0.0.2"}
+
+	for id := uint64(1); id <= 3; id++ {
+		resolver.storeCache(socketKey{pid: 1, fd: 1, sockID: id}, tuple)
+	}
+	if got := resolver.cacheEntries(); got != 2 {
+		t.Fatalf("resolver cache entries: got %d want 2", got)
+	}
+}
+
+func TestAssemblerBoundsTraceStatesAndSkipsUnknownSizeOnly(t *testing.T) {
+	assembler := httptrace.NewAssembler(32<<10, time.Minute, time.Second)
+	assembler.SetMaxActiveStates(2)
+	for chainID := uint64(1); chainID <= 3; chainID++ {
+		if _, err := assembler.Process(httptrace.Event{ChainID: chainID, Direction: httptrace.DirectionRequest, Payload: []byte("GET / HTTP/1.1\r\nHost: example\r\n")}); err != nil {
+			t.Fatalf("process chain %d: %v", chainID, err)
+		}
+	}
+	snapshot := assembler.Snapshot()
+	if snapshot.ActiveTraceStates != 2 || snapshot.StateDrops != 1 {
+		t.Fatalf("unexpected state limit snapshot: %+v", snapshot)
+	}
+	if _, err := assembler.Process(httptrace.Event{ChainID: 4, Direction: httptrace.DirectionRequest, Flags: 1 << 6}); err != nil {
+		t.Fatalf("process size-only event: %v", err)
+	}
+	snapshot = assembler.Snapshot()
+	if snapshot.ActiveTraceStates != 2 || snapshot.StateDrops != 1 {
+		t.Fatalf("size-only event should not retain state: %+v", snapshot)
+	}
+}
+
+func TestStatsBoundsDiagnosticChainSets(t *testing.T) {
+	s := &stats{}
+	for chainID := uint64(1); chainID <= maxTrackedChainsPerKey+10; chainID++ {
+		s.recordRawSourceEvent(httptrace.Event{ChainID: chainID, Direction: httptrace.DirectionRequest, Source: "sock_sendmsg"})
+		s.recordUpdateSource("sock_sendmsg", "request", chainID)
+	}
+
+	rawCount, rawOverflow := s.rawChainsByKey["sock_sendmsg:req"].count()
+	if rawCount != maxTrackedChainsPerKey || rawOverflow != 10 {
+		t.Fatalf("raw diagnostic set: count=%d overflow=%d", rawCount, rawOverflow)
+	}
+	updateCount, updateOverflow := s.updateChainsByKey["sock_sendmsg:req"].count()
+	if updateCount != maxTrackedChainsPerKey || updateOverflow != 10 {
+		t.Fatalf("update diagnostic set: count=%d overflow=%d", updateCount, updateOverflow)
+	}
+}
+
 func TestFormatIPv4FromKernelNetworkOrderValue(t *testing.T) {
 	const raw uint32 = 0xA104A8C0
-	log.Println(raw)
-	log.Println(formatIPv4(raw))
+	log.Println("原始地址：", raw)
+	log.Println("IPv4 地址：", formatIPv4(raw))
 
 	if got, want := formatIPv4(raw), "192.168.4.161"; got != want {
 		t.Fatalf("formatIPv4 mismatch: got %q want %q", got, want)

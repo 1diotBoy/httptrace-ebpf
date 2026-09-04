@@ -812,6 +812,52 @@ func TestAssemblerEvictExpiredFlushesPartialResponse(t *testing.T) {
 	}
 }
 
+func TestAssemblerReleasesIncompleteFragmentsOnEviction(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Millisecond, 500*time.Millisecond)
+	asm.SetMaxRetainedBytes(1024)
+	payload := []byte("POST /hold HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4096\r\n\r\n" + strings.Repeat("x", 128))
+
+	if _, err := asm.Process(Event{
+		Timestamp: time.Now(),
+		ChainID:   8801,
+		Direction: DirectionRequest,
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("process incomplete request: %v", err)
+	}
+	if got := asm.Snapshot().RetainedBytes; got != uint64(len(payload)) {
+		t.Fatalf("retained bytes after incomplete request: got %d want %d", got, len(payload))
+	}
+
+	if _, evicted := asm.EvictExpired(time.Now().Add(time.Second)); evicted != 1 {
+		t.Fatalf("evicted states: got %d want 1", evicted)
+	}
+	if got := asm.Snapshot().RetainedBytes; got != 0 {
+		t.Fatalf("retained bytes after eviction: got %d want 0", got)
+	}
+}
+
+func TestAssemblerRejectsFragmentsAboveGlobalRetentionBudget(t *testing.T) {
+	asm := NewAssembler(1<<20, time.Minute, 500*time.Millisecond)
+	asm.SetMaxRetainedBytes(64)
+
+	if _, err := asm.Process(Event{
+		Timestamp: time.Now(),
+		ChainID:   8802,
+		Direction: DirectionRequest,
+		Payload:   []byte(strings.Repeat("x", 128)),
+	}); err != nil {
+		t.Fatalf("process over-budget fragment: %v", err)
+	}
+	snap := asm.Snapshot()
+	if snap.RetainedBytes != 0 {
+		t.Fatalf("over-budget fragment retained %d bytes", snap.RetainedBytes)
+	}
+	if snap.BufferDrops != 1 {
+		t.Fatalf("over-budget fragment drops: got %d want 1", snap.BufferDrops)
+	}
+}
+
 func TestAssemblerFlushStalledTruncatedResponseWithoutFinalSizeEvent(t *testing.T) {
 	asm := NewAssembler(1<<20, time.Minute, 100*time.Millisecond)
 	now := time.Now()

@@ -53,8 +53,10 @@ func TestParseBodyLimitBytesAcceptsKBAndBytes(t *testing.T) {
 	}{
 		{name: "kb value", raw: "32", want: 32 * 1024},
 		{name: "bytes value", raw: "32768", want: 32 * 1024},
-		{name: "clamp over 32kb", raw: "64", want: 32 * 1024},
+		{name: "larger kb value", raw: "64", want: 64 * 1024},
 		{name: "lower byte value", raw: "16384", want: 16 * 1024},
+		{name: "megabyte suffix", raw: "1m", want: 1024 * 1024},
+		{name: "megabyte suffix with bytes", raw: "1mb", want: 1024 * 1024},
 	}
 
 	for _, tc := range tests {

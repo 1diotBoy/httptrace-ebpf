@@ -42,16 +42,20 @@
  *
  * 当前策略：
  * 1. 单个 perf event 的 payload 放大到 4KB 级别；
- * 2. 通用路径默认覆盖前 2 个 iov；legacy 4.19 固定展开时会额外补第 3 个 iov，
- *    用来减少小 chunked 响应只抓到 framing、抓不到 body 的情况；
- * 3. 单 iov 最多展开 8 个 chunk；
- * 4. request/response 的总采集上限保持 32KB。
+ * 2. 通用路径与 legacy 路径都覆盖前 8 个 iov。超过可覆盖范围时必须停止
+ *    payload 采集，避免在缺失中间字节后继续向用户态拼接；
+ * 3. 单 iov 最多展开 9 个 chunk，保证 4095-byte event 下能够精确覆盖 32KB；
+ * 4. request/response 的实际采集上限由 filter map 中的动态配置决定。
+ *    单次调用的固定展开上限只限制一次 hook 能发出的 fragment 数量，
+ *    不应被当成整条消息的逻辑截断值。
  */
 #define EVENT_PAYLOAD_SIZE 4096
 #define MAX_PAYLOAD_SIZE 4095
 #define MAX_PAYLOAD_MASK 4095
-#define MAX_IOVECS 2
-#define MAX_CHUNKS_PER_IOV 8
+#define MAX_IOVECS 8
+/* 4.19 legacy 对固定展开次数非常敏感；保持原有展开规模，避免
+ * verifier 状态爆炸。它只限制单次 hook 的覆盖量，不限制消息总上限。 */
+#define MAX_CHUNKS_PER_IOV 9
 #define MAX_FRAGMENTS (MAX_IOVECS * MAX_CHUNKS_PER_IOV)
 #define MAX_CAPTURE_BYTES_PER_CALL (MAX_PAYLOAD_SIZE * MAX_FRAGMENTS)
 #define DEBUG_SNAPSHOT_RAW_BYTES 64
@@ -89,6 +93,8 @@ enum http_event_flags {
 	EVT_FLAG_CONTROL = 1 << 4,
 	EVT_FLAG_CLOSE = 1 << 5,
 	EVT_FLAG_SIZE_ONLY = 1 << 6,
+	/* 最后一个连续 payload 已经输出；它不是 HTTP 消息结束。 */
+	EVT_FLAG_CAPTURE_BOUNDARY = 1 << 7,
 };
 
 enum filter_debug_flags {
@@ -471,6 +477,11 @@ struct kernel_stats {
 	__u64 iter_bvec;
 	__u64 iter_unsupported;
 	__u64 iter_load_fail;
+	/* 诊断动态截断/只统计路径；这些计数不改变采集语义。 */
+	__u64 capture_limit_hits;
+	__u64 capture_boundary_events;
+	__u64 size_final_events;
+	__u64 informational_responses;
 };
 
 struct trace_event_raw_sys_enter_compat {

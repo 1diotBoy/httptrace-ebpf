@@ -1,6 +1,7 @@
 package bpfgen
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -82,13 +83,13 @@ var knownKernelProfiles = []kernelProfile{
 // LoadedObjects 把 modern/legacy 两套 bpf2go 产物统一成同一组句柄，
 // 上层业务不需要关心当前实际加载的是哪一版 eBPF 对象。
 type LoadedObjects struct {
-	Variant      string
-	HookStrategy HookStrategy
+	Variant      string       // 变体名称
+	HookStrategy HookStrategy // 钩子策略
 
-	Events           *ebpf.Map
-	FilterMap        *ebpf.Map
-	KernelStatsMap   *ebpf.Map
-	DebugSnapshotMap *ebpf.Map
+	Events           *ebpf.Map // 事件映射
+	FilterMap        *ebpf.Map // 过滤映射
+	KernelStatsMap   *ebpf.Map // 内核统计映射
+	DebugSnapshotMap *ebpf.Map // 调试快照映射
 
 	KprobeSockRecvmsg      *ebpf.Program
 	KprobeSockSendmsg      *ebpf.Program
@@ -134,21 +135,58 @@ func LoadObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
 
 	var errs []string
 	for _, plan := range plans {
-		log.Printf("loading eBPF objects variant=%s kernel=%s hook_strategy=%s", plan.Name, version.Release, plan.HookStrategy)
+		log.Printf("正在加载 eBPF 对象：variant=%s kernel=%s hook_strategy=%s", plan.Name, version.Release, plan.HookStrategy)
 		objs, err := plan.Load(opts)
 		if err == nil {
-			log.Printf("eBPF objects loaded variant=%s kernel=%s hook_strategy=%s", plan.Name, version.Release, plan.HookStrategy)
+			log.Printf("eBPF 对象加载完成：variant=%s kernel=%s hook_strategy=%s", plan.Name, version.Release, plan.HookStrategy)
 			return objs, nil
 		}
 
+		// Collection 加载会将实际程序加载错误包装为失败字段名。普通返回错误保持简洁，
+		// 但在这里输出完整的 verifier/errno 诊断，使旧内核返回的 EINVAL 不会只显示为“无效参数”。
+		logKernelLoadFailure(version, plan, err)
 		errs = append(errs, fmt.Sprintf("%s: %v", plan.Name, err))
 		if !shouldTryNextVariant(plan.Name, err) {
 			return nil, fmt.Errorf("load %s objects: %w", plan.Name, err)
 		}
-		log.Printf("load variant=%s failed, trying next candidate: %v", plan.Name, err)
+		log.Printf("加载 variant=%s 失败，尝试下一个候选项：%v", plan.Name, err)
 	}
 
 	return nil, fmt.Errorf("load bpf variants for kernel %s: %s", version.Release, strings.Join(errs, "; "))
+}
+
+// logKernelLoadFailure 输出生成的 bpf2go LoadAndAssign 包装器默认隐藏的信息。
+// cilium/ebpf 收到 verifier 拒绝时可以提供 verifier 日志，并默认使用诊断日志重试加载；
+// 排障时可通过 POWER_EBPF_VERIFIER_LOG 请求更大的指令级缓冲区。
+func logKernelLoadFailure(version kernelVersion, plan variantPlan, err error) {
+	if err == nil {
+		return
+	}
+
+	log.Printf("eBPF 加载失败：variant=%s hook_strategy=%s kernel=%s (%d.%d) error_type=%T error=%v",
+		plan.Name, plan.HookStrategy, version.Release, version.Major, version.Minor, err, err)
+
+	var verifierErr *ebpf.VerifierError
+	if errors.As(err, &verifierErr) {
+		if len(verifierErr.Log) == 0 {
+			log.Printf("eBPF verifier 日志不可用：内核在输出 verifier 信息前拒绝了请求；请设置 POWER_EBPF_VERIFIER_LOG=1 后重试")
+		} else {
+			const maxPrintedVerifierLog = 1 << 20
+			text := strings.Join(verifierErr.Log, "\n")
+			if len(text) > maxPrintedVerifierLog {
+				log.Printf("eBPF verifier 日志（共 %d 字节，前 %d 字节）：\n%s", len(text), maxPrintedVerifierLog, text[:maxPrintedVerifierLog])
+				log.Printf("eBPF verifier 日志已截断；POWER_EBPF_VERIFIER_LOG 控制采集缓冲区大小，当前缓冲区可能包含完整日志")
+			} else {
+				log.Printf("eBPF verifier 日志（%d 字节）：\n%s", len(text), text)
+			}
+		}
+	}
+
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		log.Printf("eBPF 加载 errno：%d（%s）；EINVAL 通常表示当前内核不支持某个 helper/程序属性，或 verifier 拒绝了程序",
+			errno, errno)
+	}
 }
 
 func loadModernObjects(opts *ebpf.CollectionOptions) (*LoadedObjects, error) {
@@ -448,14 +486,14 @@ func chooseVariantPlans(version kernelVersion) []variantPlan {
 	if forced := strings.TrimSpace(os.Getenv(objectVariantEnv)); forced != "" {
 		plan, ok := variantPlanByName(forced)
 		if !ok {
-			log.Printf("ignore unknown %s=%q, continue auto variant selection", objectVariantEnv, forced)
+			log.Printf("忽略未知的 %s=%q，继续自动选择 variant", objectVariantEnv, forced)
 		} else {
 			return []variantPlan{plan}
 		}
 	}
 
 	if profile, ok := matchKernelProfile(version); ok {
-		log.Printf("matched kernel profile=%s release=%s", profile.Name, version.Release)
+		log.Printf("匹配到内核配置：profile=%s release=%s", profile.Name, version.Release)
 		return plansForVariantNames(profile.Variants)
 	}
 
@@ -509,7 +547,7 @@ func plansForVariantNames(names []string) []variantPlan {
 	for _, name := range names {
 		plan, ok := variantPlanByName(name)
 		if !ok {
-			log.Printf("ignore unknown variant name %q in kernel profile plan", name)
+			log.Printf("忽略内核配置计划中的未知 variant：%q", name)
 			continue
 		}
 		plans = append(plans, plan)
@@ -641,7 +679,7 @@ func withVerifierLogs(opts *ebpf.CollectionOptions) *ebpf.CollectionOptions {
 		return opts
 	}
 
-	log.Printf("verifier debug log enabled by %s", verifierLogEnv)
+	log.Printf("已通过 %s 开启 verifier 调试日志", verifierLogEnv)
 
 	if opts == nil {
 		return &ebpf.CollectionOptions{

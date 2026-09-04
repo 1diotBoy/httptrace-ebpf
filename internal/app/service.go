@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,17 +29,133 @@ import (
 )
 
 const (
-	flagStart        = 1 << 0
-	flagEnd          = 1 << 1
-	flagCaptureTrunc = 1 << 2
-	flagControl      = 1 << 4
-	flagClose        = 1 << 5
-	flagSizeOnly     = 1 << 6
+	flagStart           = 1 << 0
+	flagEnd             = 1 << 1
+	flagCaptureTrunc    = 1 << 2
+	flagControl         = 1 << 4
+	flagClose           = 1 << 5
+	flagSizeOnly        = 1 << 6
+	flagCaptureBoundary = 1 << 7
 
 	kernelDebugFlagSnapshot             = 1 << 0
 	kernelDebugFlagLegacySendPrimaryTCP = 1 << 8
 	kernelDebugFlagLegacyRecvPrimaryTCP = 1 << 9
+	redisQueuePermitBytes               = 64 << 10
+	maxEventPayloadBytes                = 4095
 )
+
+var errRedisWriteQueueFull = errors.New("redis write queue is full")
+
+type redisWriteItem struct {
+	update  httptrace.Update
+	permits int
+}
+
+// redisWriteQueue 有两类上限：channel 限制排队记录数，permits 限制排队中和处理中的记录所保留的字节数。
+// 仅限制记录数并不安全，因为单个采集前缀可能达到数 MiB。
+type redisWriteQueue struct {
+	ch       chan redisWriteItem
+	permits  chan struct{}
+	maxBytes uint64
+	bytes    atomic.Uint64
+	peak     atomic.Uint64
+	blocked  atomic.Uint64
+}
+
+func newRedisWriteQueue(recordCapacity, byteBudget int) *redisWriteQueue {
+	if recordCapacity < 1 {
+		recordCapacity = 1
+	}
+	if byteBudget < redisQueuePermitBytes {
+		byteBudget = redisQueuePermitBytes
+	}
+	permitCapacity := (byteBudget + redisQueuePermitBytes - 1) / redisQueuePermitBytes
+	return &redisWriteQueue{
+		ch:       make(chan redisWriteItem, recordCapacity),
+		permits:  make(chan struct{}, permitCapacity),
+		maxBytes: uint64(permitCapacity * redisQueuePermitBytes),
+	}
+}
+
+func estimateRedisUpdateBytes(update httptrace.Update) uint64 {
+	// Save 将文档编码为 JSON，此时排队更新仍引用原始正文。正文字节按三份预留，
+	// 覆盖原始正文、编码缓冲区以及分配器增长/Redis 客户端复制的开销。
+	const metadataBytes = 16 << 10
+	bytes := uint64(metadataBytes)
+	if request := update.Trace.Request; request != nil {
+		bytes += 3 * uint64(len(request.Body))
+	}
+	if response := update.Trace.Response; response != nil {
+		bytes += 3 * uint64(len(response.Body))
+	}
+	return bytes
+}
+
+func (q *redisWriteQueue) permitsFor(update httptrace.Update) int {
+	if q == nil {
+		return 0
+	}
+	permits := (estimateRedisUpdateBytes(update) + redisQueuePermitBytes - 1) / redisQueuePermitBytes
+	if permits == 0 {
+		permits = 1
+	}
+	if permits > uint64(cap(q.permits)) {
+		// 单条记录即使超过配置预算也仍会写入，但必须等待其他写入完成后再处理，
+		// 不会在内存中无限复制。
+		permits = uint64(cap(q.permits))
+	}
+	return int(permits)
+}
+
+// Redis 队列满时改为立即丢弃 Redis 副本并记录 redis_dropped，不再阻塞 HTTP worker 和 perf reader
+func (q *redisWriteQueue) enqueue(ctx context.Context, update httptrace.Update) error {
+	if q == nil {
+		return nil
+	}
+	permits := q.permitsFor(update)
+	for i := 0; i < permits; i++ {
+		select {
+		case q.permits <- struct{}{}:
+			continue
+		default:
+			q.releasePermits(i)
+			q.blocked.Add(1)
+			return errRedisWriteQueueFull
+		}
+	}
+	reserved := uint64(permits * redisQueuePermitBytes)
+	current := q.bytes.Add(reserved)
+	updateAtomicMax(&q.peak, current)
+	item := redisWriteItem{update: update, permits: permits}
+	select {
+	case <-ctx.Done():
+		q.release(permits)
+		return ctx.Err()
+	case q.ch <- item:
+		return nil
+	default:
+		q.release(permits)
+		q.blocked.Add(1)
+		return errRedisWriteQueueFull
+	}
+}
+
+func (q *redisWriteQueue) releasePermits(permits int) {
+	if q == nil || permits <= 0 {
+		return
+	}
+	for i := 0; i < permits; i++ {
+		<-q.permits
+	}
+}
+
+func (q *redisWriteQueue) release(permits int) {
+	if q == nil || permits <= 0 {
+		return
+	}
+	q.releasePermits(permits)
+	q.bytes.Add(^uint64(permits*redisQueuePermitBytes - 1))
+}
 
 type Service struct {
 	cfg                      Config
@@ -59,6 +176,16 @@ type Service struct {
 	currentStatsDay          string
 	collectEnabled           atomic.Bool
 	dailyMu                  sync.Mutex
+	runtimeMu                sync.RWMutex
+	primaryPerfPerCPUBytes   int
+	primaryPerfMaxMmapBytes  uint64
+	primaryPerfCPUs          int
+	tlsPerfPerCPUBytes       int
+	tlsPerfMaxMmapBytes      uint64
+	tlsPerfCPUs              int
+	workerQueues             []chan httptrace.Event
+	redisQueue               *redisWriteQueue
+	retryQueue               chan struct{}
 }
 
 type stats struct {
@@ -70,6 +197,7 @@ type stats struct {
 	outputBytes        atomic.Uint64
 	redisWrites        atomic.Uint64
 	redisFailures      atomic.Uint64
+	redisDropped       atomic.Uint64
 	parseFailures      atomic.Uint64
 	evicted            atomic.Uint64
 	userFiltered       atomic.Uint64
@@ -110,9 +238,54 @@ type stats struct {
 	sourceMu           sync.Mutex
 	rawBySource        map[string]sourceDirectionCounts
 	updatesBySource    map[string]sourceUpdateCounts
-	rawChainsByKey     map[string]map[uint64]struct{}
-	updateChainsByKey  map[string]map[uint64]struct{}
+	rawChainsByKey     map[string]*boundedChainSet
+	updateChainsByKey  map[string]*boundedChainSet
 	rawChainDetails    map[string]rawChainDetail
+}
+
+const (
+	maxTrackedChainsPerKey = 65536
+	maxRawChainDetails     = 2048
+)
+
+// boundedChainSet 仅用于诊断状态。raw/update 事件计数仍然精确；此集合避免高基数负载
+// 一直保留所有 chain id，直到每日统计切换。
+type boundedChainSet struct {
+	ids      map[uint64]struct{}
+	overflow uint64
+}
+
+func (s *boundedChainSet) add(id uint64) bool {
+	if s == nil || id == 0 {
+		return false
+	}
+	if s.ids == nil {
+		s.ids = make(map[uint64]struct{})
+	}
+	if _, ok := s.ids[id]; ok {
+		return false
+	}
+	if len(s.ids) >= maxTrackedChainsPerKey {
+		s.overflow++
+		return false
+	}
+	s.ids[id] = struct{}{}
+	return true
+}
+
+func (s *boundedChainSet) contains(id uint64) bool {
+	if s == nil {
+		return false
+	}
+	_, ok := s.ids[id]
+	return ok
+}
+
+func (s *boundedChainSet) count() (int, uint64) {
+	if s == nil {
+		return 0, 0
+	}
+	return len(s.ids), s.overflow
 }
 
 type sourceDirectionCounts struct {
@@ -229,14 +402,14 @@ func NewService(cfg Config) (*Service, error) {
 			return nil, err
 		}
 	} else {
-		log.Printf("redis 地址为空， 不存储到redis ...")
+		log.Printf("Redis 地址为空，不写入 Redis")
 	}
 	startTime := time.Now()
 	heartbeat, err := newHeartbeatRuntime(cfg, startTime)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("runtime resource plan: %s", plan.Summary())
+	log.Printf("运行时资源计划：%s", plan.Summary())
 	svc := &Service{
 		cfg:             cfg,
 		filter:          filter,
@@ -252,6 +425,7 @@ func NewService(cfg Config) (*Service, error) {
 	if svc.assembler != nil {
 		_, _, assemblerLimit := svc.currentCaptureLimits()
 		svc.assembler.SetMaxMessageBytes(assemblerLimit)
+		svc.assembler.SetMaxRetainedBytes(cfg.AssemblerBufferBytes)
 	}
 	svc.assembler.SetDebugTLSQueue(cfg.DebugKernel)
 	svc.collectEnabled.Store(true)
@@ -277,40 +451,42 @@ func (s *Service) Run(ctx context.Context) error {
 		tlsReader *perf.Reader
 	)
 
-	log.Printf("加载ebpf 对象...")
-	stopLoadWatch := startPhaseWatch(ctx, "bpf object load", 2*time.Second)
+	log.Printf("正在加载 eBPF 对象...")
+	stopLoadWatch := startPhaseWatch(ctx, "BPF 对象加载", 2*time.Second)
 	objs, err := bpfgen.LoadObjects(nil)
 	stopLoadWatch()
 	if err != nil {
 		return fmt.Errorf("load bpf objects: %w", err)
 	}
 	defer objs.Close()
-	log.Printf("bpf objects loaded (variant=%s hook_strategy=%s)", objs.Variant, objs.HookStrategy)
+	log.Printf("eBPF 对象加载完成：variant=%s hook_strategy=%s", objs.Variant, objs.HookStrategy)
 	s.hookStrategy = objs.HookStrategy
 
+	// 内核态过滤，挂载点不能稳定获取，暂未开启内核态过滤
 	if err := s.installFilter(objs); err != nil {
 		return err
 	}
+
 	if err := s.syncCaptureLimitsToKernel(objs.FilterMap); err != nil {
-		log.Printf("initial kernel capture limit sync error: %v", err)
+		log.Printf("初始内核采集上限同步失败：%v", err)
 	}
-	log.Printf("resolved filter: %s", s.filter.Summary())
+	log.Printf("已解析过滤规则：%s", s.filter.Summary())
 	if s.cfg.DisableUserTuple {
-		log.Printf("user tuple pipeline disabled: skip /proc tuple resolve and user-space tuple filter; redis/console output keeps kernel tuple when available")
+		log.Printf("用户元组管道已禁用：跳过/proc元组解析和用户空间元组过滤器；redis/控制台输出在可用时保留内核元组")
 	}
 
-	stopAttachWatch := startPhaseWatch(ctx, "probe attach", 2*time.Second)
+	stopAttachWatch := startPhaseWatch(ctx, "probe 挂载", 2*time.Second)
 	links, err := attachAll(objs)
 	stopAttachWatch()
 	if err != nil {
 		return err
 	}
 	defer closeAll(links)
-	log.Printf("probe attach complete")
+	log.Printf("探针挂载完成")
 
 	if s.cfg.EnableTLS {
-		log.Printf("loading tls uprobes...")
-		stopTLSLoadWatch := startPhaseWatch(ctx, "tls object load", 2*time.Second)
+		log.Printf("正在加载 TLS uprobe...")
+		stopTLSLoadWatch := startPhaseWatch(ctx, "TLS 对象加载", 2*time.Second)
 		tlsObjs, err = bpfgen.LoadTLSObjects(nil)
 		stopTLSLoadWatch()
 		if err != nil {
@@ -329,9 +505,9 @@ func (s *Service) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("resolve tls library paths: %w", err)
 		}
-		log.Printf("resolved tls libraries for comm=%q: %s", tlstrace.ResolveTargetComm(s.cfg.TLSComm), strings.Join(tlsLibPaths, ","))
+		log.Printf("已解析 comm=%q 的 TLS 库：%s", tlstrace.ResolveTargetComm(s.cfg.TLSComm), strings.Join(tlsLibPaths, ","))
 
-		stopTLSAttachWatch := startPhaseWatch(ctx, "tls uprobe attach", 2*time.Second)
+		stopTLSAttachWatch := startPhaseWatch(ctx, "TLS uprobe 挂载", 2*time.Second)
 		tlsLinks, err = tlstrace.AttachAll(tlsObjs, tlsLibPaths)
 		stopTLSAttachWatch()
 		if err != nil {
@@ -339,11 +515,9 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 		defer closeAll(tlsLinks)
 
-		tlsPerfBytes := s.cfg.PerfBufferBytes() * 4
-		if tlsPerfBytes < s.cfg.PerfBufferBytes() {
-			tlsPerfBytes = s.cfg.PerfBufferBytes()
-		}
-		tlsReader, err = perf.NewReader(tlsObjs.Events, tlsPerfBytes)
+		// perf.NewReader 会为每个可能的 CPU 分配这块数据区域。TLS 和 socket reader 共用同一套
+		// 有界的每 CPU 预算；如果在这里重复放大，TLS 模式会消耗已经全局分配的环形区的四倍内存。
+		tlsReader, err = perf.NewReader(tlsObjs.Events, s.cfg.PerfBufferBytes())
 		if err != nil {
 			return fmt.Errorf("create tls perf reader: %w", err)
 		}
@@ -356,10 +530,18 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	defer reader.Close()
 
+	// 启动redis写入器
 	writeCh, writersDone := s.startRedisWriters()
+	// 启动工作线程，将事件分发到对应的worker中，每个worker一个channel，用于接收事件
 	workers, workersDone := s.startWorkers(writeCh)
 
-	retrySem := make(chan struct{}, s.cfg.RetryQueueSize)
+	retrySem := make(chan struct{}, s.cfg.RetryQueueSize) // 重试队列，用于重试失败的事件
+	s.setRuntimeDiagnostics(reader, int(objs.Events.MaxEntries()), tlsReader, func() int {
+		if tlsObjs == nil {
+			return 0
+		}
+		return int(tlsObjs.Events.MaxEntries())
+	}(), workers, writeCh, retrySem)
 	var retryWG sync.WaitGroup
 
 	var wg sync.WaitGroup
@@ -368,6 +550,7 @@ func (s *Service) Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// 启动读取循环，读取事件并分发到对应的worker中
 		if err := s.readLoop(ctx, reader, workers, retrySem, &retryWG); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, perf.ErrClosed) {
 			errCh <- err
 		}
@@ -435,11 +618,11 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	if len(updates) > 0 || flushedStates > 0 {
 		s.stats.shutdownFlushes.Add(uint64(len(updates)))
-		log.Printf("shutdown flush(states=%d updates=%d)", flushedStates, len(updates))
+		log.Printf("停止前刷新完成：states=%d updates=%d", flushedStates, len(updates))
 	}
 
 	if writeCh != nil {
-		close(writeCh)
+		close(writeCh.ch)
 	}
 	writersDone.Wait()
 	s.logStatsSnapshot("final", objs)
@@ -451,12 +634,14 @@ func (s *Service) Run(ctx context.Context) error {
 func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 	key := uint32(0)
 	kernelFilter := s.filter.Kernel
+	// 获取当前采集限制,用于设置内核态过滤规则
 	requestLimit, responseLimit, assemblerLimit := s.currentCaptureLimits()
 	if s.assembler != nil {
 		s.assembler.SetMaxMessageBytes(assemblerLimit)
 	}
+	// cfg.DisableKernelFilter=false 则不进行内核态过滤
 	if s.cfg.DisableKernelFilter {
-		log.Printf("kernel endpoint filter disabled by flag: all IP/port checks are skipped before perf output")
+		log.Printf("按标志关闭内核端点过滤：perf 输出前跳过全部 IP/端口检查")
 		kernelFilter.Ifindex = 0
 		kernelFilter.SrcIp = 0
 		kernelFilter.DstIp = 0
@@ -474,7 +659,7 @@ func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 		return nil
 	}
 	if kernelFilter.Ifindex != 0 {
-		log.Printf("ifname filter is not enforced in kernel tuple-cache mode: socket-layer ifindex is not reliable enough")
+		log.Printf("五元组缓存模式不执行 ifname 过滤：socket 层 ifindex 可靠性不足")
 	}
 	kernelFilter.Ifindex = 0
 	kernelFilter.RequestCaptureBytes = requestLimit
@@ -486,7 +671,7 @@ func (s *Service) installFilter(objs *bpfgen.LoadedObjects) error {
 		// 4.x 上 sock 结构布局在不同发行版/回移内核间差异更大，
 		// 改成用 inet_sock_set_state 维护 tuple cache，send/recv 路径优先查 cache 做端口/IP 过滤。
 		// 这样 4.x 不再依赖收发现场直接读 sock_common 来做强过滤。
-		log.Printf("legacy 4.x detected: prefer tuple-cache based kernel port/IP filter and ignore socket-layer ifname filter")
+		log.Printf("检测到旧版 4.x 内核：优先使用基于五元组缓存的内核端口/IP 过滤，忽略 socket 层 ifname 过滤")
 	}
 	if err := objs.FilterMap.Update(&key, &kernelFilter, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update filter map: %w", err)
@@ -533,7 +718,7 @@ func (s *Service) syncCaptureLimitsToKernel(filterMap *ebpf.Map) error {
 	s.lastRequestCaptureLimit = requestLimit
 	s.lastResponseCaptureLimit = responseLimit
 	s.lastFilterDebugFlags = debugFlags
-	log.Printf("updated kernel capture state request=%dB response=%dB assembler=%dB enabled=%t", requestLimit, responseLimit, assemblerLimit, s.collectEnabled.Load())
+	log.Printf("内核采集状态已更新：request=%dB response=%dB assembler=%dB enabled=%t", requestLimit, responseLimit, assemblerLimit, s.collectEnabled.Load())
 	return nil
 }
 
@@ -563,11 +748,11 @@ func (s *Service) installTLSConfig(configMap *ebpf.Map) error {
 	if err := configMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update tls config map: %w", err)
 	}
-	log.Printf("updated tls capture state request=%dB response=%dB assembler=%dB flags=%d", requestLimit, responseLimit, assemblerLimit, cfg.Flags)
+	log.Printf("TLS 采集状态已更新：request=%dB response=%dB assembler=%dB flags=%d", requestLimit, responseLimit, assemblerLimit, cfg.Flags)
 	return nil
 }
 
-func (s *Service) startRedisWriters() (chan httptrace.Update, *sync.WaitGroup) {
+func (s *Service) startRedisWriters() (*redisWriteQueue, *sync.WaitGroup) {
 	var wg sync.WaitGroup
 
 	if s.store == nil {
@@ -581,30 +766,31 @@ func (s *Service) startRedisWriters() (chan httptrace.Update, *sync.WaitGroup) {
 	if queueSize <= 0 {
 		queueSize = max(256, s.resourcePlan.RedisQueueSize)
 	}
-	ch := make(chan httptrace.Update, queueSize)
+	queue := newRedisWriteQueue(queueSize, s.cfg.RedisQueueBytes)
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			for update := range ch {
+			for item := range queue.ch {
 				// 超时
 				saveCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				err := s.store.Save(saveCtx, update.Trace)
+				err := s.store.Save(saveCtx, item.update.Trace)
 				cancel()
+				queue.release(item.permits)
 				if err != nil {
 					s.stats.redisFailures.Add(1)
-					log.Printf("[redis-worker=%d] save error: %v", workerID, err)
+					log.Printf("[redis-worker=%d] 保存失败：%v", workerID, err)
 					continue
 				}
 				s.stats.redisWrites.Add(1)
 			}
 		}(i)
 	}
-	return ch, &wg
+	return queue, &wg
 }
 
 // startWorkers 启动批量解析 worker。每个 worker 固定一个 OS 线程，减少高并发下的调度抖动。
-func (s *Service) startWorkers(writeCh chan<- httptrace.Update) ([]chan httptrace.Event, *sync.WaitGroup) {
+func (s *Service) startWorkers(writeCh *redisWriteQueue) ([]chan httptrace.Event, *sync.WaitGroup) {
 	workerCount := s.cfg.WorkerCount
 	if workerCount <= 0 {
 		workerCount = max(1, s.resourcePlan.WorkerCount)
@@ -626,8 +812,196 @@ func (s *Service) startWorkers(writeCh chan<- httptrace.Update) ([]chan httptrac
 	return workers, &wg
 }
 
+// setRuntimeDiagnostics记录实际性能读取器的容量和
+// 用户空间队列。PerfReader。BufferSize是每个CPU的数据区域；这
+// 内核mmap还为每个CPU包含一个元数据页。用于记录实际性能读取器的容量和用户空间队列的容量。
+func (s *Service) setRuntimeDiagnostics(primary *perf.Reader, primaryCPUs int, tlsReader *perf.Reader, tlsCPUs int, workers []chan httptrace.Event, redisQueue *redisWriteQueue, retryQueue chan struct{}) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
+	s.primaryPerfCPUs = primaryCPUs
+	if primary != nil {
+		s.primaryPerfPerCPUBytes = primary.BufferSize()
+		s.primaryPerfMaxMmapBytes = uint64(primary.BufferSize()+os.Getpagesize()) * uint64(max(primaryCPUs, 0))
+	}
+	s.tlsPerfCPUs = tlsCPUs
+	if tlsReader != nil {
+		s.tlsPerfPerCPUBytes = tlsReader.BufferSize()
+		s.tlsPerfMaxMmapBytes = uint64(tlsReader.BufferSize()+os.Getpagesize()) * uint64(max(tlsCPUs, 0))
+	}
+	s.workerQueues = workers
+	s.redisQueue = redisQueue
+	s.retryQueue = retryQueue
+	pageSize := os.Getpagesize()
+	workerSlots := workerQueueCapacity(workers) * len(workers)
+	workerStructBytes := uint64(workerSlots) * uint64(unsafe.Sizeof(httptrace.Event{}))
+	workerPayloadBytes := uint64(workerSlots * maxEventPayloadBytes)
+	log.Printf("运行时缓冲区实际容量(page_size=%d perf_data_pages_per_cpu=%d perf_mmap_pages_per_cpu=%d perf_data_per_cpu=%s perf_mmap_max=%s perf_cpu_slots=%d tls_perf_data_pages_per_cpu=%d tls_perf_mmap_pages_per_cpu=%d tls_perf_data_per_cpu=%s tls_perf_mmap_max=%s tls_perf_cpu_slots=%d worker_count=%d worker_queue_capacity=%d worker_queue_slots=%d worker_queue_struct_bytes=%s worker_queue_payload_upper=%s worker_queue_retained_upper=%s redis_queue_capacity=%d redis_queue_budget=%s retry_queue_capacity=%d event_struct_bytes=%d max_event_payload_bytes=%d)",
+		pageSize,
+		s.primaryPerfPerCPUBytes/pageSize,
+		(s.primaryPerfPerCPUBytes+pageSize)/pageSize,
+		formatBytesIEC(uint64(s.primaryPerfPerCPUBytes)),
+		formatBytesIEC(s.primaryPerfMaxMmapBytes),
+		s.primaryPerfCPUs,
+		s.tlsPerfPerCPUBytes/pageSize,
+		(s.tlsPerfPerCPUBytes+pageSize)/pageSize,
+		formatBytesIEC(uint64(s.tlsPerfPerCPUBytes)),
+		formatBytesIEC(s.tlsPerfMaxMmapBytes),
+		s.tlsPerfCPUs,
+		len(workers),
+		workerQueueCapacity(workers),
+		workerSlots,
+		formatBytesIEC(workerStructBytes),
+		formatBytesIEC(workerPayloadBytes),
+		formatBytesIEC(workerStructBytes+workerPayloadBytes),
+		redisQueueCapacity(redisQueue),
+		formatBytesIEC(redisQueueBudget(redisQueue)),
+		queueCapacity(retryQueue),
+		unsafe.Sizeof(httptrace.Event{}), maxEventPayloadBytes,
+	)
+}
+
+func workerQueueCapacity(queues []chan httptrace.Event) int {
+	if len(queues) == 0 {
+		return 0
+	}
+	return cap(queues[0])
+}
+
+func queueCapacity[T any](queue chan T) int {
+	if queue == nil {
+		return 0
+	}
+	return cap(queue)
+}
+
+func redisQueueCapacity(queue *redisWriteQueue) int {
+	if queue == nil {
+		return 0
+	}
+	return cap(queue.ch)
+}
+
+func redisQueueBytes(queue *redisWriteQueue) uint64 {
+	if queue == nil {
+		return 0
+	}
+	return queue.bytes.Load()
+}
+
+func redisQueueBudget(queue *redisWriteQueue) uint64 {
+	if queue == nil {
+		return 0
+	}
+	return queue.maxBytes
+}
+
+func redisQueuePeak(queue *redisWriteQueue) uint64 {
+	if queue == nil {
+		return 0
+	}
+	return queue.peak.Load()
+}
+
+func redisQueueBlocked(queue *redisWriteQueue) uint64 {
+	if queue == nil {
+		return 0
+	}
+	return queue.blocked.Load()
+}
+
+func (s *Service) logRuntimeDiagnostics(label string) {
+	s.runtimeMu.RLock()
+	defer s.runtimeMu.RUnlock()
+	workerSlots, workerCapacity, workerMax := 0, 0, 0
+	for _, queue := range s.workerQueues {
+		if queue == nil {
+			continue
+		}
+		n := len(queue)
+		workerSlots += n
+		workerCapacity += cap(queue)
+		if n > workerMax {
+			workerMax = n
+		}
+	}
+	workerStructBytes := uint64(workerSlots) * uint64(unsafe.Sizeof(httptrace.Event{}))
+	workerPayloadBytes := uint64(workerSlots * maxEventPayloadBytes)
+	workerCapacityStructBytes := uint64(workerCapacity) * uint64(unsafe.Sizeof(httptrace.Event{}))
+	workerCapacityPayloadBytes := uint64(workerCapacity * maxEventPayloadBytes)
+	redisSlots, redisCapacity := 0, 0
+	if s.redisQueue != nil {
+		redisSlots, redisCapacity = len(s.redisQueue.ch), cap(s.redisQueue.ch)
+	}
+	pageSize := os.Getpagesize()
+	log.Printf("%s 运行时资源使用情况(page_size=%d perf_data_pages_per_cpu=%d perf_mmap_pages_per_cpu=%d perf_data_per_cpu=%s perf_mmap_max=%s perf_cpu_slots=%d tls_perf_data_pages_per_cpu=%d tls_perf_mmap_pages_per_cpu=%d tls_perf_data_per_cpu=%s tls_perf_mmap_max=%s tls_perf_cpu_slots=%d worker_queue_slots=%d/%d worker_queue_struct_bytes=%s/%s worker_queue_payload_upper=%s/%s worker_queue_retained_upper=%s/%s worker_queue_max=%d redis_queue_slots=%d/%d redis_queue_bytes=%s/%s redis_queue_peak=%s redis_queue_blocked=%d retry_queue_slots=%d/%d perf_received=%d perf_lost=%d worker_backpressure=%d dispatch_blocked=%d)",
+		label,
+		pageSize,
+		s.primaryPerfPerCPUBytes/pageSize,
+		(s.primaryPerfPerCPUBytes+pageSize)/pageSize,
+		formatBytesIEC(uint64(s.primaryPerfPerCPUBytes)),
+		formatBytesIEC(s.primaryPerfMaxMmapBytes),
+		s.primaryPerfCPUs,
+		s.tlsPerfPerCPUBytes/pageSize,
+		(s.tlsPerfPerCPUBytes+pageSize)/pageSize,
+		formatBytesIEC(uint64(s.tlsPerfPerCPUBytes)),
+		formatBytesIEC(s.tlsPerfMaxMmapBytes),
+		s.tlsPerfCPUs,
+		workerSlots, workerCapacity,
+		formatBytesIEC(workerStructBytes), formatBytesIEC(workerCapacityStructBytes),
+		formatBytesIEC(workerPayloadBytes), formatBytesIEC(workerCapacityPayloadBytes),
+		formatBytesIEC(workerStructBytes+workerPayloadBytes), formatBytesIEC(workerCapacityStructBytes+workerCapacityPayloadBytes), workerMax,
+		redisSlots, redisCapacity,
+		formatBytesIEC(redisQueueBytes(s.redisQueue)), formatBytesIEC(redisQueueBudget(s.redisQueue)), formatBytesIEC(redisQueuePeak(s.redisQueue)), redisQueueBlocked(s.redisQueue),
+		retryQueueUsage(s.retryQueue), queueCapacity(s.retryQueue),
+		s.stats.perfReceived.Load(), s.stats.perfLost.Load(), s.stats.workerBackpressure.Load(), s.stats.dispatchBlocked.Load(),
+	)
+}
+
+func logProcessMemory(label string) {
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	log.Printf("%s 进程内存使用情况(rss=%s heap_alloc=%s heap_inuse=%s heap_idle=%s heap_released=%s heap_objects=%d stack_inuse=%s goroutines=%d gc=%d)",
+		label,
+		formatBytesIEC(processRSSBytes()),
+		formatBytesIEC(mem.HeapAlloc),
+		formatBytesIEC(mem.HeapInuse),
+		formatBytesIEC(mem.HeapIdle),
+		formatBytesIEC(mem.HeapReleased),
+		mem.HeapObjects,
+		formatBytesIEC(mem.StackInuse),
+		runtime.NumGoroutine(),
+		mem.NumGC,
+	)
+}
+
+func processRSSBytes() uint64 {
+	data, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "VmRSS:" {
+			continue
+		}
+		kilobytes, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0
+		}
+		return kilobytes << 10
+	}
+	return 0
+}
+
+func retryQueueUsage(queue chan struct{}) int {
+	if queue == nil {
+		return 0
+	}
+	return len(queue)
+}
+
 // workerLoop 负责批量调用 assembler、打印解析结果、落 Redis。
-func (s *Service) workerLoop(workerID int, ch <-chan httptrace.Event, writeCh chan<- httptrace.Update, wg *sync.WaitGroup) {
+func (s *Service) workerLoop(workerID int, ch <-chan httptrace.Event, writeCh *redisWriteQueue, wg *sync.WaitGroup) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	defer wg.Done()
@@ -642,7 +1016,7 @@ func (s *Service) workerLoop(workerID int, ch <-chan httptrace.Event, writeCh ch
 			updates, err := s.assembler.Process(event)
 			if err != nil {
 				s.stats.parseFailures.Add(1)
-				log.Printf("[worker=%d] process error: %v", workerID, err)
+				log.Printf("[worker=%d] 处理事件失败：%v", workerID, err)
 				continue
 			}
 			for _, update := range updates {
@@ -707,13 +1081,13 @@ func (s *Service) printHTTPTraceTag(tag string, update httptrace.Update) {
 	}
 	body, err := json.Marshal(view)
 	if err != nil {
-		log.Printf("[%s] marshal console trace error: %v", tag, err)
+		log.Printf("[%s] 序列化控制台追踪信息失败：%v", tag, err)
 		return
 	}
-	log.Printf("[%s] http=%s", tag, string(body))
+	log.Printf("[%s] HTTP=%s", tag, string(body))
 }
 
-func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace.Update, writeCh chan<- httptrace.Update) {
+func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace.Update, writeCh *redisWriteQueue) {
 	update.Trace = s.enrichTraceTupleForOutput(update.Trace)
 	update.Trace = s.sanitizeTraceForOutput(update.Trace)
 	s.stats.recordUpdateSource(update.Trace.CaptureSource, update.Kind, update.Trace.ChainID)
@@ -741,10 +1115,10 @@ func (s *Service) handleUpdate(ctx context.Context, tag string, update httptrace
 		s.printHTTPTraceTag(tag, update)
 	}
 	if writeCh != nil {
-		select {
-		case <-ctx.Done():
-			return
-		case writeCh <- update:
+		if err := writeCh.enqueue(ctx, update); errors.Is(err, errRedisWriteQueueFull) {
+			s.stats.redisDropped.Add(1)
+		} else if err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("[%s] Redis 写入入队失败：%v", tag, err)
 		}
 	}
 }
@@ -756,7 +1130,7 @@ func (s *Service) logAssemblyDiagnostic(tag string, update httptrace.Update) {
 			return
 		}
 		log.Printf(
-			"[%s] request diag chain=%d source=%s truncated=%t body_bytes=%d observed=%d consumed=%d content_length=%d chunked=%t body_partial=%t",
+			"[%s] 请求诊断：chain=%d source=%s truncated=%t body_bytes=%d observed=%d consumed=%d content_length=%d chunked=%t body_partial=%t",
 			tag,
 			update.Trace.ChainID,
 			update.Trace.CaptureSource,
@@ -780,7 +1154,7 @@ func (s *Service) logAssemblyDiagnostic(tag string, update httptrace.Update) {
 			reason = "stalled_flush"
 		}
 		log.Printf(
-			"[%s] response diag chain=%d reason=%s source=%s truncated=%t status=%d chunked=%t body_partial=%t body_bytes=%d observed=%d consumed=%d content_length=%d",
+			"[%s] 响应诊断：chain=%d reason=%s source=%s truncated=%t status=%d chunked=%t body_partial=%t body_bytes=%d observed=%d consumed=%d content_length=%d",
 			tag,
 			update.Trace.ChainID,
 			reason,
@@ -862,14 +1236,19 @@ func isZeroTraceIP(ip string) bool {
 func (s *Service) missingSrcIPMarker(trace httptrace.TraceDocument) string {
 	switch {
 	case strings.HasPrefix(trace.CaptureSource, "tls_"):
+		// TLS 路径本身没有 socket tuple ，http场景不涉及
 		return "missing:tls_no_tuple"
 	case s != nil && s.cfg.DisableUserTuple:
+		// 用户态 tuple 反查被关闭
 		return "missing:user_tuple_disabled"
 	case trace.PID == 0 || trace.FD < 0:
+		// 没有 socket 标识
 		return "missing:no_socket_identity"
 	case trace.SrcPort != 0 || trace.DstPort != 0:
+		// 内核 tuple 提取失败
 		return "missing:kernel_port_only_or_resolver_miss"
 	default:
+		// 内核 tuple 提取失败
 		return "missing:kernel_tuple_extract_failed"
 	}
 }
@@ -1027,6 +1406,7 @@ func shouldRetryResolve(event httptrace.Event) bool {
 	return true
 }
 
+// 将事件重试解析，放入重试队列，用于重试失败的事件
 func (s *Service) enqueueRetry(ctx context.Context, retrySem chan struct{}, retryWG *sync.WaitGroup, workers []chan httptrace.Event, event httptrace.Event, workerID int) bool {
 	if retrySem == nil || !shouldRetryResolve(event) {
 		return false
@@ -1053,12 +1433,17 @@ func (s *Service) enqueueRetry(ctx context.Context, retrySem chan struct{}, retr
 	}
 }
 
+// 事件分发，将事件分发到对应的worker中
+// ctx：上下文
+// event：事件
+// worker：worker通道
+// 返回：错误
 func (s *Service) dispatchEvent(ctx context.Context, event httptrace.Event, worker chan<- httptrace.Event) error {
 	newRawChain := s.stats.recordRawSourceEvent(event)
 	// https 明细日志
 	if s.cfg.DebugKernel && newRawChain && strings.HasPrefix(event.Source, "tls_") {
 		log.Printf(
-			"tls raw chain source=%s dir=%d chain=%d sock=%d fd=%d seq=%d observed=%d comm=%s prefix=%q",
+			"TLS 原始链路：source=%s dir=%d chain=%d sock=%d fd=%d seq=%d observed=%d comm=%s prefix=%q",
 			event.Source,
 			event.Direction,
 			event.ChainID,
@@ -1092,7 +1477,7 @@ func (s *Service) dispatchEvent(ctx context.Context, event httptrace.Event, work
 				s.recordFilterDrop(event.Direction, reason)
 				if count <= 5 {
 					log.Printf(
-						"user filtered event chain=%d dir=%d source=%s fd=%d ifindex=%d %s:%d -> %s:%d comm=%s",
+						"用户态过滤事件：chain=%d dir=%d source=%s fd=%d ifindex=%d %s:%d -> %s:%d comm=%s",
 						event.ChainID,
 						event.Direction,
 						event.Source,
@@ -1196,29 +1581,28 @@ func (s *stats) recordRawSourceEvent(event httptrace.Event) bool {
 	s.rawBySource[source] = counts
 	if event.ChainID != 0 {
 		if s.rawChainsByKey == nil {
-			s.rawChainsByKey = make(map[string]map[uint64]struct{})
+			s.rawChainsByKey = make(map[string]*boundedChainSet)
 		}
 		key := sourceDirectionKey(source, event.Direction)
 		if s.rawChainsByKey[key] == nil {
-			s.rawChainsByKey[key] = make(map[uint64]struct{})
+			s.rawChainsByKey[key] = &boundedChainSet{}
 		}
-		if _, exists := s.rawChainsByKey[key][event.ChainID]; !exists {
-			newChain = true
-		}
-		s.rawChainsByKey[key][event.ChainID] = struct{}{}
+		newChain = s.rawChainsByKey[key].add(event.ChainID)
 		if newChain && strings.HasPrefix(source, "tls_") {
 			if s.rawChainDetails == nil {
 				s.rawChainDetails = make(map[string]rawChainDetail)
 			}
-			detailKey := fmt.Sprintf("%s:%d", key, event.ChainID)
-			s.rawChainDetails[detailKey] = rawChainDetail{
-				Source:    source,
-				Direction: event.Direction,
-				ChainID:   event.ChainID,
-				SockID:    event.SockID,
-				FD:        event.FD,
-				Comm:      event.Comm,
-				Prefix:    summarizePayloadPrefix(event.Payload, 48),
+			if len(s.rawChainDetails) < maxRawChainDetails {
+				detailKey := fmt.Sprintf("%s:%d", key, event.ChainID)
+				s.rawChainDetails[detailKey] = rawChainDetail{
+					Source:    source,
+					Direction: event.Direction,
+					ChainID:   event.ChainID,
+					SockID:    event.SockID,
+					FD:        event.FD,
+					Comm:      event.Comm,
+					Prefix:    summarizePayloadPrefix(event.Payload, 48),
+				}
 			}
 		}
 	}
@@ -1249,13 +1633,13 @@ func (s *stats) recordUpdateSource(source, kind string, chainID uint64) {
 	s.updatesBySource[source] = counts
 	if chainID != 0 {
 		if s.updateChainsByKey == nil {
-			s.updateChainsByKey = make(map[string]map[uint64]struct{})
+			s.updateChainsByKey = make(map[string]*boundedChainSet)
 		}
 		key := sourceUpdateKey(source, kind)
 		if s.updateChainsByKey[key] == nil {
-			s.updateChainsByKey[key] = make(map[uint64]struct{})
+			s.updateChainsByKey[key] = &boundedChainSet{}
 		}
-		s.updateChainsByKey[key][chainID] = struct{}{}
+		s.updateChainsByKey[key].add(chainID)
 	}
 	s.sourceMu.Unlock()
 }
@@ -1320,7 +1704,8 @@ func (s *stats) rawSourceChainSummary() string {
 	sort.Strings(keys)
 	parts := make([]string, 0, len(keys))
 	for _, key := range keys {
-		parts = append(parts, fmt.Sprintf("%s=%d", key, len(s.rawChainsByKey[key])))
+		count, overflow := s.rawChainsByKey[key].count()
+		parts = append(parts, fmt.Sprintf("%s=%d(+%d)", key, count, overflow))
 	}
 	return strings.Join(parts, " ")
 }
@@ -1341,7 +1726,8 @@ func (s *stats) updateSourceChainSummary() string {
 	sort.Strings(keys)
 	parts := make([]string, 0, len(keys))
 	for _, key := range keys {
-		parts = append(parts, fmt.Sprintf("%s=%d", key, len(s.updateChainsByKey[key])))
+		count, overflow := s.updateChainsByKey[key].count()
+		parts = append(parts, fmt.Sprintf("%s=%d(+%d)", key, count, overflow))
 	}
 	return strings.Join(parts, " ")
 }
@@ -1411,7 +1797,7 @@ func (s *stats) rawTLSMissingUpdateSummary(limit int) string {
 		detail := s.rawChainDetails[key]
 		updateKey := sourceDirectionKey(detail.Source, detail.Direction)
 		if chains := s.updateChainsByKey[updateKey]; chains != nil {
-			if _, ok := chains[detail.ChainID]; ok {
+			if chains.contains(detail.ChainID) {
 				continue
 			}
 		}
@@ -1543,7 +1929,12 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 			return fmt.Errorf("read perf buffer: %w", err)
 		}
 		if record.LostSamples != 0 {
-			s.stats.perfLost.Add(record.LostSamples)
+			lostAfter := s.stats.perfLost.Add(record.LostSamples)
+			lostBefore := lostAfter - record.LostSamples
+			// 保留首次丢失和每 1000 个样本的边界提示，避免 perf 环形缓冲区持续溢出时刷屏。
+			if lostAfter <= 10 || lostAfter/1000 != lostBefore/1000 {
+				log.Printf("perf 环形缓冲区丢失样本：samples=%d total_lost=%d cpu=%d", record.LostSamples, lostAfter, record.CPU)
+			}
 			continue
 		}
 		s.stats.recordsRead.Add(1)
@@ -1555,7 +1946,7 @@ func (s *Service) readLoop(ctx context.Context, reader *perf.Reader, workers []c
 		raw, err := decodeRawEvent(record.RawSample)
 		if err != nil {
 			s.stats.parseFailures.Add(1)
-			log.Printf("decode raw event error: %v", err)
+			log.Printf("解码原始事件失败：%v", err)
 			continue
 		}
 		if s.cfg.DebugKernel {
@@ -1600,7 +1991,7 @@ func (s *Service) logKernelFragment(cpu int, raw bpfgen.HttpTraceHttpEvent, even
 	if strings.HasPrefix(event.Source, "tls_") {
 		if event.Flags&flagControl != 0 {
 			log.Printf(
-				"kernel tls control cpu=%d chain=%d source=%s flags=%s fd=%d seq=%d",
+				"内核 TLS 控制事件：cpu=%d chain=%d source=%s flags=%s fd=%d seq=%d",
 				cpu,
 				event.ChainID,
 				event.Source,
@@ -1611,7 +2002,7 @@ func (s *Service) logKernelFragment(cpu int, raw bpfgen.HttpTraceHttpEvent, even
 			return
 		}
 		log.Printf(
-			"kernel tls event cpu=%d chain=%d dir=%d source=%s frag=%d payload=%d total=%d observed=%d flags=%s fd=%d seq=%d prefix=%q",
+			"内核 TLS 事件：cpu=%d chain=%d dir=%d source=%s frag=%d payload=%d total=%d observed=%d flags=%s fd=%d seq=%d prefix=%q",
 			cpu,
 			event.ChainID,
 			event.Direction,
@@ -1629,7 +2020,7 @@ func (s *Service) logKernelFragment(cpu int, raw bpfgen.HttpTraceHttpEvent, even
 	}
 	if event.Flags&flagControl != 0 {
 		log.Printf(
-			"kernel control cpu=%d chain=%d source=%s flags=%s fd=%d seq=%d",
+			"内核控制事件：cpu=%d chain=%d source=%s flags=%s fd=%d seq=%d",
 			cpu,
 			event.ChainID,
 			event.Source,
@@ -1642,7 +2033,7 @@ func (s *Service) logKernelFragment(cpu int, raw bpfgen.HttpTraceHttpEvent, even
 	if event.Direction != httptrace.DirectionResponse {
 		if event.Flags&flagSizeOnly != 0 {
 			log.Printf(
-				"kernel size-only cpu=%d chain=%d dir=%d source=%s observed=%d flags=%s fd=%d seq=%d",
+				"内核仅大小事件：cpu=%d chain=%d dir=%d source=%s observed=%d flags=%s fd=%d seq=%d",
 				cpu,
 				event.ChainID,
 				event.Direction,
@@ -1657,7 +2048,7 @@ func (s *Service) logKernelFragment(cpu int, raw bpfgen.HttpTraceHttpEvent, even
 	}
 	if event.Flags&flagSizeOnly != 0 {
 		log.Printf(
-			"kernel response size-only cpu=%d chain=%d source=%s observed=%d flags=%s fd=%d seq=%d",
+			"内核响应仅大小事件：cpu=%d chain=%d source=%s observed=%d flags=%s fd=%d seq=%d",
 			cpu,
 			event.ChainID,
 			event.Source,
@@ -1669,7 +2060,7 @@ func (s *Service) logKernelFragment(cpu int, raw bpfgen.HttpTraceHttpEvent, even
 		return
 	}
 	log.Printf(
-		"kernel response fragment cpu=%d chain=%d source=%s frag=%d payload=%d total=%d observed=%d flags=%s fd=%d seq=%d",
+		"内核响应片段：cpu=%d chain=%d source=%s frag=%d payload=%d total=%d observed=%d flags=%s fd=%d seq=%d",
 		cpu,
 		event.ChainID,
 		event.Source,
@@ -1687,7 +2078,7 @@ func (s *Service) logKernelFragment(cpu int, raw bpfgen.HttpTraceHttpEvent, even
 // 这里的 request_fragments/response_fragments 是按 HTTP 语义分类后的 fragment 数，
 // 不是完整请求/响应条数；真正成功解析出来的条数看 user(requests/responses)。
 // send_calls/recv_calls 仍然是 kprobe/kretprobe 被触发的 syscall 次数。
-func (s *Service) logLoop(ctx context.Context, objs *bpfgen.LoadedObjects, tlsConfigMap *ebpf.Map, writeCh chan<- httptrace.Update) error {
+func (s *Service) logLoop(ctx context.Context, objs *bpfgen.LoadedObjects, tlsConfigMap *ebpf.Map, writeCh *redisWriteQueue) error {
 	statsTicker := time.NewTicker(s.cfg.LogInterval)
 	defer statsTicker.Stop()
 	captureTicker := time.NewTicker(5 * time.Second)
@@ -1706,11 +2097,11 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.LoadedObjects, tlsCo
 		case <-captureTicker.C:
 			s.RolloverDaily(time.Now(), objs)
 			if err := s.syncCaptureLimitsToKernel(objs.FilterMap); err != nil {
-				log.Printf("sync kernel capture limits error: %v", err)
+				log.Printf("同步内核采集上限失败：%v", err)
 			}
 			if tlsConfigMap != nil {
 				if err := s.installTLSConfig(tlsConfigMap); err != nil {
-					log.Printf("sync tls config error: %v", err)
+					log.Printf("同步 TLS 配置失败：%v", err)
 				}
 			}
 		case <-flushTicker.C:
@@ -1741,12 +2132,12 @@ func (s *Service) logLoop(ctx context.Context, objs *bpfgen.LoadedObjects, tlsCo
 func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 	kstats, err := readKernelStats(objs.KernelStatsMap)
 	if err != nil {
-		log.Printf("read kernel stats error: %v", err)
+		log.Printf("读取内核统计失败：%v", err)
 		return
 	}
 	asmStats := s.assembler.Snapshot()
 	log.Printf(
-		"%s stats kernel(send_calls=%d recv_calls=%d request_fragments=%d response_fragments=%d filtered=%d perf_errors=%d truncations=%d) user(perf_received=%d lost=%d requests=%d responses=%d redis=%d redis_failures=%d parse_failures=%d evicted=%d user_filtered=%d tuple_resolved=%d tuple_miss=%d pending_req=%d pending_resp=%d pending_no_resp=%d req_buf_states=%d resp_buf_states=%d stalled_flush=%d evict_flush=%d orphan_resp=%d promoted_req=%d deferred_resp=%d)",
+		"%s 统计信息：kernel(send_calls=%d recv_calls=%d request_fragments=%d response_fragments=%d filtered=%d perf_errors=%d truncations=%d capture_limit_hits=%d boundary_events=%d size_final_events=%d informational_responses=%d) user(perf_received=%d lost=%d requests=%d responses=%d redis=%d redis_failures=%d redis_dropped=%d parse_failures=%d evicted=%d user_filtered=%d tuple_resolved=%d tuple_miss=%d pending_req=%d pending_resp=%d pending_no_resp=%d req_buf_states=%d resp_buf_states=%d assembler_retained=%d assembler_budget=%d assembler_drops=%d assembler_states=%d/%d assembler_state_drops=%d stalled_flush=%d evict_flush=%d orphan_resp=%d promoted_req=%d deferred_resp=%d)",
 		label,
 		kstats.SendCalls,
 		kstats.RecvCalls,
@@ -1755,12 +2146,17 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 		kstats.Filtered,
 		kstats.PerfErrors,
 		kstats.Truncations,
+		kstats.CaptureLimitHits,
+		kstats.CaptureBoundaryEvents,
+		kstats.SizeFinalEvents,
+		kstats.InformationalResponses,
 		s.stats.perfReceived.Load(),
 		s.stats.perfLost.Load(),
 		s.stats.requests.Load(),
 		s.stats.responses.Load(),
 		s.stats.redisWrites.Load(),
 		s.stats.redisFailures.Load(),
+		s.stats.redisDropped.Load(),
 		s.stats.parseFailures.Load(),
 		s.stats.evicted.Load(),
 		s.stats.userFiltered.Load(),
@@ -1771,6 +2167,12 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 		asmStats.PendingNoRespBytes,
 		asmStats.RequestBufferStates,
 		asmStats.ResponseBufferStates,
+		asmStats.RetainedBytes,
+		asmStats.MaxRetainedBytes,
+		asmStats.BufferDrops,
+		asmStats.ActiveTraceStates,
+		asmStats.MaxActiveTraceStates,
+		asmStats.StateDrops,
 		asmStats.StalledResponseFlushes,
 		asmStats.EvictedFlushes,
 		asmStats.OrphanResponses,
@@ -1778,7 +2180,7 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 		asmStats.DeferredResponses,
 	)
 	log.Printf(
-		"%s user debug(filter_req=%d filter_resp=%d filter_unknown=%d filter_ip=%d filter_port=%d filter_ifname=%d resolver_cache=%d resolver_proc=%d resolver_miss=%d retry_queued=%d retry_resolved=%d retry_dropped=%d retry_overflow=%d tuple_passthrough=%d chain_passthrough=%d worker_backpressure=%d upd_req_worker=%d upd_resp_worker=%d upd_resp_stalled=%d upd_req_evicted=%d upd_resp_evicted=%d shutdown_flush=%d)",
+		"%s 用户态调试统计(filter_req=%d filter_resp=%d filter_unknown=%d filter_ip=%d filter_port=%d filter_ifname=%d resolver_cache=%d resolver_entries=%d resolver_proc=%d resolver_miss=%d retry_queued=%d retry_resolved=%d retry_dropped=%d retry_overflow=%d tuple_passthrough=%d chain_passthrough=%d worker_backpressure=%d upd_req_worker=%d upd_resp_worker=%d upd_resp_stalled=%d upd_req_evicted=%d upd_resp_evicted=%d shutdown_flush=%d)",
 		label,
 		s.stats.filterReq.Load(),
 		s.stats.filterResp.Load(),
@@ -1787,6 +2189,7 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 		s.stats.filterByPort.Load(),
 		s.stats.filterByIface.Load(),
 		s.stats.resolverCache.Load(),
+		s.resolver.cacheEntries(),
 		s.stats.resolverProc.Load(),
 		s.stats.tupleMiss.Load(),
 		s.stats.retryQueued.Load(),
@@ -1803,27 +2206,29 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 		s.stats.updateRespEvicted.Load(),
 		s.stats.shutdownFlushes.Load(),
 	)
-	log.Printf("%s source raw(%s)", label, s.stats.rawSourceSummary())
-	log.Printf("%s source update(%s)", label, s.stats.updateSourceSummary())
+	s.logRuntimeDiagnostics(label)
+	logProcessMemory(label)
+	log.Printf("%s 来源原始统计(%s)", label, s.stats.rawSourceSummary())
+	log.Printf("%s 来源更新统计(%s)", label, s.stats.updateSourceSummary())
 	// raw/update chain 统计用于对比：
 	// raw 反映“内核 perf 事件层面”看到了多少唯一 chain，
 	// update 反映“用户态聚合后真正产出的文档层面”保留了多少唯一 chain。
-	log.Printf("%s source chains raw(%s)", label, s.stats.rawSourceChainSummary())
-	log.Printf("%s source chains update(%s)", label, s.stats.updateSourceChainSummary())
+	log.Printf("%s 来源链路原始统计(%s)", label, s.stats.rawSourceChainSummary())
+	log.Printf("%s 来源链路更新统计(%s)", label, s.stats.updateSourceChainSummary())
 	// 仅输出 TLS raw chain 的首包概要，帮助排查同一 TLS 会话里
 	// request/response 起链是否异常、是否混入了可疑 duplicate/phantom request。
-	// log.Printf("%s tls raw chains(%s)", label, s.stats.rawTLSChainDetailSummary())
+	// log.Printf("%s TLS 原始链路(%s)", label, s.stats.rawTLSChainDetailSummary())
 	if missing := s.stats.rawTLSMissingUpdateSummary(24); missing != "none" {
-		log.Printf("%s tls raw missing update(%s)", label, missing)
+		log.Printf("%s TLS 原始链路缺少更新(%s)", label, missing)
 	}
 	if asmStats.PendingRequests > 0 {
 		if detail := s.assembler.DebugTLSPendingQueueSummary(time.Now(), 16); detail != "none" {
-			log.Printf("%s tls pending queue(%s)", label, detail)
+			log.Printf("%s TLS 待处理队列(%s)", label, detail)
 		}
 	}
 	if asmStats.RequestBufferStates > 0 || asmStats.ResponseBufferStates > 0 {
 		if detail := s.assembler.DebugTLSPendingStateSummary(time.Now(), 16); detail != "none" {
-			log.Printf("%s tls buffered states(%s)", label, detail)
+			log.Printf("%s TLS 缓冲状态(%s)", label, detail)
 		}
 	}
 	if s.cfg.DebugKernel {
@@ -1831,7 +2236,7 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 		resolveProcCount := s.stats.resolverProc.Load()
 		dispatchBlocked := s.stats.dispatchBlocked.Load()
 		log.Printf(
-			"%s user stage(records_read=%d decode_avg_us=%.2f resolve_avg_us=%.2f resolve_proc_avg_us=%.2f resolve_proc_slow=%d filter_avg_us=%.2f dispatch_avg_us=%.2f dispatch_blocked=%d dispatch_block_avg_us=%.2f worker_queue_peak=%d)",
+			"%s 用户态处理阶段(records_read=%d decode_avg_us=%.2f resolve_avg_us=%.2f resolve_proc_avg_us=%.2f resolve_proc_slow=%d filter_avg_us=%.2f dispatch_avg_us=%.2f dispatch_blocked=%d dispatch_block_avg_us=%.2f worker_queue_peak=%d)",
 			label,
 			recordsRead,
 			avgMicros(s.stats.decodeNs.Load(), recordsRead),
@@ -1845,7 +2250,7 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 			s.stats.workerQueuePeak.Load(),
 		)
 		log.Printf(
-			"%s kernel debug(sock_send_hits=%d tcp_send_hits=%d sock_recv_hits=%d tcp_recv_hits=%d recv_store_ok=%d recv_store_no_iter=%d recv_store_meta_fail=%d recv_ret_no_meta=%d recv_dir_request=%d recv_dir_response=%d recv_dir_unknown=%d recv_fallback_local=%d recv_fallback_keepalive=%d send_no_req_chain=%d send_resp_start=%d send_resp_continue=%d send_resp_reqactive=%d send_iter_empty=%d tuple_ipv4_ok=%d tuple_ipv6_portonly=%d tuple_extract_fail=%d prefix_second_iov=%d prefix_trimmed=%d send_size_only=%d recv_size_only=%d send_guard_dups=%d send_guard_upgrades=%d recv_guard_dups=%d recv_guard_upgrades=%d iter_ubuf=%d iter_iovec=%d iter_kvec=%d iter_bvec=%d iter_unsupported=%d iter_load_fail=%d)",
+			"%s 内核调试统计(sock_send_hits=%d tcp_send_hits=%d sock_recv_hits=%d tcp_recv_hits=%d recv_store_ok=%d recv_store_no_iter=%d recv_store_meta_fail=%d recv_ret_no_meta=%d recv_dir_request=%d recv_dir_response=%d recv_dir_unknown=%d recv_fallback_local=%d recv_fallback_keepalive=%d send_no_req_chain=%d send_resp_start=%d send_resp_continue=%d send_resp_reqactive=%d send_iter_empty=%d tuple_ipv4_ok=%d tuple_ipv6_portonly=%d tuple_extract_fail=%d prefix_second_iov=%d prefix_trimmed=%d send_size_only=%d recv_size_only=%d send_guard_dups=%d send_guard_upgrades=%d recv_guard_dups=%d recv_guard_upgrades=%d iter_ubuf=%d iter_iovec=%d iter_kvec=%d iter_bvec=%d iter_unsupported=%d iter_load_fail=%d)",
 			label,
 			kstats.SockSendHits,
 			kstats.TcpSendHits,
@@ -1884,7 +2289,7 @@ func (s *Service) logStatsSnapshot(label string, objs *bpfgen.LoadedObjects) {
 			kstats.IterLoadFail,
 		)
 		log.Printf(
-			"%s kernel tuple-cache(updates=%d deletes=%d hits=%d misses=%d)",
+			"%s 内核五元组缓存(updates=%d deletes=%d hits=%d misses=%d)",
 			label,
 			kstats.TupleCacheUpdates,
 			kstats.TupleCacheDeletes,
@@ -1909,7 +2314,7 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 	}, 0, 3)
 
 	if objs.HookStrategy == bpfgen.HookStrategyLegacySock {
-		log.Printf("using legacy socket hook strategy: prefer sock_sendmsg/sock_recvmsg on 4.x and avoid __sock_* ABI drift")
+		log.Printf("使用旧版 socket 挂载策略：4.x 优先使用 sock_sendmsg/sock_recvmsg，并规避 __sock_* ABI 差异")
 		required = append(required,
 			struct {
 				symbols []string
@@ -1928,7 +2333,7 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 			}{symbols: []string{"sock_recvmsg"}, ret: true, prog: objs.KretprobeSockRecvmsg},
 		)
 	} else if objs.HookStrategy == bpfgen.HookStrategyLegacyTCPSend {
-		log.Printf("using legacy hybrid hook strategy: keep sock_recvmsg on 4.x, but switch response primary path to tcp_sendmsg on vendor kernels where sock_sendmsg does not expose stable payload")
+		log.Printf("使用旧版混合挂载策略：4.x 保留 sock_recvmsg，并在 sock_sendmsg 无法提供稳定正文的厂商内核上将响应主路径切换为 tcp_sendmsg")
 		required = append(required,
 			struct {
 				symbols []string
@@ -1947,7 +2352,7 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 			}{symbols: []string{"sock_recvmsg"}, ret: true, prog: objs.KretprobeSockRecvmsg},
 		)
 	} else if objs.HookStrategy == bpfgen.HookStrategyLegacyTCPBoth {
-		log.Printf("using legacy tcp hook strategy: request/response both rely on tcp_recvmsg/tcp_sendmsg on vendor 4.x kernels where socket-layer sk extraction drifts")
+		log.Printf("使用旧版 TCP 挂载策略：在 socket 层 sk 提取不稳定的厂商 4.x 内核上，请求和响应均依赖 tcp_recvmsg/tcp_sendmsg")
 		required = append(required,
 			struct {
 				symbols []string
@@ -1966,7 +2371,7 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 			}{symbols: []string{"tcp_recvmsg"}, ret: true, prog: objs.KretprobeTcpRecvmsg},
 		)
 	} else {
-		log.Printf("using tcp-only hook strategy: request/response both rely on tcp_recvmsg/tcp_sendmsg on 5.15+/6.x")
+		log.Printf("使用纯 TCP 挂载策略：5.15+/6.x 上请求和响应均依赖 tcp_recvmsg/tcp_sendmsg")
 		required = append(required,
 			struct {
 				symbols []string
@@ -2052,7 +2457,7 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 				prog    *ebpf.Program
 			}{symbols: []string{"inet_csk_accept"}, ret: true, prog: objs.KretprobeInetCskAccept},
 		)
-		log.Printf("legacy tuple-cache fallback enabled: use tcp_v4/tcp_v6_connect and inet_csk_accept instead of inet_sock_set_state")
+		log.Printf("已启用旧版五元组缓存回退：使用 tcp_v4/tcp_v6_connect 和 inet_csk_accept 替代 inet_sock_set_state")
 	}
 	if objs.HookStrategy == bpfgen.HookStrategyLegacyTCPSend {
 		optionalKprobes = append(optionalKprobes,
@@ -2097,7 +2502,7 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 				prog    *ebpf.Program
 			}{symbols: []string{"inet_csk_accept"}, ret: true, prog: objs.KretprobeInetCskAccept},
 		)
-		log.Printf("legacy tuple-cache fallback enabled: use tcp_v4/tcp_v6_connect and inet_csk_accept instead of inet_sock_set_state")
+		log.Printf("已启用旧版五元组缓存回退：使用 tcp_v4/tcp_v6_connect 和 inet_csk_accept 替代 inet_sock_set_state")
 	}
 	if objs.HookStrategy == bpfgen.HookStrategyLegacyTCPBoth {
 		optionalKprobes = append(optionalKprobes,
@@ -2142,10 +2547,10 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 				prog    *ebpf.Program
 			}{symbols: []string{"inet_csk_accept"}, ret: true, prog: objs.KretprobeInetCskAccept},
 		)
-		log.Printf("legacy tuple-cache fallback enabled: use tcp_v4/tcp_v6_connect and inet_csk_accept instead of inet_sock_set_state")
+		log.Printf("已启用旧版五元组缓存回退：使用 tcp_v4/tcp_v6_connect 和 inet_csk_accept 替代 inet_sock_set_state")
 	}
 	if objs.HookStrategy == bpfgen.HookStrategyTCPOnly {
-		log.Printf("tcp-only capture enabled by default: skip sock_* probes and keep the same perf event/user-space parser contract")
+		log.Printf("已默认启用纯 TCP 采集：跳过 sock_* 探针，并保持相同的 perf 事件和用户态解析契约")
 	}
 	for _, item := range optionalKprobes {
 		l, err := attachOne(item.symbols, item.ret, item.prog)
@@ -2153,7 +2558,7 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 			attached = append(attached, l)
 			continue
 		}
-		log.Printf("skip optional kprobe %v: %v", item.symbols, err)
+		log.Printf("跳过可选 kprobe %v：%v", item.symbols, err)
 	}
 
 	tracepoints := []struct {
@@ -2185,7 +2590,7 @@ func attachAll(objs *bpfgen.LoadedObjects) ([]link.Link, error) {
 	for _, tp := range tracepoints {
 		l, err := link.Tracepoint(tp.group, tp.name, tp.prog, nil)
 		if err != nil {
-			log.Printf("skip tracepoint %s/%s: %v", tp.group, tp.name, err)
+			log.Printf("跳过 tracepoint %s/%s：%v", tp.group, tp.name, err)
 			continue
 		}
 		attached = append(attached, l)
@@ -2211,9 +2616,9 @@ func attachOne(symbols []string, ret bool, prog *ebpf.Program) (link.Link, error
 		}
 		if err == nil {
 			if ret {
-				log.Printf("attached kretprobe: %s", symbol)
+				log.Printf("已挂载 kretprobe：%s", symbol)
 			} else {
-				log.Printf("attached kprobe: %s", symbol)
+				log.Printf("已挂载 kprobe：%s", symbol)
 			}
 			return l, nil
 		}
@@ -2260,7 +2665,7 @@ func startPhaseWatch(ctx context.Context, phase string, interval time.Duration) 
 			case <-done:
 				return
 			case <-ticker.C:
-				log.Printf("%s is still in progress...", phase)
+				log.Printf("%s 仍在处理中……", phase)
 			}
 		}
 	}()
@@ -2288,11 +2693,9 @@ func decodeRawEvent(sample []byte) (bpfgen.HttpTraceHttpEvent, error) {
 func normalizeEvent(raw bpfgen.HttpTraceHttpEvent) httptrace.Event {
 	// raw.TsNs 来自内核 bpf_ktime_get_ns()，它是单调时钟（自开机以来的 ns），
 	// 不是 Unix 墙钟时间。
-	//
 	// 之前直接 time.Unix(0, raw.TsNs) 会把事件时间落到 1970 附近，进而让
 	// TLS pending/stall/age 判断几乎立刻触发，表现成 request 被过早 flush，
 	// 最终比真实样本数多记请求。
-	//
 	// 这里改为使用“用户态收到 perf 事件时”的墙钟时间作为 Event.Timestamp。
 	// raw.TsNs 仍然保留在 Event.TsNS 中，仅用于调试/排序线索，不再参与墙钟语义。
 	ts := time.Now()
@@ -2458,6 +2861,10 @@ func readKernelStats(m *ebpf.Map) (bpfgen.HttpTraceKernelStats, error) {
 		total.IterBvec += v.IterBvec
 		total.IterUnsupported += v.IterUnsupported
 		total.IterLoadFail += v.IterLoadFail
+		total.CaptureLimitHits += v.CaptureLimitHits
+		total.CaptureBoundaryEvents += v.CaptureBoundaryEvents
+		total.SizeFinalEvents += v.SizeFinalEvents
+		total.InformationalResponses += v.InformationalResponses
 	}
 	return total, nil
 }

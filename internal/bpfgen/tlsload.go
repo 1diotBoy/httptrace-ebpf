@@ -45,29 +45,29 @@ func LoadTLSObjects(opts *ebpf.CollectionOptions) (*LoadedTLSObjects, error) {
 	version := detectKernelVersion()
 
 	if version.Major == 4 {
-		log.Printf("tls legacy kernel detected: load legacy TLS eBPF objects directly kernel=%s", version.Release)
+		log.Printf("检测到 TLS 旧版内核：直接加载旧版 TLS eBPF 对象，kernel=%s", version.Release)
 		legacy, err := loadTLSLegacy(opts)
 		if err != nil {
 			return nil, err
 		}
-		log.Printf("tls eBPF objects loaded variant=legacy-4.x kernel=%s", version.Release)
+		log.Printf("TLS eBPF 对象加载完成：variant=legacy-4.x kernel=%s", version.Release)
 		return legacy, nil
 	}
 
 	objs, err := loadTLSModern(opts)
 	if err == nil {
-		log.Printf("tls eBPF objects loaded variant=modern kernel=%s", version.Release)
+		log.Printf("TLS eBPF 对象加载完成：variant=modern kernel=%s", version.Release)
 		return objs, nil
 	}
 
 	if !shouldFallbackToLegacy(err) {
 		return nil, err
 	}
-	log.Printf("tls modern objects load failed, trying legacy fallback: %v", err)
+	log.Printf("TLS 现代对象加载失败，尝试旧版回退：%v", err)
 
 	legacy, legacyErr := loadTLSLegacy(opts)
 	if legacyErr == nil {
-		log.Printf("tls eBPF objects loaded variant=legacy-4.x kernel=%s", version.Release)
+		log.Printf("TLS eBPF 对象加载完成：variant=legacy-4.x kernel=%s", version.Release)
 		return legacy, nil
 	}
 	return nil, legacyErr
